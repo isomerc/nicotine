@@ -276,7 +276,7 @@ pub fn run_overlay(
                 for delay in [300, 500, 1000] {
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                     if std::process::Command::new("wmctrl")
-                        .args(["-r", "Nicotine", "-b", "add,above,sticky"])
+                        .args(["-F", "-r", "Nicotine", "-b", "add,above,sticky"])
                         .output()
                         .is_ok()
                     {
