@@ -30,7 +30,7 @@ High-performance EVE Online multiboxing tool for Linux (X11 & Wayland), inspired
 ### One-Line Installer (Recommended)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/isomerc/nicotine/main/install-github.sh | bash
+curl -sSL https://raw.githubusercontent.com/isomerc/nicotine/master/install-github.sh | bash
 ```
 
 Then restart your terminal and run:
