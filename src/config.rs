@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::{env, fs};
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -58,9 +58,14 @@ fn default_minimize_inactive() -> bool {
 
 impl Config {
     fn config_dir() -> PathBuf {
-        let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-        path.push("nicotine");
-        path
+        match env::var("EVE_NICOTINE_CONFIG_DIR") {
+            Ok(path) => PathBuf::from(path),
+            Err(_) => {
+                let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+                path.push("nicotine");
+                path
+            }
+        }
     }
 
     fn config_path() -> PathBuf {

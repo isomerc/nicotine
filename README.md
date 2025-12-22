@@ -163,6 +163,8 @@ backward_button = 275      # Button 8
 minimize_inactive = false  # Minimize clients when cycling away (saves resources)
 ```
 
+The path to the config directory can be customized by setting the `EVE_NICOTINE_CONFIG_DIR` environment variable.
+
 ## Architecture
 
 - **Daemon mode**: Maintains window manager connection and state in memory for instant cycling
