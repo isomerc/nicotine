@@ -83,6 +83,67 @@ unsafe extern "system" fn foreground_event_proc(
     (*ptr).update_active(hwnd_to_id(hwnd));
 }
 
+/// Adjust a proposed window position so it docks to nearby preview windows.
+/// Each axis snaps independently so you can edge-touch on one side while
+/// also aligning a perpendicular edge (e.g., dock to the right of A AND
+/// align tops). The first match per axis wins — once snapped, further
+/// candidates on that axis are ignored to avoid thrash when previews are
+/// stacked tightly.
+fn snap_position(
+    proposed_x: i32,
+    proposed_y: i32,
+    width: i32,
+    height: i32,
+    others: &[RECT],
+) -> (i32, i32) {
+    let mut x = proposed_x;
+    let mut y = proposed_y;
+    let mut x_snapped = false;
+    let mut y_snapped = false;
+    let drag_right = proposed_x + width;
+    let drag_bottom = proposed_y + height;
+
+    for other in others {
+        // Edge-to-edge docking on the X axis.
+        if !x_snapped && (drag_right - other.left).abs() <= SNAP_THRESHOLD {
+            x = other.left - width;
+            x_snapped = true;
+        }
+        if !x_snapped && (proposed_x - other.right).abs() <= SNAP_THRESHOLD {
+            x = other.right;
+            x_snapped = true;
+        }
+        // Edge-to-edge docking on the Y axis.
+        if !y_snapped && (drag_bottom - other.top).abs() <= SNAP_THRESHOLD {
+            y = other.top - height;
+            y_snapped = true;
+        }
+        if !y_snapped && (proposed_y - other.bottom).abs() <= SNAP_THRESHOLD {
+            y = other.bottom;
+            y_snapped = true;
+        }
+        // Parallel-edge alignment so docked previews share a baseline.
+        if !y_snapped && (proposed_y - other.top).abs() <= SNAP_THRESHOLD {
+            y = other.top;
+            y_snapped = true;
+        }
+        if !y_snapped && (drag_bottom - other.bottom).abs() <= SNAP_THRESHOLD {
+            y = other.bottom - height;
+            y_snapped = true;
+        }
+        if !x_snapped && (proposed_x - other.left).abs() <= SNAP_THRESHOLD {
+            x = other.left;
+            x_snapped = true;
+        }
+        if !x_snapped && (drag_right - other.right).abs() <= SNAP_THRESHOLD {
+            x = other.right - width;
+            x_snapped = true;
+        }
+    }
+
+    (x, y)
+}
+
 /// True if (x, y) lies somewhere inside the multi-monitor virtual screen.
 /// Used to reject saved positions from a previous build that wrote
 /// off-screen coordinates due to a sign-extension bug — without this,
@@ -104,6 +165,10 @@ const RECONCILE_INTERVAL_MS: u32 = 500;
 const TITLE_HEIGHT: i32 = 24;
 const BORDER_WIDTH: i32 = 3;
 const DRAG_THRESHOLD_PX: i32 = 4;
+/// Pixels of grace within which a dragged preview snaps to align with
+/// another preview's edge. Generous enough to make docking feel deliberate
+/// but tight enough that you can place windows freely between previews.
+const SNAP_THRESHOLD: i32 = 12;
 
 /// Win32 COLORREF is 0x00BBGGRR. Nicotine red is RGB(196, 30, 58).
 const NICOTINE_RED: COLORREF = COLORREF(0x003A_1EC4);
@@ -259,6 +324,23 @@ impl PreviewManager {
         // (rare). The hook is the primary path and updates instantly.
         let active_id = self.wm.get_active_window().unwrap_or(0);
         self.update_active(active_id);
+    }
+
+    /// Snapshot of all preview window rects in screen coordinates,
+    /// excluding the one identified by `exclude`. Used by the drag handler
+    /// for snap-to-dock calculations.
+    fn collect_other_rects(&self, exclude: HWND) -> Vec<RECT> {
+        let mut rects = Vec::with_capacity(self.previews.len());
+        for preview in self.previews.values() {
+            if preview.hwnd == exclude {
+                continue;
+            }
+            let mut rect = RECT::default();
+            if unsafe { GetWindowRect(preview.hwnd, &mut rect) }.is_ok() {
+                rects.push(rect);
+            }
+        }
+        rects
     }
 
     /// Set the active-client highlight to whichever preview matches
@@ -460,8 +542,25 @@ unsafe extern "system" fn preview_wnd_proc(
                     state.dragged = true;
                 }
                 if state.dragged {
-                    let new_x = state.drag_origin_window.0 + dx;
-                    let new_y = state.drag_origin_window.1 + dy;
+                    let mut new_x = state.drag_origin_window.0 + dx;
+                    let mut new_y = state.drag_origin_window.1 + dy;
+
+                    // Snap to dock with other previews if any of our edges
+                    // come within SNAP_THRESHOLD of theirs.
+                    let mut self_rect = RECT::default();
+                    if GetWindowRect(hwnd, &mut self_rect).is_ok() {
+                        let width = self_rect.right - self_rect.left;
+                        let height = self_rect.bottom - self_rect.top;
+                        let mgr_ptr =
+                            MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
+                        if !mgr_ptr.is_null() {
+                            let others = (*mgr_ptr).collect_other_rects(hwnd);
+                            let (sx, sy) = snap_position(new_x, new_y, width, height, &others);
+                            new_x = sx;
+                            new_y = sy;
+                        }
+                    }
+
                     let _ = SetWindowPos(
                         hwnd,
                         Some(HWND_TOPMOST),
