@@ -6,6 +6,11 @@ use std::fs;
 pub struct CycleState {
     current_index: usize,
     windows: Vec<EveWindow>,
+    /// Optional ordered list of character names from characters.txt. When
+    /// set, forward/backward cycling traverses this order, skipping any
+    /// listed names that aren't currently logged in. When None, cycles
+    /// through windows in whatever order the window manager reports them.
+    character_order: Option<Vec<String>>,
 }
 
 impl CycleState {
@@ -13,6 +18,26 @@ impl CycleState {
         Self {
             current_index: 0,
             windows: Vec::new(),
+            character_order: None,
+        }
+    }
+
+    pub fn set_character_order(&mut self, order: Option<Vec<String>>) {
+        self.character_order = order;
+    }
+
+    /// Indices into `self.windows` in the order forward-cycling should
+    /// traverse them. If `character_order` is set, only listed characters
+    /// who are currently logged in are included, in list order. Otherwise
+    /// every window is included in detection order.
+    fn cycle_indices(&self) -> Vec<usize> {
+        if let Some(order) = &self.character_order {
+            order
+                .iter()
+                .filter_map(|name| self.windows.iter().position(|w| &w.title == name))
+                .collect()
+        } else {
+            (0..self.windows.len()).collect()
         }
     }
 
@@ -25,30 +50,7 @@ impl CycleState {
     }
 
     pub fn cycle_forward(&mut self, wm: &dyn WindowManager, minimize_inactive: bool) -> Result<()> {
-        if self.windows.is_empty() {
-            return Ok(());
-        }
-
-        let previous_index = self.current_index;
-        self.current_index = (self.current_index + 1) % self.windows.len();
-        self.write_index();
-
-        let new_window_id = self.windows[self.current_index].id;
-
-        if minimize_inactive {
-            // Restore new window first (in case it was minimized)
-            let _ = wm.restore_window(new_window_id);
-        }
-
-        wm.activate_window(new_window_id)?;
-
-        if minimize_inactive && previous_index != self.current_index {
-            // Minimize the previous window after activating the new one
-            let previous_window_id = self.windows[previous_index].id;
-            let _ = wm.minimize_window(previous_window_id);
-        }
-
-        Ok(())
+        self.cycle_step(wm, minimize_inactive, 1)
     }
 
     pub fn cycle_backward(
@@ -56,30 +58,60 @@ impl CycleState {
         wm: &dyn WindowManager,
         minimize_inactive: bool,
     ) -> Result<()> {
+        self.cycle_step(wm, minimize_inactive, -1)
+    }
+
+    /// Advance through the cycle by `step` positions (1 = forward,
+    /// -1 = backward). Wraps at both ends. Honors `character_order` if set.
+    fn cycle_step(
+        &mut self,
+        wm: &dyn WindowManager,
+        minimize_inactive: bool,
+        step: isize,
+    ) -> Result<()> {
         if self.windows.is_empty() {
             return Ok(());
         }
 
-        let previous_index = self.current_index;
-        if self.current_index == 0 {
-            self.current_index = self.windows.len() - 1;
-        } else {
-            self.current_index -= 1;
+        let cycle = self.cycle_indices();
+        if cycle.is_empty() {
+            // character_order is set but none of the listed characters are
+            // currently logged in — nothing to cycle to.
+            return Ok(());
         }
 
+        // Find where the currently-active window sits in the cycle list.
+        // If the active window isn't in the cycle (e.g., user is on an
+        // unlisted character), jump to the first or last entry depending
+        // on direction.
+        let position_in_cycle = cycle.iter().position(|&i| i == self.current_index);
+        let next_position = match position_in_cycle {
+            Some(p) => {
+                let len = cycle.len() as isize;
+                (((p as isize + step) % len) + len) as usize % cycle.len()
+            }
+            None => {
+                if step > 0 {
+                    0
+                } else {
+                    cycle.len() - 1
+                }
+            }
+        };
+
+        let previous_index = self.current_index;
+        self.current_index = cycle[next_position];
         self.write_index();
 
         let new_window_id = self.windows[self.current_index].id;
 
         if minimize_inactive {
-            // Restore new window first (in case it was minimized)
             let _ = wm.restore_window(new_window_id);
         }
 
         wm.activate_window(new_window_id)?;
 
         if minimize_inactive && previous_index != self.current_index {
-            // Minimize the previous window after activating the new one
             let previous_window_id = self.windows[previous_index].id;
             let _ = wm.minimize_window(previous_window_id);
         }

@@ -187,7 +187,10 @@ fn run_cycle_direct(wm: &Arc<dyn WindowManager>, config: &Config, op: CycleOp) -
         return Ok(());
     }
 
+    let character_order = Config::load_characters();
+
     let mut state = CycleState::new();
+    state.set_character_order(character_order.clone());
     state.update_windows(windows);
 
     if let Ok(active) = wm.get_active_window() {
@@ -198,7 +201,6 @@ fn run_cycle_direct(wm: &Arc<dyn WindowManager>, config: &Config, op: CycleOp) -
         CycleOp::Forward => state.cycle_forward(&**wm, config.minimize_inactive)?,
         CycleOp::Backward => state.cycle_backward(&**wm, config.minimize_inactive)?,
         CycleOp::Switch(target) => {
-            let character_order = Config::load_characters();
             state.switch_to(
                 target,
                 &**wm,

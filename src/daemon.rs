@@ -57,11 +57,17 @@ impl Daemon {
             state.lock().unwrap().update_windows(windows);
         }
 
-        // Load character order for targeted cycling
+        // Load character order. Used by both targeted cycling (switch N)
+        // and forward/backward cycling. Stored on CycleState too so the
+        // cycle methods don't need it as a parameter.
         let character_order = Config::load_characters();
         if character_order.is_some() {
             println!("Loaded character order from characters.txt");
         }
+        state
+            .lock()
+            .unwrap()
+            .set_character_order(character_order.clone());
 
         Self {
             wm,

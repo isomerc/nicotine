@@ -7,9 +7,9 @@ use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, SendMessageW, SetForegroundWindow, SetWindowPos,
-    ShowWindow, HWND_TOP, SC_MINIMIZE, SC_RESTORE, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE,
-    SW_RESTORE, WM_SYSCOMMAND,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SendMessageW, SetForegroundWindow,
+    SetWindowPos, ShowWindow, HWND_TOP, SC_MINIMIZE, SC_RESTORE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_MINIMIZE, SW_RESTORE, WM_SYSCOMMAND,
 };
 
 pub struct WindowsManager;
@@ -60,37 +60,53 @@ unsafe extern "system" fn enum_collect_eve(hwnd: HWND, lparam: LPARAM) -> BOOL {
     TRUE
 }
 
-/// SetForegroundWindow is restricted on modern Windows — to reliably steal
-/// focus from another process, briefly attach our thread's input queue to
-/// both the target's and the current foreground's queues. This is the same
-/// pattern AutoHotkey and EVE-O Preview use.
+/// SetForegroundWindow is restricted on modern Windows — for reliable
+/// focus stealing from another process, the standard pattern is to attach
+/// our input queue to the target's. But that's slow. The fast path:
+/// SetForegroundWindow works directly when our process "received the last
+/// input event" — and a `RegisterHotKey` WM_HOTKEY counts. So we try the
+/// cheap call first and only fall back to the AttachThreadInput dance if
+/// Windows rejects it (typical when activation is triggered from the
+/// passive low-level mouse hook, not a hotkey).
 fn force_activate(target: HWND) {
     unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground == target {
+            // Already focused — skip everything. Common case for repeated
+            // hotkey presses against the active window.
+            return;
+        }
+
+        // SW_RESTORE triggers the show animation, so only fire it when we
+        // genuinely need to un-minimize.
+        if IsIconic(target).as_bool() {
+            let _ = ShowWindow(target, SW_RESTORE);
+        }
+
+        // Fast path: try direct SetForegroundWindow first.
+        if SetForegroundWindow(target).as_bool() {
+            return;
+        }
+
+        // Fallback path: Windows refused the foreground change. Briefly
+        // attach our thread's input queue to the target and current
+        // foreground's queues so we look like the same input session.
         let target_thread = GetWindowThreadProcessId(target, None);
         let current_thread = GetCurrentThreadId();
-        let foreground = GetForegroundWindow();
         let foreground_thread = if foreground.0.is_null() {
             0
         } else {
             GetWindowThreadProcessId(foreground, None)
         };
 
-        let attached_target = if target_thread != 0 && target_thread != current_thread {
-            AttachThreadInput(current_thread, target_thread, true).as_bool()
-        } else {
-            false
-        };
-        let attached_foreground = if foreground_thread != 0
+        let attached_target = target_thread != 0
+            && target_thread != current_thread
+            && AttachThreadInput(current_thread, target_thread, true).as_bool();
+        let attached_foreground = foreground_thread != 0
             && foreground_thread != current_thread
             && foreground_thread != target_thread
-        {
-            AttachThreadInput(current_thread, foreground_thread, true).as_bool()
-        } else {
-            false
-        };
+            && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
 
-        // Restore in case the window is minimized; ignore non-iconic windows.
-        let _ = ShowWindow(target, SW_RESTORE);
         let _ = SetForegroundWindow(target);
         let _ = BringWindowToTop(target);
         let _ = SetFocus(Some(target));

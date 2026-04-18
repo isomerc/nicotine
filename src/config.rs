@@ -74,8 +74,14 @@ fn default_backward_button() -> u16 {
     1 // XBUTTON1 (backward side button)
 }
 
+#[cfg(unix)]
 fn default_enable_keyboard() -> bool {
-    false // Disabled by default to avoid conflicts
+    false // Disabled by default to avoid conflicts with games that use Tab
+}
+
+#[cfg(windows)]
+fn default_enable_keyboard() -> bool {
+    true // F10/F11 are uncommon enough to enable by default for cycling
 }
 
 #[cfg(unix)]
@@ -85,7 +91,7 @@ fn default_forward_key() -> u16 {
 
 #[cfg(windows)]
 fn default_forward_key() -> u16 {
-    0x09 // VK_TAB
+    0x7A // VK_F11
 }
 
 #[cfg(unix)]
@@ -95,7 +101,7 @@ fn default_backward_key() -> u16 {
 
 #[cfg(windows)]
 fn default_backward_key() -> u16 {
-    0x09 // VK_TAB
+    0x79 // VK_F10
 }
 
 fn default_show_overlay() -> bool {
