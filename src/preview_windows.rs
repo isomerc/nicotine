@@ -27,6 +27,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -114,40 +115,41 @@ fn snap_position(
     let mut y_snapped = false;
     let drag_right = proposed_x + width;
     let drag_bottom = proposed_y + height;
+    let snap = px(SNAP_THRESHOLD);
 
     for other in others {
         // Edge-to-edge docking on the X axis.
-        if !x_snapped && (drag_right - other.left).abs() <= SNAP_THRESHOLD {
+        if !x_snapped && (drag_right - other.left).abs() <= snap {
             x = other.left - width;
             x_snapped = true;
         }
-        if !x_snapped && (proposed_x - other.right).abs() <= SNAP_THRESHOLD {
+        if !x_snapped && (proposed_x - other.right).abs() <= snap {
             x = other.right;
             x_snapped = true;
         }
         // Edge-to-edge docking on the Y axis.
-        if !y_snapped && (drag_bottom - other.top).abs() <= SNAP_THRESHOLD {
+        if !y_snapped && (drag_bottom - other.top).abs() <= snap {
             y = other.top - height;
             y_snapped = true;
         }
-        if !y_snapped && (proposed_y - other.bottom).abs() <= SNAP_THRESHOLD {
+        if !y_snapped && (proposed_y - other.bottom).abs() <= snap {
             y = other.bottom;
             y_snapped = true;
         }
         // Parallel-edge alignment so docked previews share a baseline.
-        if !y_snapped && (proposed_y - other.top).abs() <= SNAP_THRESHOLD {
+        if !y_snapped && (proposed_y - other.top).abs() <= snap {
             y = other.top;
             y_snapped = true;
         }
-        if !y_snapped && (drag_bottom - other.bottom).abs() <= SNAP_THRESHOLD {
+        if !y_snapped && (drag_bottom - other.bottom).abs() <= snap {
             y = other.bottom - height;
             y_snapped = true;
         }
-        if !x_snapped && (proposed_x - other.left).abs() <= SNAP_THRESHOLD {
+        if !x_snapped && (proposed_x - other.left).abs() <= snap {
             x = other.left;
             x_snapped = true;
         }
-        if !x_snapped && (drag_right - other.right).abs() <= SNAP_THRESHOLD {
+        if !x_snapped && (drag_right - other.right).abs() <= snap {
             x = other.right - width;
             x_snapped = true;
         }
@@ -170,11 +172,30 @@ fn position_on_screen(x: i32, y: i32) -> bool {
     }
 }
 
+/// System DPI scale factor (1.0 at 96 DPI, 1.5 at 150%, 2.0 at 200%).
+/// Cached once per process — we're SYSTEM_AWARE, so the value is fixed
+/// at process start and doesn't change as windows move between monitors.
+fn dpi_scale() -> f32 {
+    static CACHED: OnceLock<f32> = OnceLock::new();
+    *CACHED.get_or_init(|| unsafe { GetDpiForSystem() as f32 / 96.0 })
+}
+
+/// Scale a reference pixel value (authored at 96 DPI) to actual physical
+/// pixels on the current display. Preserves sign so negative font
+/// heights round correctly.
+fn px(n: i32) -> i32 {
+    (n as f32 * dpi_scale()).round() as i32
+}
+
 const PREVIEW_CLASS: &str = "NicotinePreviewWnd\0";
 const CONTROL_CLASS: &str = "NicotinePreviewCtrl\0";
 const LIST_CLASS: &str = "NicotineListWnd\0";
 
-/// Pixel dimensions for the client-list window.
+// Chrome dimensions below are "reference pixels" at 96 DPI. Every use
+// site wraps them in `px(...)` so they render at the correct physical
+// size on high-DPI displays (e.g. 4K @ 150% scaling).
+
+/// Reference dimensions for the client-list window (96 DPI).
 const LIST_WIDTH: i32 = 260;
 const LIST_ROW_HEIGHT: i32 = 24;
 const LIST_PADDING: i32 = 6;
@@ -186,9 +207,10 @@ const RECONCILE_INTERVAL_MS: u32 = 100;
 const TITLE_HEIGHT: i32 = 24;
 const BORDER_WIDTH: i32 = 3;
 const DRAG_THRESHOLD_PX: i32 = 4;
-/// Pixels of grace within which a dragged preview snaps to align with
-/// another preview's edge. Generous enough to make docking feel deliberate
-/// but tight enough that you can place windows freely between previews.
+/// Reference-pixel grace band within which a dragged preview snaps to
+/// align with another preview's edge. Generous enough to make docking
+/// feel deliberate but tight enough that you can place windows freely
+/// between previews.
 const SNAP_THRESHOLD: i32 = 12;
 
 /// Win32 COLORREF is 0x00BBGGRR. Nicotine red is RGB(196, 30, 58).
@@ -463,7 +485,7 @@ impl PreviewManager {
                             Some(HWND_TOPMOST),
                             0,
                             0,
-                            LIST_WIDTH,
+                            px(LIST_WIDTH),
                             target_h,
                             SWP_NOMOVE | SWP_NOACTIVATE,
                         );
@@ -521,7 +543,7 @@ impl PreviewManager {
                 WS_POPUP | WS_VISIBLE,
                 x,
                 y,
-                LIST_WIDTH,
+                px(LIST_WIDTH),
                 height,
                 None,
                 None,
@@ -664,7 +686,7 @@ impl PreviewManager {
             .unwrap_or_else(|| {
                 let off = self.next_default_offset;
                 self.next_default_offset = (self.next_default_offset + 32) % 320;
-                (10 + off, 10 + off)
+                (px(10 + off), px(10 + off))
             });
 
         let width = self.config.preview_width as i32;
@@ -761,13 +783,15 @@ impl PreviewManager {
 /// client area definition reportedly hides the actual game render surface,
 /// so SOURCECLIENTAREAONLY gives a blank preview.
 fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
+    let border = px(BORDER_WIDTH);
+    let title = px(TITLE_HEIGHT);
     let props = DWM_THUMBNAIL_PROPERTIES {
         dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
         rcDestination: RECT {
-            left: BORDER_WIDTH,
-            top: TITLE_HEIGHT,
-            right: width - BORDER_WIDTH,
-            bottom: height - BORDER_WIDTH,
+            left: border,
+            top: title,
+            right: width - border,
+            bottom: height - border,
         },
         rcSource: RECT::default(),
         opacity: 255,
@@ -832,7 +856,8 @@ unsafe extern "system" fn preview_wnd_proc(
 
                 let dx = pt.x - state.drag_origin_screen.0;
                 let dy = pt.y - state.drag_origin_screen.1;
-                if dx.abs() > DRAG_THRESHOLD_PX || dy.abs() > DRAG_THRESHOLD_PX {
+                let threshold = px(DRAG_THRESHOLD_PX);
+                if dx.abs() > threshold || dy.abs() > threshold {
                     state.dragged = true;
                 }
                 if state.dragged {
@@ -946,7 +971,7 @@ fn nicotine_body_font() -> HFONT {
     static SLOT: OnceLock<isize> = OnceLock::new();
     let raw = *SLOT.get_or_init(|| {
         register_embedded_fonts();
-        unsafe { create_font("JetBrains Mono", -14).0 as isize }
+        unsafe { create_font("JetBrains Mono", px(-14)).0 as isize }
     });
     HFONT(raw as *mut _)
 }
@@ -957,7 +982,7 @@ fn nicotine_logo_font() -> HFONT {
     static SLOT: OnceLock<isize> = OnceLock::new();
     let raw = *SLOT.get_or_init(|| {
         register_embedded_fonts();
-        unsafe { create_font("Marlboro", -20).0 as isize }
+        unsafe { create_font("Marlboro", px(-20)).0 as isize }
     });
     HFONT(raw as *mut _)
 }
@@ -978,32 +1003,34 @@ unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
 
     let chrome_color = if is_active { NICOTINE_RED } else { CHROME_DARK };
     let chrome_brush = CreateSolidBrush(chrome_color);
+    let title_h = px(TITLE_HEIGHT);
+    let border_w = px(BORDER_WIDTH);
 
     // Top strip (full-width title bar).
     let title_strip = RECT {
         left: 0,
         top: 0,
         right: width,
-        bottom: TITLE_HEIGHT,
+        bottom: title_h,
     };
     FillRect(hdc, &title_strip, chrome_brush);
 
     // Left, right, and bottom borders around the thumbnail area.
     let left_border = RECT {
         left: 0,
-        top: TITLE_HEIGHT,
-        right: BORDER_WIDTH,
+        top: title_h,
+        right: border_w,
         bottom: height,
     };
     let right_border = RECT {
-        left: width - BORDER_WIDTH,
-        top: TITLE_HEIGHT,
+        left: width - border_w,
+        top: title_h,
         right: width,
         bottom: height,
     };
     let bottom_border = RECT {
         left: 0,
-        top: height - BORDER_WIDTH,
+        top: height - border_w,
         right: width,
         bottom: height,
     };
@@ -1034,7 +1061,7 @@ unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
 /// Height of the list window given a current client count.
 fn list_window_height(num_clients: usize) -> i32 {
     let rows = num_clients.max(1) as i32;
-    TITLE_HEIGHT + rows * LIST_ROW_HEIGHT + LIST_PADDING
+    px(TITLE_HEIGHT) + rows * px(LIST_ROW_HEIGHT) + px(LIST_PADDING)
 }
 
 /// Window procedure for the single list-view window. Paints the title
@@ -1079,7 +1106,8 @@ unsafe extern "system" fn list_wnd_proc(
                 let _ = ClientToScreen(hwnd, &mut pt);
                 let dx = pt.x - state.drag_origin_screen.0;
                 let dy = pt.y - state.drag_origin_screen.1;
-                if dx.abs() > DRAG_THRESHOLD_PX || dy.abs() > DRAG_THRESHOLD_PX {
+                let threshold = px(DRAG_THRESHOLD_PX);
+                if dx.abs() > threshold || dy.abs() > threshold {
                     state.dragged = true;
                 }
                 if state.dragged {
@@ -1136,11 +1164,14 @@ unsafe fn paint_list(hwnd: HWND) {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
 
+    let title_h = px(TITLE_HEIGHT);
+    let row_h = px(LIST_ROW_HEIGHT);
+
     // Cream body
     let body_brush = CreateSolidBrush(NICOTINE_CREAM);
     let body_rect = RECT {
         left: 0,
-        top: TITLE_HEIGHT,
+        top: title_h,
         right: width,
         bottom: height,
     };
@@ -1153,7 +1184,7 @@ unsafe fn paint_list(hwnd: HWND) {
         left: 0,
         top: 0,
         right: width,
-        bottom: TITLE_HEIGHT,
+        bottom: title_h,
     };
     FillRect(hdc, &title_rect, title_brush);
     let _ = DeleteObject(title_brush.into());
@@ -1193,7 +1224,9 @@ unsafe fn paint_list(hwnd: HWND) {
     // Per-row text — JetBrains Mono, same as config panel body text.
     let body_font = nicotine_body_font();
     let prev_row_font = SelectObject(hdc, body_font.into());
-    let mut y = TITLE_HEIGHT + 2;
+    let left_pad = px(10);
+    let right_pad = px(6);
+    let mut y = title_h + px(2);
     for window in &windows {
         let is_active = window.id == active_id;
         let text = if is_active {
@@ -1209,13 +1242,13 @@ unsafe fn paint_list(hwnd: HWND) {
         let _ = SetTextColor(hdc, color);
         let mut row_buf: Vec<u16> = text.encode_utf16().collect();
         let mut row_rect = RECT {
-            left: 10,
+            left: left_pad,
             top: y,
-            right: width - 6,
-            bottom: y + LIST_ROW_HEIGHT,
+            right: width - right_pad,
+            bottom: y + row_h,
         };
         let _ = DrawTextW(hdc, &mut row_buf, &mut row_rect, DT_SINGLELINE | DT_VCENTER);
-        y += LIST_ROW_HEIGHT;
+        y += row_h;
     }
     SelectObject(hdc, prev_row_font);
 

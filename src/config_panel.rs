@@ -915,11 +915,15 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> Result<(), eframe:
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            // Fixed-size window sized to show every section end-to-end
-            // without a scrollbar. Not resizable — this is a config
-            // panel, not a document viewer, and dialogs feel more
-            // intentional when they don't wiggle.
-            .with_inner_size([600.0, 1000.0])
+            // Open at the empty-config size; the per-frame auto-resize
+            // grows the window as the user adds characters. Starting at
+            // a tall fixed value (e.g. 1000pt) caused huge dead space on
+            // first launch on machines where the OS ignores
+            // ViewportCommand::InnerSize *shrinks* on a non-resizable
+            // window — the window would never shrink back from the
+            // initial size to fit the (much shorter) empty content.
+            // Growing reliably works everywhere, so we start small.
+            .with_inner_size([600.0, 640.0])
             .with_resizable(false)
             .with_title("Nicotine")
             .with_icon(icon),

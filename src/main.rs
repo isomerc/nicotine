@@ -245,6 +245,23 @@ fn run_cycle_direct(wm: &Arc<dyn WindowManager>, config: &Config, op: CycleOp) -
 }
 
 fn main() -> Result<()> {
+    // Declare DPI awareness before any window gets created. SYSTEM_AWARE
+    // means Windows reports real monitor DPI instead of bitmap-scaling a
+    // virtual 96 DPI canvas — chrome, text, and window dims then need to
+    // be scaled manually (see `preview_windows::px`). Without this, users
+    // on high-DPI displays get blurry GDI text or weirdly-sized windows
+    // depending on launch-order interaction with eframe/winit's own
+    // awareness declaration. Ignoring the Result is intentional: the
+    // call can fail harmlessly if awareness was already set (e.g. by a
+    // hosting process) and we have no recovery.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+        };
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
+    }
+
     let args: Vec<String> = env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
