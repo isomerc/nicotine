@@ -100,15 +100,21 @@ impl eframe::App for ConfigPanel {
                     .inner_margin(egui::Margin::same(0.0)),
             )
             .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Nicotine")
-                            .family(egui::FontFamily::Name("logo".into()))
-                            .size(48.0)
-                            .color(NICOTINE_CREAM),
-                    );
-                });
+                // Center the logo both horizontally AND vertically in the
+                // red strip. `centered_and_justified` handles the vertical
+                // centering so we don't have to hand-tune add_space based
+                // on the Marlboro font's internal glyph padding.
+                ui.with_layout(
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new("Nicotine")
+                                .family(egui::FontFamily::Name("logo".into()))
+                                .size(48.0)
+                                .color(NICOTINE_CREAM),
+                        );
+                    },
+                );
             });
 
         // ---- Status toast / footer ----
