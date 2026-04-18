@@ -346,7 +346,17 @@ impl PreviewManager {
     /// Set the active-client highlight to whichever preview matches
     /// `active_id`. Cheap to call repeatedly — only invalidates and
     /// repaints when a preview's state actually flips.
+    ///
+    /// Also keeps the cycle's `current_index` in sync with whatever EVE
+    /// window the user has manually focused (via mouse click, Alt-Tab,
+    /// etc.). Without this, `current_index` only updates when our own
+    /// cycle commands run — so if the user activates B by hand, then
+    /// focuses a non-EVE app, then presses F11, the cycle would step
+    /// from wherever we last cycled to (say A) instead of from B,
+    /// looking like "cycle skipped a client."
     fn update_active(&mut self, active_id: u32) {
+        self.state.lock().unwrap().sync_with_active(active_id);
+
         for preview in self.previews.values_mut() {
             let now_active = preview.source_id == active_id;
             if preview.is_active == now_active {
@@ -551,8 +561,7 @@ unsafe extern "system" fn preview_wnd_proc(
                     if GetWindowRect(hwnd, &mut self_rect).is_ok() {
                         let width = self_rect.right - self_rect.left;
                         let height = self_rect.bottom - self_rect.top;
-                        let mgr_ptr =
-                            MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
+                        let mgr_ptr = MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
                         if !mgr_ptr.is_null() {
                             let others = (*mgr_ptr).collect_other_rects(hwnd);
                             let (sx, sy) = snap_position(new_x, new_y, width, height, &others);
@@ -689,6 +698,13 @@ fn register_classes(module: HMODULE) -> Result<()> {
     unsafe {
         let cursor = LoadCursorW(None, IDC_ARROW).context("LoadCursorW failed")?;
 
+        // Background brush for preview windows. Without this, the OS skips
+        // WM_ERASEBKGND and any pixel that DWM doesn't fully cover (e.g. a
+        // sub-pixel anti-aliased edge of the thumbnail) shows whatever was
+        // last in the buffer — typically white. Erasing to chrome dark
+        // first means those edges blend invisibly with our chrome.
+        let preview_bg = CreateSolidBrush(CHROME_DARK);
+
         let preview_class: Vec<u16> = PREVIEW_CLASS.encode_utf16().collect();
         let preview_wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -699,7 +715,7 @@ fn register_classes(module: HMODULE) -> Result<()> {
             hInstance: module.into(),
             hIcon: HICON::default(),
             hCursor: cursor,
-            hbrBackground: Default::default(),
+            hbrBackground: preview_bg,
             lpszMenuName: PCWSTR::null(),
             lpszClassName: PCWSTR(preview_class.as_ptr()),
             hIconSm: HICON::default(),
