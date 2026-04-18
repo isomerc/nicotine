@@ -2,33 +2,16 @@ use crate::config::{Config, DisplayMode, LiveSettings};
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 
-/// Curated dropdown of common cycle-hotkey choices. Values are Win32 VK
-/// codes on Windows; on Linux they're stored as evdev codes but the panel
-/// is currently Windows-facing so we use VK_* labels.
-const VK_CHOICES: &[(u16, &str)] = &[
-    (0x70, "F1"),
-    (0x71, "F2"),
-    (0x72, "F3"),
-    (0x73, "F4"),
-    (0x74, "F5"),
-    (0x75, "F6"),
-    (0x76, "F7"),
-    (0x77, "F8"),
-    (0x78, "F9"),
-    (0x79, "F10"),
-    (0x7A, "F11"),
-    (0x7B, "F12"),
-    (0x09, "Tab"),
-    (0x20, "Space"),
-    (0xC0, "` (backtick)"),
-];
-
-const MODIFIER_CHOICES: &[(Option<u16>, &str)] = &[
-    (None, "None"),
-    (Some(0x10), "Shift"),
-    (Some(0x11), "Ctrl"),
-    (Some(0x12), "Alt"),
-];
+/// Which config field is currently capturing a live keypress/click from
+/// the panel. Only one can capture at a time; `None` means no capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureTarget {
+    ForwardKey,
+    BackwardKey,
+    ModifierKey,
+    ForwardButton,
+    BackwardButton,
+}
 
 /// Brand palette matching the existing Linux overlay.
 const NICOTINE_RED: egui::Color32 = egui::Color32::from_rgb(196, 30, 58);
@@ -47,6 +30,9 @@ pub struct ConfigPanel {
     /// Shared settings watched by the preview manager for live updates
     /// (resize windows while sliders are being dragged).
     live: Arc<Mutex<LiveSettings>>,
+    /// When Some(...), the panel is listening for the next keypress /
+    /// side-mouse click to bind it to the given field.
+    capturing: Option<CaptureTarget>,
 }
 
 impl ConfigPanel {
@@ -79,18 +65,93 @@ impl ConfigPanel {
             .push("logo_font".to_owned());
         cc.egui_ctx.set_fonts(fonts);
 
+        // Nicotine-branded light theme. egui's default light visuals use
+        // pale grays against our cream background, which makes hover /
+        // active state changes basically invisible. Override with a
+        // warmer palette so every interactive widget has a visible
+        // idle / hover / pressed progression (cream → gold → red).
+        cc.egui_ctx.set_visuals(build_visuals());
+
         Self {
             config,
             dirty: false,
             new_character_buffer: String::new(),
             status: None,
             live,
+            capturing: None,
         }
     }
 }
 
+fn build_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::light();
+
+    // Cream page / non-interactive surfaces.
+    v.widgets.noninteractive.bg_fill = NICOTINE_CREAM;
+    v.widgets.noninteractive.weak_bg_fill = NICOTINE_CREAM;
+    v.widgets.noninteractive.fg_stroke.color = NICOTINE_BLACK;
+
+    // Idle: slightly-off-cream so the widget is distinguishable from the
+    // surrounding panel, with a gold-ish border.
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(240, 234, 218);
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(244, 238, 224);
+    v.widgets.inactive.fg_stroke.color = NICOTINE_BLACK;
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, NICOTINE_GOLD);
+
+    // Hover: strong gold — clearly different from idle so moving the
+    // mouse over anything shows a visible change.
+    v.widgets.hovered.bg_fill = NICOTINE_GOLD;
+    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(228, 212, 176);
+    v.widgets.hovered.fg_stroke.color = NICOTINE_BLACK;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.5, NICOTINE_RED);
+
+    // Pressed / active: Nicotine red with cream text.
+    v.widgets.active.bg_fill = NICOTINE_RED;
+    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(230, 176, 186);
+    v.widgets.active.fg_stroke.color = NICOTINE_CREAM;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.5, NICOTINE_RED);
+
+    // Open popup / selected — e.g. radio selection, text edit focus.
+    v.widgets.open.bg_fill = NICOTINE_GOLD;
+    v.widgets.open.weak_bg_fill = egui::Color32::from_rgb(228, 212, 176);
+    v.widgets.open.fg_stroke.color = NICOTINE_BLACK;
+    v.widgets.open.bg_stroke = egui::Stroke::new(1.5, NICOTINE_RED);
+
+    // Text selection highlight.
+    v.selection.bg_fill = NICOTINE_RED.gamma_multiply(0.45);
+    v.selection.stroke.color = NICOTINE_BLACK;
+
+    // Hyperlinks / accents (rarely used here but keep the brand colour).
+    v.hyperlink_color = NICOTINE_RED;
+
+    v
+}
+
 impl eframe::App for ConfigPanel {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ---- Capture mode: listen for the next keypress / x-button ----
+        // Runs before any widget draw so the event stream we inspect
+        // reflects what the user just did.
+        if let Some(target) = self.capturing {
+            if let Some(vk) = captured_binding(ctx, target) {
+                match target {
+                    CaptureTarget::ForwardKey => self.config.forward_key = vk,
+                    CaptureTarget::BackwardKey => self.config.backward_key = vk,
+                    CaptureTarget::ModifierKey => self.config.modifier_key = Some(vk),
+                    CaptureTarget::ForwardButton => self.config.forward_button = vk,
+                    CaptureTarget::BackwardButton => self.config.backward_button = vk,
+                }
+                self.capturing = None;
+                self.dirty = true;
+            } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                // Escape cancels capture without binding.
+                self.capturing = None;
+            }
+            // Keep requesting frames so a key press lands even when the
+            // user isn't hovering over the panel.
+            ctx.request_repaint();
+        }
+
         // ---- Branded header strip ----
         egui::TopBottomPanel::top("nicotine_header")
             .exact_height(72.0)
@@ -317,20 +378,37 @@ impl ConfigPanel {
         ui.add_enabled_ui(self.config.enable_keyboard_buttons, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Forward:");
-                self.dirty |= vk_dropdown(ui, "forward_key", &mut self.config.forward_key);
+                self.draw_bind_button(
+                    ui,
+                    CaptureTarget::ForwardKey,
+                    vk_to_label(self.config.forward_key),
+                );
             });
             ui.horizontal(|ui| {
                 ui.label("Backward:");
-                self.dirty |= vk_dropdown(ui, "backward_key", &mut self.config.backward_key);
+                self.draw_bind_button(
+                    ui,
+                    CaptureTarget::BackwardKey,
+                    vk_to_label(self.config.backward_key),
+                );
             });
             ui.horizontal(|ui| {
                 ui.label("Modifier:");
-                self.dirty |= modifier_dropdown(ui, "modifier_key", &mut self.config.modifier_key);
+                let label = match self.config.modifier_key {
+                    Some(vk) => vk_to_label(vk),
+                    None => "None".to_string(),
+                };
+                self.draw_bind_button(ui, CaptureTarget::ModifierKey, label);
+                if self.config.modifier_key.is_some() && ui.button("Clear").clicked() {
+                    self.config.modifier_key = None;
+                    self.dirty = true;
+                }
             });
             ui.label(
                 egui::RichText::new(
-                    "Set both keys to the same value with a modifier to cycle backward via \
-                     modifier+key (e.g. Tab + Shift+Tab).",
+                    "Click a binding to record the next key you press. Esc cancels. \
+                     Set both keys to the same value with a modifier to cycle backward \
+                     via modifier+key (e.g. Tab + Shift+Tab).",
                 )
                 .size(10.0)
                 .color(NICOTINE_BLACK),
@@ -351,26 +429,53 @@ impl ConfigPanel {
         ui.add_enabled_ui(self.config.enable_mouse_buttons, |ui| {
             ui.label(
                 egui::RichText::new(
-                    "Windows mice expose XBUTTON1 (back) and XBUTTON2 (forward). To swap \
-                     directions, exchange the two values below.",
+                    "Click a binding then press the mouse side button you want to use. \
+                     Esc cancels. Most mice expose XBUTTON1 (back) and XBUTTON2 (forward).",
                 )
                 .size(10.0)
                 .color(NICOTINE_BLACK),
             );
-            let prev_fwd = self.config.forward_button;
-            let prev_back = self.config.backward_button;
             ui.horizontal(|ui| {
                 ui.label("Forward button:");
-                ui.add(egui::DragValue::new(&mut self.config.forward_button).range(1..=2));
+                self.draw_bind_button(
+                    ui,
+                    CaptureTarget::ForwardButton,
+                    xbutton_to_label(self.config.forward_button),
+                );
             });
             ui.horizontal(|ui| {
                 ui.label("Backward button:");
-                ui.add(egui::DragValue::new(&mut self.config.backward_button).range(1..=2));
+                self.draw_bind_button(
+                    ui,
+                    CaptureTarget::BackwardButton,
+                    xbutton_to_label(self.config.backward_button),
+                );
             });
-            if self.config.forward_button != prev_fwd || self.config.backward_button != prev_back {
-                self.dirty = true;
-            }
         });
+    }
+
+    /// Button that toggles capture for a given config field. When
+    /// capturing, shows a hint; otherwise shows the current binding's
+    /// label. Click while already capturing to cancel.
+    fn draw_bind_button(&mut self, ui: &mut egui::Ui, target: CaptureTarget, label: String) {
+        let is_capturing = self.capturing == Some(target);
+        let text = if is_capturing {
+            "[press key / button — Esc to cancel]".to_string()
+        } else {
+            label
+        };
+        // When idle, let the theme drive hover colors. When capturing,
+        // lock the fill to gold + red stroke as a loud "waiting for
+        // input" indicator.
+        let mut button = egui::Button::new(text).min_size(egui::vec2(200.0, 22.0));
+        if is_capturing {
+            button = button
+                .fill(NICOTINE_GOLD)
+                .stroke(egui::Stroke::new(1.5, NICOTINE_RED));
+        }
+        if ui.add(button).clicked() {
+            self.capturing = if is_capturing { None } else { Some(target) };
+        }
     }
 
     fn draw_previews_section(&mut self, ui: &mut egui::Ui) {
@@ -414,46 +519,177 @@ impl ConfigPanel {
     }
 }
 
-/// Dropdown for selecting a Win32 VK code from the curated list. Returns
-/// true if the user changed the selection.
-fn vk_dropdown(ui: &mut egui::Ui, id: &str, value: &mut u16) -> bool {
-    let label = VK_CHOICES
-        .iter()
-        .find(|(code, _)| *code == *value)
-        .map(|(_, name)| *name)
-        .unwrap_or("Custom");
-    let mut changed = false;
-    egui::ComboBox::from_id_source(id)
-        .selected_text(label)
-        .show_ui(ui, |ui| {
-            for (code, name) in VK_CHOICES {
-                if ui.selectable_label(*value == *code, *name).clicked() {
-                    *value = *code;
-                    changed = true;
+/// Given a target, poll egui's input events for the right kind of
+/// press and return the Win32 VK or XBUTTON code to bind. Returns None
+/// when nothing relevant happened this frame.
+fn captured_binding(ctx: &egui::Context, target: CaptureTarget) -> Option<u16> {
+    ctx.input(|i| {
+        for event in &i.events {
+            match (target, event) {
+                // Keyboard targets: first non-Escape keypress wins.
+                (
+                    CaptureTarget::ForwardKey
+                    | CaptureTarget::BackwardKey
+                    | CaptureTarget::ModifierKey,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    },
+                ) if *key != egui::Key::Escape => {
+                    return egui_key_to_vk(*key);
                 }
+                // Mouse-button targets: only XBUTTON1/XBUTTON2 count.
+                (
+                    CaptureTarget::ForwardButton | CaptureTarget::BackwardButton,
+                    egui::Event::PointerButton {
+                        button,
+                        pressed: true,
+                        ..
+                    },
+                ) => {
+                    return match button {
+                        egui::PointerButton::Extra1 => Some(1),
+                        egui::PointerButton::Extra2 => Some(2),
+                        _ => None,
+                    };
+                }
+                _ => {}
             }
-        });
-    changed
+        }
+        None
+    })
 }
 
-fn modifier_dropdown(ui: &mut egui::Ui, id: &str, value: &mut Option<u16>) -> bool {
-    let label = MODIFIER_CHOICES
-        .iter()
-        .find(|(code, _)| *code == *value)
-        .map(|(_, name)| *name)
-        .unwrap_or("Custom");
-    let mut changed = false;
-    egui::ComboBox::from_id_source(id)
-        .selected_text(label)
-        .show_ui(ui, |ui| {
-            for (code, name) in MODIFIER_CHOICES {
-                if ui.selectable_label(*value == *code, *name).clicked() {
-                    *value = *code;
-                    changed = true;
-                }
-            }
-        });
-    changed
+/// Map an egui Key to the Windows Virtual-Key code. Returns None for
+/// keys that don't have a standard VK_ (mostly exotic IME / media keys
+/// we don't care about binding for cycling).
+fn egui_key_to_vk(key: egui::Key) -> Option<u16> {
+    use egui::Key;
+    let vk: u32 = match key {
+        Key::F1 => 0x70,
+        Key::F2 => 0x71,
+        Key::F3 => 0x72,
+        Key::F4 => 0x73,
+        Key::F5 => 0x74,
+        Key::F6 => 0x75,
+        Key::F7 => 0x76,
+        Key::F8 => 0x77,
+        Key::F9 => 0x78,
+        Key::F10 => 0x79,
+        Key::F11 => 0x7A,
+        Key::F12 => 0x7B,
+        Key::F13 => 0x7C,
+        Key::F14 => 0x7D,
+        Key::F15 => 0x7E,
+        Key::Tab => 0x09,
+        Key::Space => 0x20,
+        Key::Enter => 0x0D,
+        Key::Backspace => 0x08,
+        Key::Insert => 0x2D,
+        Key::Delete => 0x2E,
+        Key::Home => 0x24,
+        Key::End => 0x23,
+        Key::PageUp => 0x21,
+        Key::PageDown => 0x22,
+        Key::ArrowUp => 0x26,
+        Key::ArrowDown => 0x28,
+        Key::ArrowLeft => 0x25,
+        Key::ArrowRight => 0x27,
+        Key::A => 0x41,
+        Key::B => 0x42,
+        Key::C => 0x43,
+        Key::D => 0x44,
+        Key::E => 0x45,
+        Key::F => 0x46,
+        Key::G => 0x47,
+        Key::H => 0x48,
+        Key::I => 0x49,
+        Key::J => 0x4A,
+        Key::K => 0x4B,
+        Key::L => 0x4C,
+        Key::M => 0x4D,
+        Key::N => 0x4E,
+        Key::O => 0x4F,
+        Key::P => 0x50,
+        Key::Q => 0x51,
+        Key::R => 0x52,
+        Key::S => 0x53,
+        Key::T => 0x54,
+        Key::U => 0x55,
+        Key::V => 0x56,
+        Key::W => 0x57,
+        Key::X => 0x58,
+        Key::Y => 0x59,
+        Key::Z => 0x5A,
+        Key::Num0 => 0x30,
+        Key::Num1 => 0x31,
+        Key::Num2 => 0x32,
+        Key::Num3 => 0x33,
+        Key::Num4 => 0x34,
+        Key::Num5 => 0x35,
+        Key::Num6 => 0x36,
+        Key::Num7 => 0x37,
+        Key::Num8 => 0x38,
+        Key::Num9 => 0x39,
+        Key::Backtick => 0xC0,
+        Key::Minus => 0xBD,
+        Key::Equals => 0xBB,
+        Key::OpenBracket => 0xDB,
+        Key::CloseBracket => 0xDD,
+        Key::Backslash => 0xDC,
+        Key::Semicolon => 0xBA,
+        Key::Quote => 0xDE,
+        Key::Comma => 0xBC,
+        Key::Period => 0xBE,
+        Key::Slash => 0xBF,
+        _ => return None,
+    };
+    Some(vk as u16)
+}
+
+/// Human label for a Win32 VK code, used on the bind button.
+fn vk_to_label(vk: u16) -> String {
+    match vk {
+        0x70 => "F1".into(),
+        0x71 => "F2".into(),
+        0x72 => "F3".into(),
+        0x73 => "F4".into(),
+        0x74 => "F5".into(),
+        0x75 => "F6".into(),
+        0x76 => "F7".into(),
+        0x77 => "F8".into(),
+        0x78 => "F9".into(),
+        0x79 => "F10".into(),
+        0x7A => "F11".into(),
+        0x7B => "F12".into(),
+        0x09 => "Tab".into(),
+        0x20 => "Space".into(),
+        0x0D => "Enter".into(),
+        0x08 => "Backspace".into(),
+        0x1B => "Escape".into(),
+        0x10 | 0xA0 | 0xA1 => "Shift".into(),
+        0x11 | 0xA2 | 0xA3 => "Ctrl".into(),
+        0x12 | 0xA4 | 0xA5 => "Alt".into(),
+        0xC0 => "`".into(),
+        0x30..=0x39 => format!("{}", (vk - 0x30) as u8 as char),
+        0x41..=0x5A => format!("{}", vk as u8 as char),
+        0x26 => "Up".into(),
+        0x28 => "Down".into(),
+        0x25 => "Left".into(),
+        0x27 => "Right".into(),
+        other => format!("VK 0x{:02X}", other),
+    }
+}
+
+/// Human label for the two Windows X-buttons.
+fn xbutton_to_label(b: u16) -> String {
+    match b {
+        1 => "XBUTTON1 (back)".into(),
+        2 => "XBUTTON2 (forward)".into(),
+        other => format!("XBUTTON {}", other),
+    }
 }
 
 /// Open the config panel as a top-level window. Blocks until the user
@@ -469,12 +705,12 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> Result<(), eframe:
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            // Sized to show every section end-to-end at launch without a
-            // scrollbar for a typical ~6 character setup. The scroll area
-            // still kicks in if the user has many more characters or
-            // shrinks the window manually.
-            .with_inner_size([540.0, 900.0])
-            .with_min_inner_size([420.0, 500.0])
+            // Fixed-size window sized to show every section end-to-end
+            // without a scrollbar. Not resizable — this is a config
+            // panel, not a document viewer, and dialogs feel more
+            // intentional when they don't wiggle.
+            .with_inner_size([600.0, 1000.0])
+            .with_resizable(false)
             .with_title("Nicotine")
             .with_icon(icon),
         ..Default::default()

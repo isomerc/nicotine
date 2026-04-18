@@ -195,6 +195,12 @@ const LIST_TEXT_BLACK: COLORREF = COLORREF(0x0000_0000);
 pub struct PreviewPositions {
     #[serde(default)]
     pub positions: HashMap<String, (i32, i32)>,
+    /// Last-known position of the single list-view window (Display Mode =
+    /// List). Saved on drag-end, restored on window (re)create. Without
+    /// this, toggling display mode would reset the list window back to
+    /// its default spawn position every time.
+    #[serde(default)]
+    pub list_position: Option<(i32, i32)>,
 }
 
 impl PreviewPositions {
@@ -484,14 +490,25 @@ impl PreviewManager {
         let windows_len = self.state.lock().unwrap().get_windows().len();
         let height = list_window_height(windows_len);
 
+        // Restore the last-known list-view position if we have one and
+        // it's still on screen (handles saved coords from a prior setup
+        // with a now-disconnected monitor).
+        let (x, y) = self
+            .positions
+            .lock()
+            .unwrap()
+            .list_position
+            .filter(|(x, y)| position_on_screen(*x, *y))
+            .unwrap_or((20, 20));
+
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(title.as_ptr()),
                 WS_POPUP | WS_VISIBLE,
-                20,
-                20,
+                x,
+                y,
                 LIST_WIDTH,
                 height,
                 None,
@@ -998,6 +1015,20 @@ unsafe extern "system" fn list_wnd_proc(
             if state.drag_active {
                 state.drag_active = false;
                 let _ = ReleaseCapture();
+                if state.dragged {
+                    // Persist the new list-view position so it survives
+                    // a display-mode toggle (which destroys/recreates
+                    // this window) or a daemon restart.
+                    let mut rect = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut rect);
+                    let mgr_ptr =
+                        MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
+                    if !mgr_ptr.is_null() {
+                        let mut positions = (*mgr_ptr).positions.lock().unwrap();
+                        positions.list_position = Some((rect.left, rect.top));
+                        positions.save();
+                    }
+                }
                 state.dragged = false;
             }
             LRESULT(0)
