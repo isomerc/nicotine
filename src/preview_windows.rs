@@ -60,6 +60,17 @@ fn unpack_xy(lparam: LPARAM) -> (i32, i32) {
 /// the manager thread; the WinEvent callback runs on the same thread.
 static MANAGER_PTR: AtomicUsize = AtomicUsize::new(0);
 
+/// Read the shared `positions_locked` flag. Used by preview + list
+/// window drag handlers to ignore mouse drags when the user has locked
+/// the layout in the config panel.
+fn positions_locked() -> bool {
+    let ptr = MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
+    if ptr.is_null() {
+        return false;
+    }
+    unsafe { (*ptr).live.lock().unwrap().positions_locked }
+}
+
 /// WinEvent hook callback for EVENT_SYSTEM_FOREGROUND. Fires synchronously
 /// on every system-wide foreground change. Routes the new HWND into the
 /// manager so the active-client outline updates immediately instead of
@@ -807,7 +818,10 @@ unsafe extern "system" fn preview_wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            if state.drag_active {
+            // Positions locked: don't track motion. Keeping drag_active
+            // true means the subsequent WM_LBUTTONUP's `!dragged` path
+            // still fires, so click-to-activate keeps working.
+            if state.drag_active && !positions_locked() {
                 let (client_x, client_y) = unpack_xy(lparam);
                 let mut pt = POINT {
                     x: client_x,
@@ -986,7 +1000,8 @@ unsafe extern "system" fn list_wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            if state.drag_active {
+            // Positions locked: drag the list window is a no-op.
+            if state.drag_active && !positions_locked() {
                 let (cx, cy) = unpack_xy(lparam);
                 let mut pt = POINT { x: cx, y: cy };
                 let _ = ClientToScreen(hwnd, &mut pt);
@@ -1021,8 +1036,7 @@ unsafe extern "system" fn list_wnd_proc(
                     // this window) or a daemon restart.
                     let mut rect = RECT::default();
                     let _ = GetWindowRect(hwnd, &mut rect);
-                    let mgr_ptr =
-                        MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
+                    let mgr_ptr = MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
                     if !mgr_ptr.is_null() {
                         let mut positions = (*mgr_ptr).positions.lock().unwrap();
                         positions.list_position = Some((rect.left, rect.top));

@@ -23,6 +23,10 @@ pub struct LiveSettings {
     pub preview_width: u32,
     pub preview_height: u32,
     pub display_mode: DisplayMode,
+    /// When true, both preview windows and the client-list window
+    /// ignore mouse drags so they can't accidentally be knocked out of
+    /// position mid-game. Click-to-activate still works on previews.
+    pub positions_locked: bool,
 }
 
 impl LiveSettings {
@@ -31,6 +35,7 @@ impl LiveSettings {
             preview_width: config.preview_width,
             preview_height: config.preview_height,
             display_mode: config.display_mode,
+            positions_locked: config.positions_locked,
         }))
     }
 }
@@ -89,6 +94,10 @@ pub struct Config {
     /// Which on-screen representation of running clients Nicotine shows.
     #[serde(default = "default_display_mode")]
     pub display_mode: DisplayMode,
+    /// When true, drag is disabled on preview windows and the client
+    /// list so they can't accidentally move during gameplay.
+    #[serde(default)]
+    pub positions_locked: bool,
 }
 
 fn default_enable_mouse() -> bool {
@@ -277,6 +286,7 @@ impl Config {
             show_previews: default_show_previews(),
             characters: Vec::new(),
             display_mode: default_display_mode(),
+            positions_locked: false,
         }
     }
 
@@ -355,6 +365,7 @@ mod tests {
             show_previews: true,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
+            positions_locked: false,
         };
 
         // Height should be: 1080 - 40 = 1040
@@ -388,6 +399,7 @@ mod tests {
             show_previews: true,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
+            positions_locked: false,
         };
 
         assert_eq!(config.eve_height_adjusted(), 1080);
@@ -420,6 +432,7 @@ mod tests {
             show_previews: true,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
+            positions_locked: false,
         };
 
         let toml_str = toml::to_string(&config).unwrap();

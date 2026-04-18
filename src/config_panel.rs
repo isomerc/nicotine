@@ -300,6 +300,19 @@ impl ConfigPanel {
             // manager swaps modes within its next reconcile tick.
             self.live.lock().unwrap().display_mode = self.config.display_mode;
         }
+
+        ui.add_space(6.0);
+        let prev_lock = self.config.positions_locked;
+        ui.checkbox(
+            &mut self.config.positions_locked,
+            "Lock positions (drag disabled on previews and list)",
+        );
+        if self.config.positions_locked != prev_lock {
+            self.dirty = true;
+            // Live-apply so the running preview manager stops honoring
+            // drags immediately — no save + restart needed.
+            self.live.lock().unwrap().positions_locked = self.config.positions_locked;
+        }
     }
 
     fn draw_characters_section(&mut self, ui: &mut egui::Ui) {
