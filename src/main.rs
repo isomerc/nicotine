@@ -1,3 +1,12 @@
+// Release builds on Windows run under the GUI subsystem so Windows
+// doesn't allocate a console (or launch Windows Terminal) when the
+// user double-clicks nicotine.exe. Debug builds stay on the default
+// CONSOLE subsystem so `cargo run` / `cargo xwin run` during dev still
+// prints stdout. The tradeoff: release-binary runs from PowerShell no
+// longer show println! output in the shell. That's OK — the app is
+// GUI-first; the daemon subcommand still works, it just runs headless.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod config;
 mod config_panel;
 mod cycle_state;
@@ -316,6 +325,13 @@ fn main() -> Result<()> {
 
         "init-config" => {
             Config::save_default()?;
+        }
+
+        // Windows double-click: no command arg → go straight to the GUI
+        // start path rather than printing help to a hidden console.
+        #[cfg(windows)]
+        "" => {
+            start_command(wm, config)?;
         }
 
         // Handle switch command or numeric shorthand

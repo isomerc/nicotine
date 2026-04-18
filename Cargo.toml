@@ -6,6 +6,18 @@ description = "High-performance EVE Online multiboxing tool (Linux X11/Wayland a
 license = "MIT"
 repository = "https://github.com/isomerc/nicotine"
 
+# Binary name is capitalized so Windows users see `Nicotine.exe` in
+# Explorer (standard convention for user-facing apps like Discord.exe,
+# Chrome.exe). On Linux `install-local.sh` drops a lowercase `nicotine`
+# symlink next to it so shell commands stay lowercase.
+[[bin]]
+name = "Nicotine"
+path = "src/main.rs"
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+ico = "0.3"
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

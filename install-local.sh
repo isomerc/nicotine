@@ -3,7 +3,8 @@
 set -e
 
 INSTALL_DIR="$HOME/.local/bin"
-BINARY_NAME="nicotine"
+BINARY_NAME="Nicotine"
+LOWER_SYMLINK="nicotine"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "=== Nicotine Local Installer ==="
@@ -15,6 +16,9 @@ cargo build --release
 echo "[2/5] Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
 cp "target/release/$BINARY_NAME" "$INSTALL_DIR/"
+# Lowercase symlink so users can still type `nicotine` on the Linux CLI
+# despite the binary itself being capitalized for Windows UX.
+ln -sf "$BINARY_NAME" "$INSTALL_DIR/$LOWER_SYMLINK"
 
 echo "[3/5] Installing desktop file and icon..."
 mkdir -p ~/.local/share/applications

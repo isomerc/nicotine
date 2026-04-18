@@ -454,6 +454,13 @@ fn modifier_dropdown(ui: &mut egui::Ui, id: &str, value: &mut Option<u16>) -> bo
 /// closes the window. Takes a shared LiveSettings so slider changes can
 /// be applied to the running preview manager instantly.
 pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> Result<(), eframe::Error> {
+    // Load the Nicotine icon for the window chrome + taskbar + alt-tab.
+    // Baked into the binary via include_bytes so there's no external
+    // asset to lose on install. from_png_bytes goes through eframe's
+    // bundled `image` crate (already pulled in with the png feature).
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("failed to decode embedded icon.png");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             // Sized to show every section end-to-end at launch without a
@@ -462,7 +469,8 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> Result<(), eframe:
             // shrinks the window manually.
             .with_inner_size([540.0, 900.0])
             .with_min_inner_size([420.0, 500.0])
-            .with_title("Nicotine"),
+            .with_title("Nicotine")
+            .with_icon(icon),
         ..Default::default()
     };
 
