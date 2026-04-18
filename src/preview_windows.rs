@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use windows::core::PCWSTR;
@@ -19,19 +20,22 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT, TRANSPARENT,
+    InvalidateRect, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, TranslateMessage, GWLP_USERDATA, HCURSOR, HICON,
-    HMENU, HWND_TOPMOST, IDC_ARROW, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_DESTROY,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, TranslateMessage, EVENT_SYSTEM_FOREGROUND,
+    GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST, IDC_ARROW, MSG, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 /// Type alias for DWM thumbnail handles. windows-rs 0.59 doesn't expose a
@@ -48,6 +52,35 @@ fn unpack_xy(lparam: LPARAM) -> (i32, i32) {
     let x = (raw as u16) as i16 as i32;
     let y = ((raw >> 16) as u16) as i16 as i32;
     (x, y)
+}
+
+/// Pointer to the live PreviewManager, stored as a usize so the WinEvent
+/// callback (which can't capture environment) can find it. Set when the
+/// manager thread starts and cleared on shutdown. SAFETY: only written by
+/// the manager thread; the WinEvent callback runs on the same thread.
+static MANAGER_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// WinEvent hook callback for EVENT_SYSTEM_FOREGROUND. Fires synchronously
+/// on every system-wide foreground change. Routes the new HWND into the
+/// manager so the active-client outline updates immediately instead of
+/// waiting up to 500ms for the next reconcile tick.
+unsafe extern "system" fn foreground_event_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    if event != EVENT_SYSTEM_FOREGROUND {
+        return;
+    }
+    let ptr = MANAGER_PTR.load(Ordering::Acquire) as *mut PreviewManager;
+    if ptr.is_null() {
+        return;
+    }
+    (*ptr).update_active(hwnd_to_id(hwnd));
 }
 
 /// True if (x, y) lies somewhere inside the multi-monitor virtual screen.
@@ -69,7 +102,14 @@ const CONTROL_CLASS: &str = "NicotinePreviewCtrl\0";
 const RECONCILE_TIMER_ID: usize = 1;
 const RECONCILE_INTERVAL_MS: u32 = 500;
 const TITLE_HEIGHT: i32 = 24;
+const BORDER_WIDTH: i32 = 3;
 const DRAG_THRESHOLD_PX: i32 = 4;
+
+/// Win32 COLORREF is 0x00BBGGRR. Nicotine red is RGB(196, 30, 58).
+const NICOTINE_RED: COLORREF = COLORREF(0x003A_1EC4);
+/// Dark chrome color used for inactive previews — same as the title strip
+/// so the border blends in until a client becomes active.
+const CHROME_DARK: COLORREF = COLORREF(0x0000_0000);
 
 /// Per-character preview window position. Persisted to disk so previews come
 /// back at the same place across daemon restarts.
@@ -128,12 +168,20 @@ struct PreviewWindowState {
     dragged: bool,
     drag_origin_screen: (i32, i32),
     drag_origin_window: (i32, i32),
+    /// True when this preview's source EVE client is the system foreground
+    /// window. Read from WM_PAINT to choose border color. Updated by
+    /// reconcile via the GWLP_USERDATA pointer.
+    is_active: bool,
 }
 
 /// One owned preview window. Drop unregisters the DWM thumbnail.
 struct OwnedPreview {
     hwnd: HWND,
     source_id: u32,
+    /// Mirror of `PreviewWindowState.is_active` kept here so reconcile
+    /// can detect changes without dereferencing the GWLP_USERDATA pointer
+    /// on every tick.
+    is_active: bool,
 }
 
 impl Drop for OwnedPreview {
@@ -206,6 +254,31 @@ impl PreviewManager {
                 );
             }
         }
+
+        // Polling fallback in case the WinEvent hook missed something
+        // (rare). The hook is the primary path and updates instantly.
+        let active_id = self.wm.get_active_window().unwrap_or(0);
+        self.update_active(active_id);
+    }
+
+    /// Set the active-client highlight to whichever preview matches
+    /// `active_id`. Cheap to call repeatedly — only invalidates and
+    /// repaints when a preview's state actually flips.
+    fn update_active(&mut self, active_id: u32) {
+        for preview in self.previews.values_mut() {
+            let now_active = preview.source_id == active_id;
+            if preview.is_active == now_active {
+                continue;
+            }
+            preview.is_active = now_active;
+            unsafe {
+                let ptr = GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *mut PreviewWindowState;
+                if !ptr.is_null() {
+                    (*ptr).is_active = now_active;
+                }
+                let _ = InvalidateRect(Some(preview.hwnd), None, true);
+            }
+        }
     }
 
     fn create_preview(&mut self, window: &crate::window_manager::EveWindow) -> Result<()> {
@@ -269,6 +342,7 @@ impl PreviewManager {
             dragged: false,
             drag_origin_screen: (0, 0),
             drag_origin_window: (0, 0),
+            is_active: false,
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(per_window) as isize);
@@ -293,6 +367,7 @@ impl PreviewManager {
             OwnedPreview {
                 hwnd,
                 source_id: window.id,
+                is_active: false,
             },
         );
         Ok(())
@@ -307,18 +382,19 @@ impl PreviewManager {
 }
 
 /// Recompute the DWM thumbnail destination rect. The thumbnail occupies
-/// everything below the title strip. We mirror the whole source window
-/// (including any title bar/border) — EVE's client area definition
-/// reportedly hides the actual game render surface, so SOURCECLIENTAREAONLY
-/// gives a blank preview.
+/// everything below the title strip, inset by BORDER_WIDTH on the sides
+/// and bottom so we have margin to paint the active-client outline. We
+/// mirror the whole source window (including any title bar/border) — EVE's
+/// client area definition reportedly hides the actual game render surface,
+/// so SOURCECLIENTAREAONLY gives a blank preview.
 fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
     let props = DWM_THUMBNAIL_PROPERTIES {
         dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
         rcDestination: RECT {
-            left: 0,
+            left: BORDER_WIDTH,
             top: TITLE_HEIGHT,
-            right: width,
-            bottom: height,
+            right: width - BORDER_WIDTH,
+            bottom: height - BORDER_WIDTH,
         },
         rcSource: RECT::default(),
         opacity: 255,
@@ -348,7 +424,7 @@ unsafe extern "system" fn preview_wnd_proc(
 
     match msg {
         WM_PAINT => {
-            paint_title_strip(hwnd, &state.character_name);
+            paint_chrome(hwnd, &state.character_name, state.is_active);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -426,32 +502,62 @@ unsafe extern "system" fn preview_wnd_proc(
     }
 }
 
-unsafe fn paint_title_strip(hwnd: HWND, character_name: &str) {
+/// Paint the preview's chrome: a title strip at the top with the
+/// character name, plus a left/right/bottom border around the thumbnail
+/// area. Border color is Nicotine red when this client is the system
+/// foreground window, otherwise the same dark color as the title strip
+/// (so it blends seamlessly).
+unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
 
     let mut rect = RECT::default();
     let _ = GetWindowRect(hwnd, &mut rect);
     let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
 
-    let strip = RECT {
+    let chrome_color = if is_active { NICOTINE_RED } else { CHROME_DARK };
+    let chrome_brush = CreateSolidBrush(chrome_color);
+
+    // Top strip (full-width title bar).
+    let title_strip = RECT {
         left: 0,
         top: 0,
         right: width,
         bottom: TITLE_HEIGHT,
     };
+    FillRect(hdc, &title_strip, chrome_brush);
 
-    // Dark gray title strip
-    let bg = CreateSolidBrush(COLORREF(0x002A2A2A));
-    FillRect(hdc, &strip, bg);
-    let _ = DeleteObject(bg.into());
+    // Left, right, and bottom borders around the thumbnail area.
+    let left_border = RECT {
+        left: 0,
+        top: TITLE_HEIGHT,
+        right: BORDER_WIDTH,
+        bottom: height,
+    };
+    let right_border = RECT {
+        left: width - BORDER_WIDTH,
+        top: TITLE_HEIGHT,
+        right: width,
+        bottom: height,
+    };
+    let bottom_border = RECT {
+        left: 0,
+        top: height - BORDER_WIDTH,
+        right: width,
+        bottom: height,
+    };
+    FillRect(hdc, &left_border, chrome_brush);
+    FillRect(hdc, &right_border, chrome_brush);
+    FillRect(hdc, &bottom_border, chrome_brush);
 
-    // White centered text. DrawTextW takes &mut [u16] but doesn't actually
-    // mutate it for the formatting flags we use.
+    let _ = DeleteObject(chrome_brush.into());
+
+    // White centered character name in the title strip.
     let _ = SetBkMode(hdc, TRANSPARENT);
-    let _ = SetTextColor(hdc, COLORREF(0x00FFFFFF));
+    let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
     let mut text: Vec<u16> = character_name.encode_utf16().collect();
-    let mut text_rect = strip;
+    let mut text_rect = title_strip;
     let _ = DrawTextW(
         hdc,
         &mut text,
@@ -588,6 +694,7 @@ fn run_manager(
         next_default_offset: 0,
     });
     let manager_ptr = Box::into_raw(manager);
+    MANAGER_PTR.store(manager_ptr as usize, Ordering::Release);
     unsafe {
         SetWindowLongPtrW(control_hwnd, GWLP_USERDATA, manager_ptr as isize);
         let _ = SetTimer(
@@ -597,6 +704,23 @@ fn run_manager(
             None,
         );
     }
+
+    // Subscribe to system-wide foreground changes so the active-client
+    // outline updates instantly on focus change instead of waiting up to
+    // 500ms for the next reconcile tick. WINEVENT_OUTOFCONTEXT delivers
+    // the callback on this thread via the message queue, which is exactly
+    // what we want — no cross-thread synchronization needed.
+    let win_event_hook = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(foreground_event_proc),
+            0, // any process
+            0, // any thread
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
 
     // Main message pump for the manager + all preview windows on this
     // thread.
@@ -614,6 +738,8 @@ fn run_manager(
 
     // Cleanup on shutdown.
     unsafe {
+        let _ = UnhookWinEvent(win_event_hook);
+        MANAGER_PTR.store(0, Ordering::Release);
         let _ = KillTimer(Some(control_hwnd), RECONCILE_TIMER_ID);
         if !manager_ptr.is_null() {
             // Drop the manager last — that drops the OwnedPreview map, which

@@ -153,18 +153,28 @@ impl Config {
         path
     }
 
+    /// Path Nicotine looks at for the per-character cycle order file.
+    pub fn characters_path() -> PathBuf {
+        let mut path = Self::config_dir();
+        path.push("characters.txt");
+        path
+    }
+
     /// Load character order from characters.txt
     /// Each line is a character name (without "EVE - " prefix)
     /// Returns None if file doesn't exist
     pub fn load_characters() -> Option<Vec<String>> {
-        let mut path = Self::config_dir();
-        path.push("characters.txt");
+        let path = Self::characters_path();
 
         if !path.exists() {
             return None;
         }
 
         fs::read_to_string(&path).ok().map(|contents| {
+            // Strip a UTF-8 BOM if present — Windows Notepad writes one by
+            // default and the invisible \u{feff} prefix would silently
+            // break the first character's name match against EVE titles.
+            let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
             contents
                 .lines()
                 .map(|line| line.trim().to_string())

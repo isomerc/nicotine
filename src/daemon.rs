@@ -60,9 +60,18 @@ impl Daemon {
         // Load character order. Used by both targeted cycling (switch N)
         // and forward/backward cycling. Stored on CycleState too so the
         // cycle methods don't need it as a parameter.
+        let characters_path = Config::characters_path();
         let character_order = Config::load_characters();
-        if character_order.is_some() {
-            println!("Loaded character order from characters.txt");
+        match &character_order {
+            Some(names) => println!(
+                "Loaded {} character(s) from {}",
+                names.len(),
+                characters_path.display()
+            ),
+            None => println!(
+                "characters.txt not found at {} — cycling will use detection order",
+                characters_path.display()
+            ),
         }
         state
             .lock()
@@ -84,13 +93,30 @@ impl Daemon {
         // Spawn platform-specific input listeners.
         self.spawn_input_listeners();
 
-        // Refresh window list periodically in background
+        // Refresh window list AND character_order periodically in
+        // background. Reloading characters.txt on every tick means edits
+        // to the file are picked up within ~500ms — no daemon restart
+        // needed when the user adds/reorders character names.
         let wm_clone = Arc::clone(&self.wm);
         let state_clone = Arc::clone(&self.state);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if let Ok(windows) = wm_clone.get_eve_windows() {
-                state_clone.lock().unwrap().update_windows(windows);
+        std::thread::spawn(move || {
+            let mut last_order: Option<Vec<String>> = Config::load_characters();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if let Ok(windows) = wm_clone.get_eve_windows() {
+                    state_clone.lock().unwrap().update_windows(windows);
+                }
+                let new_order = Config::load_characters();
+                if new_order != last_order {
+                    if new_order.is_some() {
+                        println!("Reloaded character order from characters.txt");
+                    }
+                    state_clone
+                        .lock()
+                        .unwrap()
+                        .set_character_order(new_order.clone());
+                    last_order = new_order;
+                }
             }
         });
 
