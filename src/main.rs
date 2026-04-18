@@ -1,4 +1,5 @@
 mod config;
+mod config_panel;
 mod cycle_state;
 mod daemon;
 mod ipc;
@@ -23,14 +24,12 @@ mod x11_manager;
 #[cfg(windows)]
 mod preview_windows;
 #[cfg(windows)]
-mod windows_daemon;
-#[cfg(windows)]
 mod windows_input;
 #[cfg(windows)]
 mod windows_manager;
 
 use anyhow::Result;
-use config::Config;
+use config::{Config, LiveSettings};
 use cycle_state::CycleState;
 use daemon::Daemon;
 use std::env;
@@ -106,14 +105,16 @@ enum CycleOp {
 
 #[cfg(unix)]
 fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
+    let live = LiveSettings::from_config(&config);
     let daemonize = Daemonize::new().working_directory("/tmp").umask(0o027);
 
     match daemonize.start() {
         Ok(_) => {
             let wm_daemon = Arc::clone(&wm);
             let config_daemon = config.clone();
+            let live_daemon = Arc::clone(&live);
             let daemon_thread = std::thread::spawn(move || {
-                let mut daemon = Daemon::new(wm_daemon, config_daemon);
+                let mut daemon = Daemon::new(wm_daemon, config_daemon, live_daemon);
                 if let Err(e) = daemon.run() {
                     eprintln!("Daemon error: {}", e);
                 }
@@ -146,16 +147,34 @@ fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
 
 #[cfg(windows)]
 fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
-    // The detached child re-execs with this env var set; on that side we just
-    // run the daemon directly instead of spawning another child.
-    if std::env::var("NICOTINE_DAEMON_CHILD").is_ok() {
-        let mut daemon = Daemon::new(wm, config);
-        daemon.run()?;
-        return Ok(());
+    let live = LiveSettings::from_config(&config);
+
+    // If a separate daemon is already running (e.g. the user invoked
+    // `nicotine.exe daemon` in headless mode), don't spawn a duplicate —
+    // just open the config panel. Edits propagate via hot-reload.
+    if !ipc::daemon_running() {
+        let wm_daemon = Arc::clone(&wm);
+        let config_daemon = config.clone();
+        let live_daemon = Arc::clone(&live);
+        std::thread::spawn(move || {
+            let mut daemon = Daemon::new(wm_daemon, config_daemon, live_daemon);
+            if let Err(e) = daemon.run() {
+                eprintln!("Daemon error: {}", e);
+            }
+        });
+        // Brief pause so the IPC socket is bound before the panel opens.
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    windows_daemon::spawn_detached_self()?;
-    println!("✓ Daemon spawned in background");
+    // The config panel is the visible app — it shows in the taskbar and
+    // owns the process's main thread. eframe blocks here until the user
+    // closes the window; on close, the process exits and the daemon
+    // thread terminates with it. The shared LiveSettings lets the panel
+    // push slider changes straight to the preview manager without
+    // waiting for a save-to-disk round-trip.
+    if let Err(e) = config_panel::run(config, live) {
+        eprintln!("Config panel error: {}", e);
+    }
     Ok(())
 }
 
@@ -187,7 +206,11 @@ fn run_cycle_direct(wm: &Arc<dyn WindowManager>, config: &Config, op: CycleOp) -
         return Ok(());
     }
 
-    let character_order = Config::load_characters();
+    let character_order = if config.characters.is_empty() {
+        None
+    } else {
+        Some(config.characters.clone())
+    };
 
     let mut state = CycleState::new();
     state.set_character_order(character_order.clone());
@@ -233,7 +256,8 @@ fn main() -> Result<()> {
 
         "daemon" => {
             println!("Starting Nicotine daemon...");
-            let mut daemon = Daemon::new(wm, config);
+            let live = LiveSettings::from_config(&config);
+            let mut daemon = Daemon::new(wm, config, live);
             daemon.run()?;
         }
 

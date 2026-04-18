@@ -14,10 +14,10 @@ anyhow = "1.0"
 dirs = "5.0"
 interprocess = "2.2"
 fd-lock = "4.0"
+egui = "0.29"
 
 [target.'cfg(unix)'.dependencies]
 x11rb = { version = "0.13", features = ["all-extensions"] }
-egui = "0.29"
 eframe = { version = "0.29", default-features = false, features = [
   "default_fonts",
   "glow",
@@ -34,6 +34,10 @@ reqwest = { version = "0.12", features = [
 ], default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+eframe = { version = "0.29", default-features = false, features = [
+  "default_fonts",
+  "glow",
+] }
 windows = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",

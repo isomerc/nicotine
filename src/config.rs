@@ -2,6 +2,26 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+/// Settings that components watch for *live* changes — e.g. the preview
+/// manager resizes windows as soon as these change, without waiting for a
+/// save-to-disk + hot-reload cycle. Shared via Arc<Mutex<>> between the
+/// config panel (writer) and the preview manager (reader).
+#[derive(Debug, Clone)]
+pub struct LiveSettings {
+    pub preview_width: u32,
+    pub preview_height: u32,
+}
+
+impl LiveSettings {
+    pub fn from_config(config: &Config) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            preview_width: config.preview_width,
+            preview_height: config.preview_height,
+        }))
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -48,6 +68,12 @@ pub struct Config {
     /// false, the daemon runs headless and you cycle via hotkeys / CLI only.
     #[serde(default = "default_show_previews")]
     pub show_previews: bool,
+    /// Ordered list of EVE character names. Forward/backward cycling
+    /// traverses this order; `switch N` maps target N to entry N-1.
+    /// Empty list = cycle through whatever order the window manager
+    /// reports (no stable ordering).
+    #[serde(default)]
+    pub characters: Vec<String>,
 }
 
 fn default_enable_mouse() -> bool {
@@ -153,34 +179,21 @@ impl Config {
         path
     }
 
-    /// Path Nicotine looks at for the per-character cycle order file.
-    pub fn characters_path() -> PathBuf {
-        let mut path = Self::config_dir();
-        path.push("characters.txt");
-        path
+    /// Public accessor for `config.toml`'s on-disk path.
+    pub fn config_path_for_display() -> PathBuf {
+        Self::config_path()
     }
 
-    /// Load character order from characters.txt
-    /// Each line is a character name (without "EVE - " prefix)
-    /// Returns None if file doesn't exist
-    pub fn load_characters() -> Option<Vec<String>> {
-        let path = Self::characters_path();
-
-        if !path.exists() {
-            return None;
+    /// Persist the current Config back to disk. Used by the config panel
+    /// to commit user edits.
+    pub fn save(&self) -> Result<()> {
+        let config_path = Self::config_path();
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
         }
-
-        fs::read_to_string(&path).ok().map(|contents| {
-            // Strip a UTF-8 BOM if present — Windows Notepad writes one by
-            // default and the invisible \u{feff} prefix would silently
-            // break the first character's name match against EVE titles.
-            let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
-            contents
-                .lines()
-                .map(|line| line.trim().to_string())
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .collect()
-        })
+        let contents = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        fs::write(&config_path, contents).context("Failed to write config.toml")?;
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -243,6 +256,7 @@ impl Config {
             preview_width: default_preview_width(),
             preview_height: default_preview_height(),
             show_previews: default_show_previews(),
+            characters: Vec::new(),
         }
     }
 
@@ -319,6 +333,7 @@ mod tests {
             preview_width: 320,
             preview_height: 180,
             show_previews: true,
+            characters: Vec::new(),
         };
 
         // Height should be: 1080 - 40 = 1040
@@ -350,6 +365,7 @@ mod tests {
             preview_width: 320,
             preview_height: 180,
             show_previews: true,
+            characters: Vec::new(),
         };
 
         assert_eq!(config.eve_height_adjusted(), 1080);
@@ -380,6 +396,7 @@ mod tests {
             preview_width: 320,
             preview_height: 180,
             show_previews: true,
+            characters: Vec::new(),
         };
 
         let toml_str = toml::to_string(&config).unwrap();

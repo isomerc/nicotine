@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, LiveSettings};
 use crate::cycle_state::CycleState;
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
@@ -161,7 +161,10 @@ fn position_on_screen(x: i32, y: i32) -> bool {
 const PREVIEW_CLASS: &str = "NicotinePreviewWnd\0";
 const CONTROL_CLASS: &str = "NicotinePreviewCtrl\0";
 const RECONCILE_TIMER_ID: usize = 1;
-const RECONCILE_INTERVAL_MS: u32 = 500;
+/// Reconcile tick interval in ms. Needs to be snappy enough that slider
+/// drags in the config panel feel live. 100ms = 10fps — enough for size
+/// changes to track a dragging slider without a visible lag.
+const RECONCILE_INTERVAL_MS: u32 = 100;
 const TITLE_HEIGHT: i32 = 24;
 const BORDER_WIDTH: i32 = 3;
 const DRAG_THRESHOLD_PX: i32 = 4;
@@ -273,10 +276,19 @@ struct PreviewManager {
     /// Where to drop the next never-seen-before preview. Increments
     /// diagonally so multiple new clients don't stack on top of each other.
     next_default_offset: i32,
+    /// Shared settings watched for live updates (e.g. slider drags in the
+    /// config panel). Checked on every reconcile tick; any difference from
+    /// the cached config values triggers a resize pass over all previews.
+    live: Arc<Mutex<LiveSettings>>,
 }
 
 impl PreviewManager {
     fn reconcile(&mut self) {
+        // Apply any pending live-settings changes first — this lets the
+        // user drag the size sliders in the config panel and see preview
+        // windows resize in real time.
+        self.apply_live_size();
+
         let windows = {
             let s = self.state.lock().unwrap();
             s.get_windows().to_vec()
@@ -324,6 +336,46 @@ impl PreviewManager {
         // (rare). The hook is the primary path and updates instantly.
         let active_id = self.wm.get_active_window().unwrap_or(0);
         self.update_active(active_id);
+    }
+
+    /// Read the shared LiveSettings and, if the user has adjusted preview
+    /// size, resize every preview window and update its DWM thumbnail
+    /// rect. No-op when nothing has changed.
+    fn apply_live_size(&mut self) {
+        let (want_w, want_h) = {
+            let live = self.live.lock().unwrap();
+            (live.preview_width, live.preview_height)
+        };
+        if want_w == self.config.preview_width && want_h == self.config.preview_height {
+            return;
+        }
+        self.config.preview_width = want_w;
+        self.config.preview_height = want_h;
+        let w = want_w as i32;
+        let h = want_h as i32;
+        for preview in self.previews.values() {
+            unsafe {
+                // Resize the window without touching its position or z-order.
+                let _ = SetWindowPos(
+                    preview.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    w,
+                    h,
+                    SWP_NOMOVE | SWP_NOACTIVATE,
+                );
+                // Recompute the thumbnail destination rect against the
+                // new window size so the mirror fills the new area.
+                let ptr =
+                    GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
+                if !ptr.is_null() {
+                    update_thumbnail_rect((*ptr).thumbnail, w, h);
+                }
+                // Repaint title strip + border at the new dimensions.
+                let _ = InvalidateRect(Some(preview.hwnd), None, true);
+            }
+        }
     }
 
     /// Snapshot of all preview window rects in screen coordinates,
@@ -752,9 +804,10 @@ pub fn spawn(
     config: Config,
     wm: Arc<dyn WindowManager>,
     state: Arc<Mutex<CycleState>>,
+    live: Arc<Mutex<LiveSettings>>,
 ) -> Result<JoinHandle<()>> {
     let handle = std::thread::spawn(move || {
-        if let Err(e) = run_manager(config, wm, state) {
+        if let Err(e) = run_manager(config, wm, state, live) {
             eprintln!("Preview window manager exited with error: {}", e);
         }
     });
@@ -765,6 +818,7 @@ fn run_manager(
     config: Config,
     wm: Arc<dyn WindowManager>,
     state: Arc<Mutex<CycleState>>,
+    live: Arc<Mutex<LiveSettings>>,
 ) -> Result<()> {
     // Touch the thread ID so message routing works (and so any future
     // PostThreadMessage senders have a stable ID to target).
@@ -807,6 +861,7 @@ fn run_manager(
         positions,
         previews: HashMap::new(),
         next_default_offset: 0,
+        live,
     });
     let manager_ptr = Box::into_raw(manager);
     MANAGER_PTR.store(manager_ptr as usize, Ordering::Release);

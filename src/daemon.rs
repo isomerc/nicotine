@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, LiveSettings};
 use crate::cycle_state::CycleState;
 use crate::ipc;
 #[cfg(unix)]
@@ -46,10 +46,11 @@ pub struct Daemon {
     state: Arc<Mutex<CycleState>>,
     config: Config,
     character_order: Option<Vec<String>>,
+    live: Arc<Mutex<LiveSettings>>,
 }
 
 impl Daemon {
-    pub fn new(wm: Arc<dyn WindowManager>, config: Config) -> Self {
+    pub fn new(wm: Arc<dyn WindowManager>, config: Config, live: Arc<Mutex<LiveSettings>>) -> Self {
         let state = Arc::new(Mutex::new(CycleState::new()));
 
         // Initialize windows
@@ -57,20 +58,19 @@ impl Daemon {
             state.lock().unwrap().update_windows(windows);
         }
 
-        // Load character order. Used by both targeted cycling (switch N)
-        // and forward/backward cycling. Stored on CycleState too so the
-        // cycle methods don't need it as a parameter.
-        let characters_path = Config::characters_path();
-        let character_order = Config::load_characters();
+        // Character order lives in config.toml under `characters`. Used by
+        // both targeted cycling (switch N) and forward/backward cycling.
+        // Stored on CycleState too so the cycle methods don't need it as
+        // a parameter.
+        let character_order = if config.characters.is_empty() {
+            None
+        } else {
+            Some(config.characters.clone())
+        };
         match &character_order {
-            Some(names) => println!(
-                "Loaded {} character(s) from {}",
-                names.len(),
-                characters_path.display()
-            ),
+            Some(names) => println!("Loaded {} character(s) from config.toml", names.len()),
             None => println!(
-                "characters.txt not found at {} — cycling will use detection order",
-                characters_path.display()
+                "No `characters` configured in config.toml — cycling will use detection order"
             ),
         }
         state
@@ -83,6 +83,7 @@ impl Daemon {
             state,
             config,
             character_order,
+            live,
         }
     }
 
@@ -93,23 +94,35 @@ impl Daemon {
         // Spawn platform-specific input listeners.
         self.spawn_input_listeners();
 
-        // Refresh window list AND character_order periodically in
-        // background. Reloading characters.txt on every tick means edits
-        // to the file are picked up within ~500ms — no daemon restart
-        // needed when the user adds/reorders character names.
+        // Refresh window list AND character order periodically in
+        // background. Re-reading config.toml on every tick means edits
+        // (via the config panel or direct file edit) are picked up
+        // within ~500ms — no daemon restart needed.
         let wm_clone = Arc::clone(&self.wm);
         let state_clone = Arc::clone(&self.state);
-        std::thread::spawn(move || {
-            let mut last_order: Option<Vec<String>> = Config::load_characters();
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                if let Ok(windows) = wm_clone.get_eve_windows() {
-                    state_clone.lock().unwrap().update_windows(windows);
-                }
-                let new_order = Config::load_characters();
+        let mut last_order: Option<Vec<String>> = if self.config.characters.is_empty() {
+            None
+        } else {
+            Some(self.config.characters.clone())
+        };
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Ok(windows) = wm_clone.get_eve_windows() {
+                state_clone.lock().unwrap().update_windows(windows);
+            }
+            // Re-read config.toml to detect changes to the characters list.
+            if let Ok(fresh_config) = Config::load() {
+                let new_order = if fresh_config.characters.is_empty() {
+                    None
+                } else {
+                    Some(fresh_config.characters.clone())
+                };
                 if new_order != last_order {
-                    if new_order.is_some() {
-                        println!("Reloaded character order from characters.txt");
+                    match &new_order {
+                        Some(names) => {
+                            println!("Reloaded {} character(s) from config.toml", names.len())
+                        }
+                        None => println!("Character list cleared in config.toml"),
                     }
                     state_clone
                         .lock()
@@ -189,7 +202,13 @@ impl Daemon {
         if self.config.show_previews {
             let wm_clone = Arc::clone(&self.wm);
             let state_clone = Arc::clone(&self.state);
-            match crate::preview_windows::spawn(self.config.clone(), wm_clone, state_clone) {
+            let live_clone = Arc::clone(&self.live);
+            match crate::preview_windows::spawn(
+                self.config.clone(),
+                wm_clone,
+                state_clone,
+                live_clone,
+            ) {
                 Ok(_) => println!("DWM preview windows started"),
                 Err(e) => {
                     eprintln!("Warning: Could not start preview window manager: {}", e)
