@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -19,9 +19,10 @@ use windows::Win32::Graphics::Dwm::{
     DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    InvalidateRect, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT,
-    TRANSPARENT,
+    AddFontMemResourceEx, BeginPaint, ClientToScreen, CreateFontIndirectW, CreateSolidBrush,
+    DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect, SelectObject, SetBkMode,
+    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CENTER,
+    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HFONT, LOGFONTW, OUT_TT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -893,6 +894,74 @@ unsafe extern "system" fn preview_wnd_proc(
     }
 }
 
+/// Register JetBrains Mono + Marlboro with GDI from bytes embedded in the
+/// binary. After this runs, CreateFontIndirectW can locate both fonts by
+/// family name. Idempotent — GDI refcounts the underlying data on repeat
+/// calls, and the OnceLock ensures we only do it once per process.
+fn register_embedded_fonts() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        const FONTS: &[&[u8]] = &[
+            include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
+            include_bytes!("../assets/fonts/Marlboro.ttf"),
+        ];
+        for bytes in FONTS {
+            let mut count: u32 = 0;
+            unsafe {
+                AddFontMemResourceEx(
+                    bytes.as_ptr() as *const _,
+                    bytes.len() as u32,
+                    None,
+                    &mut count,
+                );
+            }
+        }
+    });
+}
+
+/// Build a LOGFONTW + create an HFONT for `face` at the given negative
+/// lfHeight (pixels). Caller owns the returned HFONT; in practice we stash
+/// them in OnceLocks and never delete them — they live for the process.
+unsafe fn create_font(face: &str, height: i32) -> HFONT {
+    let mut logfont = LOGFONTW {
+        lfHeight: height,
+        lfWeight: FW_NORMAL.0 as i32,
+        lfCharSet: DEFAULT_CHARSET,
+        lfOutPrecision: OUT_TT_PRECIS,
+        lfClipPrecision: CLIP_DEFAULT_PRECIS,
+        lfQuality: CLEARTYPE_QUALITY,
+        ..Default::default()
+    };
+    let face_u16: Vec<u16> = face.encode_utf16().collect();
+    let max = logfont.lfFaceName.len() - 1;
+    for (i, c) in face_u16.iter().take(max).enumerate() {
+        logfont.lfFaceName[i] = *c;
+    }
+    CreateFontIndirectW(&logfont)
+}
+
+/// JetBrains Mono for body text — character names on preview titles and
+/// on list rows. Matches the config panel's body font.
+fn nicotine_body_font() -> HFONT {
+    static SLOT: OnceLock<isize> = OnceLock::new();
+    let raw = *SLOT.get_or_init(|| {
+        register_embedded_fonts();
+        unsafe { create_font("JetBrains Mono", -14).0 as isize }
+    });
+    HFONT(raw as *mut _)
+}
+
+/// Marlboro for the list window's "NICOTINE" title strip — matches the
+/// config panel's header.
+fn nicotine_logo_font() -> HFONT {
+    static SLOT: OnceLock<isize> = OnceLock::new();
+    let raw = *SLOT.get_or_init(|| {
+        register_embedded_fonts();
+        unsafe { create_font("Marlboro", -20).0 as isize }
+    });
+    HFONT(raw as *mut _)
+}
+
 /// Paint the preview's chrome: a title strip at the top with the
 /// character name, plus a left/right/bottom border around the thumbnail
 /// area. Border color is Nicotine red when this client is the system
@@ -947,6 +1016,8 @@ unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
     // White centered character name in the title strip.
     let _ = SetBkMode(hdc, TRANSPARENT);
     let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+    let body_font = nicotine_body_font();
+    let prev_font = SelectObject(hdc, body_font.into());
     let mut text: Vec<u16> = character_name.encode_utf16().collect();
     let mut text_rect = title_strip;
     let _ = DrawTextW(
@@ -955,6 +1026,7 @@ unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
         &mut text_rect,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
+    SelectObject(hdc, prev_font);
 
     let _ = EndPaint(hwnd, &ps);
 }
@@ -1088,9 +1160,11 @@ unsafe fn paint_list(hwnd: HWND) {
 
     let _ = SetBkMode(hdc, TRANSPARENT);
 
-    // Title text
+    // Title text — Marlboro logo font, matching the config panel header.
     let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
-    let mut title_text: Vec<u16> = "NICOTINE".encode_utf16().collect();
+    let logo_font = nicotine_logo_font();
+    let prev_title_font = SelectObject(hdc, logo_font.into());
+    let mut title_text: Vec<u16> = "Nicotine".encode_utf16().collect();
     let mut title_draw_rect = title_rect;
     let _ = DrawTextW(
         hdc,
@@ -1098,6 +1172,7 @@ unsafe fn paint_list(hwnd: HWND) {
         &mut title_draw_rect,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
+    SelectObject(hdc, prev_title_font);
 
     // Pull the latest window list + active id via MANAGER_PTR. Safe
     // because the control thread (us) owns the manager memory.
@@ -1115,7 +1190,9 @@ unsafe fn paint_list(hwnd: HWND) {
         s.get_ordered_windows()
     };
 
-    // Per-row text
+    // Per-row text — JetBrains Mono, same as config panel body text.
+    let body_font = nicotine_body_font();
+    let prev_row_font = SelectObject(hdc, body_font.into());
     let mut y = TITLE_HEIGHT + 2;
     for window in &windows {
         let is_active = window.id == active_id;
@@ -1140,6 +1217,7 @@ unsafe fn paint_list(hwnd: HWND) {
         let _ = DrawTextW(hdc, &mut row_buf, &mut row_rect, DT_SINGLELINE | DT_VCENTER);
         y += LIST_ROW_HEIGHT;
     }
+    SelectObject(hdc, prev_row_font);
 
     let _ = EndPaint(hwnd, &ps);
 }

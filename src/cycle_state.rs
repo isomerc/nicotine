@@ -60,6 +60,43 @@ impl CycleState {
             .collect()
     }
 
+    /// Activate the EVE client whose title exactly matches `name`.
+    /// No-op if that character isn't currently logged in. Used by
+    /// per-character global hotkeys.
+    pub fn switch_to_character(
+        &mut self,
+        name: &str,
+        wm: &dyn WindowManager,
+        minimize_inactive: bool,
+    ) -> Result<()> {
+        let target_idx = match self.windows.iter().position(|w| w.title == name) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        if target_idx == self.current_index {
+            // Already focused — ensure it's actually brought to
+            // foreground (in case another app stole focus) and return.
+            let id = self.windows[target_idx].id;
+            wm.activate_window(id)?;
+            return Ok(());
+        }
+
+        let previous_index = self.current_index;
+        self.current_index = target_idx;
+        self.write_index();
+
+        let new_id = self.windows[target_idx].id;
+        if minimize_inactive {
+            let _ = wm.restore_window(new_id);
+        }
+        wm.activate_window(new_id)?;
+        if minimize_inactive {
+            let prev_id = self.windows[previous_index].id;
+            let _ = wm.minimize_window(prev_id);
+        }
+        Ok(())
+    }
+
     pub fn cycle_forward(&mut self, wm: &dyn WindowManager, minimize_inactive: bool) -> Result<()> {
         self.cycle_step(wm, minimize_inactive, 1)
     }

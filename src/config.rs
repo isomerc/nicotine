@@ -1,8 +1,19 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+/// A single per-character hotkey binding. `vk` is a Win32 Virtual-Key
+/// code (or evdev code on Linux); `modifier` is an optional second VK
+/// that must be held down (typically Shift/Ctrl/Alt).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct CharacterHotkey {
+    pub vk: u16,
+    #[serde(default)]
+    pub modifier: Option<u16>,
+}
 
 /// How the visible-at-a-glance view of clients is rendered.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +109,13 @@ pub struct Config {
     /// list so they can't accidentally move during gameplay.
     #[serde(default)]
     pub positions_locked: bool,
+    /// Map of character name → hotkey for jump-to-character. When the
+    /// configured key (plus optional modifier) fires, Nicotine activates
+    /// that EVE client directly — independent of the forward/backward
+    /// cycle. Keyed by name so bindings follow reorders and renames
+    /// without reassigning keys.
+    #[serde(default)]
+    pub character_hotkeys: HashMap<String, CharacterHotkey>,
 }
 
 fn default_enable_mouse() -> bool {
@@ -287,6 +305,7 @@ impl Config {
             characters: Vec::new(),
             display_mode: default_display_mode(),
             positions_locked: false,
+            character_hotkeys: HashMap::new(),
         }
     }
 
@@ -366,6 +385,7 @@ mod tests {
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
+            character_hotkeys: HashMap::new(),
         };
 
         // Height should be: 1080 - 40 = 1040
@@ -400,6 +420,7 @@ mod tests {
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
+            character_hotkeys: HashMap::new(),
         };
 
         assert_eq!(config.eve_height_adjusted(), 1080);
@@ -433,6 +454,7 @@ mod tests {
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
+            character_hotkeys: HashMap::new(),
         };
 
         let toml_str = toml::to_string(&config).unwrap();

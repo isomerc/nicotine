@@ -1,17 +1,34 @@
 use crate::config::{Config, DisplayMode, LiveSettings};
 use eframe::egui;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-/// Which config field is currently capturing a live keypress/click from
-/// the panel. Only one can capture at a time; `None` means no capture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// After any config edit we wait this long with no further edits before
+/// flushing to disk. 300ms is the sweet spot — saves feel instant when
+/// the user taps a checkbox or clicks a binding, but slider drags and
+/// text input coalesce into a single write rather than hammering disk
+/// on every pixel / keystroke.
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Which config field is currently capturing a live keypress from the
+/// panel. Only one can capture at a time; `None` means no capture.
+/// `Character` carries the character name so per-character hotkey
+/// bindings survive reorders of the characters list.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CaptureTarget {
     ForwardKey,
     BackwardKey,
     ModifierKey,
-    ForwardButton,
-    BackwardButton,
+    Character(String),
 }
+
+/// Options for the per-character / main modifier dropdown.
+const MODIFIER_CHOICES: &[(Option<u16>, &str)] = &[
+    (None, "None"),
+    (Some(0x10), "Shift"),
+    (Some(0x11), "Ctrl"),
+    (Some(0x12), "Alt"),
+];
 
 /// Brand palette matching the existing Linux overlay.
 const NICOTINE_RED: egui::Color32 = egui::Color32::from_rgb(196, 30, 58);
@@ -21,18 +38,29 @@ const NICOTINE_BLACK: egui::Color32 = egui::Color32::from_rgb(30, 30, 30);
 
 pub struct ConfigPanel {
     config: Config,
-    /// Tracks whether the working copy differs from the on-disk version.
-    dirty: bool,
     /// Buffer for "add character" text input.
     new_character_buffer: String,
-    /// Toast-style status message shown briefly after save/reload.
-    status: Option<String>,
     /// Shared settings watched by the preview manager for live updates
     /// (resize windows while sliders are being dragged).
     live: Arc<Mutex<LiveSettings>>,
     /// When Some(...), the panel is listening for the next keypress /
     /// side-mouse click to bind it to the given field.
     capturing: Option<CaptureTarget>,
+    /// Capture state from the previous frame. Used to detect edge
+    /// transitions so we can pause the daemon's global hotkeys when
+    /// the user enters capture mode (otherwise RegisterHotKey eats the
+    /// key before egui can see it) and resume afterwards.
+    last_capturing: Option<CaptureTarget>,
+    /// Timestamp of the last config edit. When set and `AUTOSAVE_DEBOUNCE`
+    /// has elapsed with no further edits, the panel flushes the config
+    /// to disk. Kept as an Option so we can skip saving when nothing
+    /// has changed since the last flush.
+    last_change: Option<Instant>,
+    /// Last inner-size we asked the OS viewport to be. Tracked so we
+    /// only send a resize command when the measured content height
+    /// actually changes — re-sending the same size every frame wastes
+    /// work and can cause visual jitter.
+    last_applied_height: f32,
 }
 
 impl ConfigPanel {
@@ -74,12 +102,20 @@ impl ConfigPanel {
 
         Self {
             config,
-            dirty: false,
             new_character_buffer: String::new(),
-            status: None,
             live,
             capturing: None,
+            last_capturing: None,
+            last_change: None,
+            last_applied_height: 0.0,
         }
+    }
+
+    /// Mark the config as edited. The next `update()` tick checks this
+    /// timestamp and flushes to disk once the user has been idle for
+    /// `AUTOSAVE_DEBOUNCE`.
+    fn touch(&mut self) {
+        self.last_change = Some(Instant::now());
     }
 }
 
@@ -129,20 +165,31 @@ fn build_visuals() -> egui::Visuals {
 
 impl eframe::App for ConfigPanel {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ---- Capture mode: listen for the next keypress / x-button ----
+        // ---- Capture mode: listen for the next keypress ----
         // Runs before any widget draw so the event stream we inspect
         // reflects what the user just did.
-        if let Some(target) = self.capturing {
-            if let Some(vk) = captured_binding(ctx, target) {
-                match target {
+        if let Some(target) = self.capturing.clone() {
+            if let Some(vk) = captured_binding(ctx) {
+                match &target {
                     CaptureTarget::ForwardKey => self.config.forward_key = vk,
                     CaptureTarget::BackwardKey => self.config.backward_key = vk,
                     CaptureTarget::ModifierKey => self.config.modifier_key = Some(vk),
-                    CaptureTarget::ForwardButton => self.config.forward_button = vk,
-                    CaptureTarget::BackwardButton => self.config.backward_button = vk,
+                    CaptureTarget::Character(name) => {
+                        // Preserve the existing modifier if already set,
+                        // otherwise default to no modifier.
+                        let modifier = self
+                            .config
+                            .character_hotkeys
+                            .get(name)
+                            .and_then(|h| h.modifier);
+                        self.config.character_hotkeys.insert(
+                            name.clone(),
+                            crate::config::CharacterHotkey { vk, modifier },
+                        );
+                    }
                 }
                 self.capturing = None;
-                self.dirty = true;
+                self.touch();
             } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 // Escape cancels capture without binding.
                 self.capturing = None;
@@ -152,19 +199,46 @@ impl eframe::App for ConfigPanel {
             ctx.request_repaint();
         }
 
+        // Edge-detect capture start/end so we can pause the daemon's
+        // global hotkeys — otherwise RegisterHotKey swallows F10/F11
+        // before egui sees them, and binding appears broken.
+        if self.last_capturing != self.capturing {
+            #[cfg(windows)]
+            {
+                if self.last_capturing.is_none() && self.capturing.is_some() {
+                    crate::windows_input::pause_hotkeys();
+                } else if self.last_capturing.is_some() && self.capturing.is_none() {
+                    // Flush config.toml synchronously before resuming so
+                    // the listener's Config::load() sees the new binding.
+                    if self.last_change.is_some() {
+                        let _ = self.config.save();
+                        self.last_change = None;
+                    }
+                    crate::windows_input::resume_hotkeys();
+                }
+            }
+            self.last_capturing = self.capturing.clone();
+        }
+
         // ---- Branded header strip ----
         egui::TopBottomPanel::top("nicotine_header")
             .exact_height(72.0)
             .frame(
                 egui::Frame::none()
                     .fill(NICOTINE_RED)
-                    .inner_margin(egui::Margin::same(0.0)),
+                    // Asymmetric vertical margin: the Marlboro font's
+                    // glyph box has more descent than ascent, so a
+                    // geometrically-centered layout reads as "logo too
+                    // high." Bumping the top margin shifts the visual
+                    // center down by a few pixels.
+                    .inner_margin(egui::Margin {
+                        left: 0.0,
+                        right: 0.0,
+                        top: 6.0,
+                        bottom: 0.0,
+                    }),
             )
             .show(ctx, |ui| {
-                // Center the logo both horizontally AND vertically in the
-                // red strip. `centered_and_justified` handles the vertical
-                // centering so we don't have to hand-tune add_space based
-                // on the Marlboro font's internal glyph padding.
                 ui.with_layout(
                     egui::Layout::centered_and_justified(egui::Direction::TopDown),
                     |ui| {
@@ -178,9 +252,9 @@ impl eframe::App for ConfigPanel {
                 );
             });
 
-        // ---- Status toast / footer ----
+        // ---- Branded footer with external links ----
         egui::TopBottomPanel::bottom("nicotine_footer")
-            .exact_height(48.0)
+            .exact_height(40.0)
             .frame(
                 egui::Frame::none()
                     .fill(NICOTINE_CREAM)
@@ -189,70 +263,84 @@ impl eframe::App for ConfigPanel {
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    let save = egui::Button::new(
-                        egui::RichText::new("SAVE")
-                            .color(NICOTINE_CREAM)
-                            .size(13.0)
-                            .strong(),
-                    )
-                    .fill(NICOTINE_RED)
-                    .rounding(2.0);
-                    if ui.add_sized([100.0, 28.0], save).clicked() {
-                        match self.config.save() {
-                            Ok(_) => {
-                                self.dirty = false;
-                                self.status =
-                                    Some("✓ Saved — daemon will pick up changes".to_string());
-                            }
-                            Err(e) => self.status = Some(format!("✗ Save failed: {}", e)),
-                        }
-                    }
-
-                    ui.add_space(8.0);
-                    let reload =
-                        egui::Button::new(egui::RichText::new("RELOAD").color(NICOTINE_BLACK))
-                            .fill(NICOTINE_GOLD)
-                            .rounding(2.0);
-                    if ui.add_sized([100.0, 28.0], reload).clicked() {
-                        match Config::load() {
-                            Ok(cfg) => {
-                                self.config = cfg;
-                                self.dirty = false;
-                                self.status = Some("✓ Reloaded from disk".to_string());
-                            }
-                            Err(e) => self.status = Some(format!("✗ Reload failed: {}", e)),
-                        }
-                    }
-
-                    ui.add_space(16.0);
-                    if let Some(msg) = &self.status {
-                        ui.colored_label(NICOTINE_BLACK, msg);
-                    } else if self.dirty {
-                        ui.colored_label(NICOTINE_RED, "Unsaved changes");
-                    }
+                    // Explicit .color() on both RichText blocks — egui's
+                    // hyperlink color doesn't always propagate through
+                    // .strong() in 0.29, leaving the text near-invisible
+                    // against the cream background.
+                    ui.hyperlink_to(
+                        egui::RichText::new("GITHUB").strong().color(NICOTINE_RED),
+                        "https://github.com/isomerc",
+                    );
+                    ui.add_space(14.0);
+                    ui.colored_label(NICOTINE_GOLD, "•");
+                    ui.add_space(14.0);
+                    ui.hyperlink_to(
+                        egui::RichText::new("ILLUMINATED IS RECRUITING")
+                            .strong()
+                            .color(NICOTINE_RED),
+                        "https://www.illuminatedcorp.com",
+                    );
                 });
             });
 
         // ---- Body ----
+        // Capture the central panel's content height from inside its
+        // builder so we can size the window to it — `ctx.used_size()`
+        // only reports what was *allocated* to the CentralPanel, which
+        // is bounded by header+footer, so tall content would clip and
+        // paint over the footer without this measurement.
+        const HEADER_HEIGHT: f32 = 72.0;
+        const FOOTER_HEIGHT: f32 = 40.0;
+        const CENTRAL_V_MARGIN: f32 = 12.0;
+        let mut central_content_height = 0.0f32;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
                     .fill(NICOTINE_CREAM)
-                    .inner_margin(egui::Margin::symmetric(16.0, 12.0)),
+                    .inner_margin(egui::Margin::symmetric(16.0, CENTRAL_V_MARGIN)),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.draw_display_mode_section(ui);
-                    ui.add_space(20.0);
-                    self.draw_characters_section(ui);
-                    ui.add_space(20.0);
-                    self.draw_hotkeys_section(ui);
-                    ui.add_space(20.0);
-                    self.draw_mouse_section(ui);
-                    ui.add_space(20.0);
-                    self.draw_previews_section(ui);
-                });
+                self.draw_display_mode_section(ui);
+                ui.add_space(20.0);
+                self.draw_characters_section(ui);
+                ui.add_space(20.0);
+                self.draw_hotkeys_section(ui);
+                ui.add_space(20.0);
+                self.draw_previews_section(ui);
+                central_content_height = ui.min_rect().height();
             });
+
+        // ---- Auto-size the window to fit the rendered content. ----
+        let target_height =
+            (HEADER_HEIGHT + FOOTER_HEIGHT + CENTRAL_V_MARGIN * 2.0 + central_content_height)
+                .round()
+                .clamp(300.0, 1500.0);
+        if (target_height - self.last_applied_height).abs() > 1.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                600.0,
+                target_height,
+            )));
+            self.last_applied_height = target_height;
+        }
+
+        // ---- Debounced auto-save ----
+        // After the user has been idle for AUTOSAVE_DEBOUNCE, flush the
+        // current config to disk. If they're actively editing (every
+        // touch() resets last_change to "now"), we keep deferring; as
+        // soon as they stop, the next tick saves. request_repaint_after
+        // ensures we get a frame to actually perform the save even
+        // when there's no other input.
+        if let Some(changed_at) = self.last_change {
+            let elapsed = changed_at.elapsed();
+            if elapsed >= AUTOSAVE_DEBOUNCE {
+                if let Err(e) = self.config.save() {
+                    eprintln!("config autosave failed: {}", e);
+                }
+                self.last_change = None;
+            } else {
+                ctx.request_repaint_after(AUTOSAVE_DEBOUNCE - elapsed);
+            }
+        }
     }
 }
 
@@ -295,7 +383,7 @@ impl ConfigPanel {
             );
         });
         if self.config.display_mode != prev {
-            self.dirty = true;
+            self.touch();
             // Push immediately to the shared LiveSettings so the preview
             // manager swaps modes within its next reconcile tick.
             self.live.lock().unwrap().display_mode = self.config.display_mode;
@@ -308,7 +396,7 @@ impl ConfigPanel {
             "Lock positions (drag disabled on previews and list)",
         );
         if self.config.positions_locked != prev_lock {
-            self.dirty = true;
+            self.touch();
             // Live-apply so the running preview manager stops honoring
             // drags immediately — no save + restart needed.
             self.live.lock().unwrap().positions_locked = self.config.positions_locked;
@@ -329,12 +417,20 @@ impl ConfigPanel {
 
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
+        // Track edits locally; `self.touch()` can't be called from
+        // inside the closures below because the closures borrow self.
+        let mut dirty = false;
 
-        for (idx, name) in self.config.characters.iter_mut().enumerate() {
+        let len = self.config.characters.len();
+        for idx in 0..len {
+            // Row 1 — name + reorder + delete.
             ui.horizontal(|ui| {
                 ui.label(format!("{}.", idx + 1));
-                if ui.text_edit_singleline(name).changed() {
-                    self.dirty = true;
+                if ui
+                    .text_edit_singleline(&mut self.config.characters[idx])
+                    .changed()
+                {
+                    dirty = true;
                 }
                 if ui.button("↑").clicked() && idx > 0 {
                     swap = Some((idx, idx - 1));
@@ -346,17 +442,92 @@ impl ConfigPanel {
                     remove = Some(idx);
                 }
             });
+
+            // Row 2 — per-character jump hotkey.
+            let name = self.config.characters[idx].clone();
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                ui.label("Hotkey:");
+
+                // Modifier dropdown.
+                let current_mod = self
+                    .config
+                    .character_hotkeys
+                    .get(&name)
+                    .and_then(|h| h.modifier);
+                let selected_label = MODIFIER_CHOICES
+                    .iter()
+                    .find(|(m, _)| *m == current_mod)
+                    .map(|(_, l)| *l)
+                    .unwrap_or("None");
+                let mut new_mod = current_mod;
+                egui::ComboBox::from_id_salt(format!("char_mod_{}", idx))
+                    .selected_text(selected_label)
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        for (code, label) in MODIFIER_CHOICES {
+                            if ui.selectable_label(new_mod == *code, *label).clicked() {
+                                new_mod = *code;
+                            }
+                        }
+                    });
+                if new_mod != current_mod {
+                    // Always persist the modifier choice. If no key has
+                    // been bound yet, we create a placeholder entry
+                    // with vk=0; the daemon's register_hotkeys skips
+                    // vk=0 entries, and the next captured keypress
+                    // fills in the vk while preserving this modifier.
+                    let entry = self.config.character_hotkeys.entry(name.clone()).or_insert(
+                        crate::config::CharacterHotkey {
+                            vk: 0,
+                            modifier: None,
+                        },
+                    );
+                    entry.modifier = new_mod;
+                    dirty = true;
+                }
+
+                // Bind button — shows current VK or "none." vk == 0
+                // means "only the modifier is set so far," so we also
+                // display that as "none" until a real key is captured.
+                let binding_label = self
+                    .config
+                    .character_hotkeys
+                    .get(&name)
+                    .filter(|h| h.vk != 0)
+                    .map(|h| vk_to_label(h.vk))
+                    .unwrap_or_else(|| "none".into());
+                self.draw_bind_button_sized(
+                    ui,
+                    &CaptureTarget::Character(name.clone()),
+                    binding_label,
+                    egui::vec2(100.0, 20.0),
+                );
+
+                // Clear the binding entirely.
+                if self.config.character_hotkeys.contains_key(&name) && ui.button("✕").clicked() {
+                    self.config.character_hotkeys.remove(&name);
+                    dirty = true;
+                }
+            });
+
+            ui.add_space(2.0);
         }
 
+        if dirty {
+            self.touch();
+        }
         if let Some((a, b)) = swap {
             if b < self.config.characters.len() {
                 self.config.characters.swap(a, b);
-                self.dirty = true;
+                self.touch();
             }
         }
         if let Some(idx) = remove {
-            self.config.characters.remove(idx);
-            self.dirty = true;
+            // Drop the per-character hotkey for the removed name too.
+            let removed_name = self.config.characters.remove(idx);
+            self.config.character_hotkeys.remove(&removed_name);
+            self.touch();
         }
 
         ui.add_space(4.0);
@@ -371,7 +542,7 @@ impl ConfigPanel {
                     .characters
                     .push(self.new_character_buffer.trim().to_string());
                 self.new_character_buffer.clear();
-                self.dirty = true;
+                self.touch();
             }
         });
     }
@@ -385,7 +556,7 @@ impl ConfigPanel {
             "Enable keyboard cycling",
         );
         if self.config.enable_keyboard_buttons != prev_enable {
-            self.dirty = true;
+            self.touch();
         }
 
         ui.add_enabled_ui(self.config.enable_keyboard_buttons, |ui| {
@@ -393,7 +564,7 @@ impl ConfigPanel {
                 ui.label("Forward:");
                 self.draw_bind_button(
                     ui,
-                    CaptureTarget::ForwardKey,
+                    &CaptureTarget::ForwardKey,
                     vk_to_label(self.config.forward_key),
                 );
             });
@@ -401,7 +572,7 @@ impl ConfigPanel {
                 ui.label("Backward:");
                 self.draw_bind_button(
                     ui,
-                    CaptureTarget::BackwardKey,
+                    &CaptureTarget::BackwardKey,
                     vk_to_label(self.config.backward_key),
                 );
             });
@@ -411,10 +582,10 @@ impl ConfigPanel {
                     Some(vk) => vk_to_label(vk),
                     None => "None".to_string(),
                 };
-                self.draw_bind_button(ui, CaptureTarget::ModifierKey, label);
+                self.draw_bind_button(ui, &CaptureTarget::ModifierKey, label);
                 if self.config.modifier_key.is_some() && ui.button("Clear").clicked() {
                     self.config.modifier_key = None;
-                    self.dirty = true;
+                    self.touch();
                 }
             });
             ui.label(
@@ -429,65 +600,38 @@ impl ConfigPanel {
         });
     }
 
-    fn draw_mouse_section(&mut self, ui: &mut egui::Ui) {
-        Self::draw_section_header(ui, "Mouse Side Buttons");
-        let prev = self.config.enable_mouse_buttons;
-        ui.checkbox(
-            &mut self.config.enable_mouse_buttons,
-            "Enable mouse cycling",
-        );
-        if self.config.enable_mouse_buttons != prev {
-            self.dirty = true;
-        }
-        ui.add_enabled_ui(self.config.enable_mouse_buttons, |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "Click a binding then press the mouse side button you want to use. \
-                     Esc cancels. Most mice expose XBUTTON1 (back) and XBUTTON2 (forward).",
-                )
-                .size(10.0)
-                .color(NICOTINE_BLACK),
-            );
-            ui.horizontal(|ui| {
-                ui.label("Forward button:");
-                self.draw_bind_button(
-                    ui,
-                    CaptureTarget::ForwardButton,
-                    xbutton_to_label(self.config.forward_button),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Backward button:");
-                self.draw_bind_button(
-                    ui,
-                    CaptureTarget::BackwardButton,
-                    xbutton_to_label(self.config.backward_button),
-                );
-            });
-        });
-    }
-
     /// Button that toggles capture for a given config field. When
     /// capturing, shows a hint; otherwise shows the current binding's
     /// label. Click while already capturing to cancel.
-    fn draw_bind_button(&mut self, ui: &mut egui::Ui, target: CaptureTarget, label: String) {
-        let is_capturing = self.capturing == Some(target);
+    fn draw_bind_button(&mut self, ui: &mut egui::Ui, target: &CaptureTarget, label: String) {
+        self.draw_bind_button_sized(ui, target, label, egui::vec2(200.0, 22.0));
+    }
+
+    fn draw_bind_button_sized(
+        &mut self,
+        ui: &mut egui::Ui,
+        target: &CaptureTarget,
+        label: String,
+        size: egui::Vec2,
+    ) {
+        let is_capturing = self.capturing.as_ref() == Some(target);
         let text = if is_capturing {
-            "[press key / button — Esc to cancel]".to_string()
+            "[press key — Esc]".to_string()
         } else {
             label
         };
-        // When idle, let the theme drive hover colors. When capturing,
-        // lock the fill to gold + red stroke as a loud "waiting for
-        // input" indicator.
-        let mut button = egui::Button::new(text).min_size(egui::vec2(200.0, 22.0));
+        let mut button = egui::Button::new(text).min_size(size);
         if is_capturing {
             button = button
                 .fill(NICOTINE_GOLD)
                 .stroke(egui::Stroke::new(1.5, NICOTINE_RED));
         }
         if ui.add(button).clicked() {
-            self.capturing = if is_capturing { None } else { Some(target) };
+            self.capturing = if is_capturing {
+                None
+            } else {
+                Some(target.clone())
+            };
         }
     }
 
@@ -496,9 +640,13 @@ impl ConfigPanel {
         let prev_show = self.config.show_previews;
         ui.checkbox(&mut self.config.show_previews, "Show preview windows");
         if self.config.show_previews != prev_show {
-            self.dirty = true;
+            self.touch();
         }
         ui.add_enabled_ui(self.config.show_previews, |ui| {
+            // Widen sliders so a 1px step is actually reachable without
+            // sub-pixel cursor precision. 3× the egui default width.
+            ui.spacing_mut().slider_width = ui.spacing().slider_width * 3.0;
+
             let prev_w = self.config.preview_width;
             let prev_h = self.config.preview_height;
             ui.horizontal(|ui| {
@@ -520,7 +668,7 @@ impl ConfigPanel {
                 );
             });
             if self.config.preview_width != prev_w || self.config.preview_height != prev_h {
-                self.dirty = true;
+                self.touch();
                 // Push the new size to the shared LiveSettings so the
                 // preview manager resizes its windows on the next tick —
                 // no need to wait for Save + hot-reload.
@@ -532,43 +680,101 @@ impl ConfigPanel {
     }
 }
 
-/// Given a target, poll egui's input events for the right kind of
-/// press and return the Win32 VK or XBUTTON code to bind. Returns None
-/// when nothing relevant happened this frame.
-fn captured_binding(ctx: &egui::Context, target: CaptureTarget) -> Option<u16> {
+/// All egui keys we're willing to bind, in the order we poll them.
+/// Using `key_pressed` polling here (instead of matching Event::Key in
+/// the event stream) is more reliable when a widget — like the bind
+/// button the user just clicked — has focus: egui may consume some
+/// keys before they surface as generic events, but `key_pressed` sees
+/// the edge regardless.
+const SUPPORTED_KEYS: &[egui::Key] = &[
+    egui::Key::F1,
+    egui::Key::F2,
+    egui::Key::F3,
+    egui::Key::F4,
+    egui::Key::F5,
+    egui::Key::F6,
+    egui::Key::F7,
+    egui::Key::F8,
+    egui::Key::F9,
+    egui::Key::F10,
+    egui::Key::F11,
+    egui::Key::F12,
+    egui::Key::F13,
+    egui::Key::F14,
+    egui::Key::F15,
+    egui::Key::Tab,
+    egui::Key::Space,
+    egui::Key::Enter,
+    egui::Key::Backspace,
+    egui::Key::Insert,
+    egui::Key::Delete,
+    egui::Key::Home,
+    egui::Key::End,
+    egui::Key::PageUp,
+    egui::Key::PageDown,
+    egui::Key::ArrowUp,
+    egui::Key::ArrowDown,
+    egui::Key::ArrowLeft,
+    egui::Key::ArrowRight,
+    egui::Key::A,
+    egui::Key::B,
+    egui::Key::C,
+    egui::Key::D,
+    egui::Key::E,
+    egui::Key::F,
+    egui::Key::G,
+    egui::Key::H,
+    egui::Key::I,
+    egui::Key::J,
+    egui::Key::K,
+    egui::Key::L,
+    egui::Key::M,
+    egui::Key::N,
+    egui::Key::O,
+    egui::Key::P,
+    egui::Key::Q,
+    egui::Key::R,
+    egui::Key::S,
+    egui::Key::T,
+    egui::Key::U,
+    egui::Key::V,
+    egui::Key::W,
+    egui::Key::X,
+    egui::Key::Y,
+    egui::Key::Z,
+    egui::Key::Num0,
+    egui::Key::Num1,
+    egui::Key::Num2,
+    egui::Key::Num3,
+    egui::Key::Num4,
+    egui::Key::Num5,
+    egui::Key::Num6,
+    egui::Key::Num7,
+    egui::Key::Num8,
+    egui::Key::Num9,
+    egui::Key::Backtick,
+    egui::Key::Minus,
+    egui::Key::Equals,
+    egui::Key::OpenBracket,
+    egui::Key::CloseBracket,
+    egui::Key::Backslash,
+    egui::Key::Semicolon,
+    egui::Key::Quote,
+    egui::Key::Comma,
+    egui::Key::Period,
+    egui::Key::Slash,
+];
+
+/// Poll egui for the first bindable key press this frame. Returns the
+/// Win32 VK code to bind, or None if no eligible press happened.
+fn captured_binding(ctx: &egui::Context) -> Option<u16> {
     ctx.input(|i| {
-        for event in &i.events {
-            match (target, event) {
-                // Keyboard targets: first non-Escape keypress wins.
-                (
-                    CaptureTarget::ForwardKey
-                    | CaptureTarget::BackwardKey
-                    | CaptureTarget::ModifierKey,
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        repeat: false,
-                        ..
-                    },
-                ) if *key != egui::Key::Escape => {
-                    return egui_key_to_vk(*key);
-                }
-                // Mouse-button targets: only XBUTTON1/XBUTTON2 count.
-                (
-                    CaptureTarget::ForwardButton | CaptureTarget::BackwardButton,
-                    egui::Event::PointerButton {
-                        button,
-                        pressed: true,
-                        ..
-                    },
-                ) => {
-                    return match button {
-                        egui::PointerButton::Extra1 => Some(1),
-                        egui::PointerButton::Extra2 => Some(2),
-                        _ => None,
-                    };
-                }
-                _ => {}
+        for key in SUPPORTED_KEYS {
+            if *key == egui::Key::Escape {
+                continue;
+            }
+            if i.key_pressed(*key) {
+                return egui_key_to_vk(*key);
             }
         }
         None
@@ -693,15 +899,6 @@ fn vk_to_label(vk: u16) -> String {
         0x25 => "Left".into(),
         0x27 => "Right".into(),
         other => format!("VK 0x{:02X}", other),
-    }
-}
-
-/// Human label for the two Windows X-buttons.
-fn xbutton_to_label(b: u16) -> String {
-    match b {
-        1 => "XBUTTON1 (back)".into(),
-        2 => "XBUTTON2 (forward)".into(),
-        other => format!("XBUTTON {}", other),
     }
 }
 

@@ -105,6 +105,29 @@ impl Daemon {
         } else {
             Some(self.config.characters.clone())
         };
+        // Signature of all hotkey-related fields, used to detect changes
+        // and trigger a daemon-side rebind without restart.
+        #[cfg(windows)]
+        type HotkeySig = (
+            bool,
+            u16,
+            u16,
+            Option<u16>,
+            std::collections::HashMap<String, crate::config::CharacterHotkey>,
+        );
+        #[cfg(windows)]
+        fn hotkey_sig(c: &Config) -> HotkeySig {
+            (
+                c.enable_keyboard_buttons,
+                c.forward_key,
+                c.backward_key,
+                c.modifier_key,
+                c.character_hotkeys.clone(),
+            )
+        }
+        #[cfg(windows)]
+        let mut last_hotkey_sig = hotkey_sig(&self.config);
+
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
             if let Ok(windows) = wm_clone.get_eve_windows() {
@@ -129,6 +152,17 @@ impl Daemon {
                         .unwrap()
                         .set_character_order(new_order.clone());
                     last_order = new_order;
+                }
+
+                // Hotkey-config change → rebind so the new keys take
+                // effect without a daemon restart.
+                #[cfg(windows)]
+                {
+                    let new_sig = hotkey_sig(&fresh_config);
+                    if new_sig != last_hotkey_sig {
+                        crate::windows_input::resume_hotkeys();
+                        last_hotkey_sig = new_sig;
+                    }
                 }
             }
         });
