@@ -1,0 +1,632 @@
+use crate::config::Config;
+use crate::cycle_state::CycleState;
+use crate::window_manager::WindowManager;
+use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{
+    COLORREF, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
+use windows::Win32::Graphics::Dwm::{
+    DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
+    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
+    DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
+    SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT, TRANSPARENT,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, TranslateMessage, GWLP_USERDATA, HCURSOR, HICON,
+    HMENU, HWND_TOPMOST, IDC_ARROW, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_DESTROY,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+};
+
+/// Type alias for DWM thumbnail handles. windows-rs 0.59 doesn't expose a
+/// named Hthumbnail type — DwmRegisterThumbnail returns isize directly and
+/// DwmUnregisterThumbnail takes isize.
+type Hthumbnail = isize;
+
+/// Extract (x, y) from a Win32 LPARAM that packs them as low/high words.
+/// The cast chain `as u16 as i16 as i32` performs the necessary
+/// sign-extension so coordinates left/above the window during a captured
+/// drag come back as small negatives instead of huge positives.
+fn unpack_xy(lparam: LPARAM) -> (i32, i32) {
+    let raw = lparam.0 as u32;
+    let x = (raw as u16) as i16 as i32;
+    let y = ((raw >> 16) as u16) as i16 as i32;
+    (x, y)
+}
+
+/// True if (x, y) lies somewhere inside the multi-monitor virtual screen.
+/// Used to reject saved positions from a previous build that wrote
+/// off-screen coordinates due to a sign-extension bug — without this,
+/// affected previews spawn invisible at coords like (65000, 1000).
+fn position_on_screen(x: i32, y: i32) -> bool {
+    unsafe {
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        x >= vx && y >= vy && x < vx + vw && y < vy + vh
+    }
+}
+
+const PREVIEW_CLASS: &str = "NicotinePreviewWnd\0";
+const CONTROL_CLASS: &str = "NicotinePreviewCtrl\0";
+const RECONCILE_TIMER_ID: usize = 1;
+const RECONCILE_INTERVAL_MS: u32 = 500;
+const TITLE_HEIGHT: i32 = 24;
+const DRAG_THRESHOLD_PX: i32 = 4;
+
+/// Per-character preview window position. Persisted to disk so previews come
+/// back at the same place across daemon restarts.
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct PreviewPositions {
+    #[serde(default)]
+    pub positions: HashMap<String, (i32, i32)>,
+}
+
+impl PreviewPositions {
+    fn config_path() -> PathBuf {
+        let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        p.push("nicotine");
+        p.push("preview_positions.toml");
+        p
+    }
+
+    pub fn load() -> Self {
+        let path = Self::config_path();
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(p) = toml::from_str::<Self>(&s) {
+                return p;
+            }
+        }
+        Self::default()
+    }
+
+    pub fn save(&self) {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(s) = toml::to_string_pretty(self) {
+            let _ = std::fs::write(&path, s);
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<(i32, i32)> {
+        self.positions.get(name).copied()
+    }
+
+    fn set(&mut self, name: String, x: i32, y: i32) {
+        self.positions.insert(name, (x, y));
+    }
+}
+
+/// State for a single preview window. The pointer is stored in the
+/// window's GWLP_USERDATA so the wnd_proc can recover it.
+struct PreviewWindowState {
+    source_id: u32,
+    character_name: String,
+    thumbnail: Hthumbnail,
+    wm: Arc<dyn WindowManager>,
+    positions: Arc<Mutex<PreviewPositions>>,
+    drag_active: bool,
+    dragged: bool,
+    drag_origin_screen: (i32, i32),
+    drag_origin_window: (i32, i32),
+}
+
+/// One owned preview window. Drop unregisters the DWM thumbnail.
+struct OwnedPreview {
+    hwnd: HWND,
+    source_id: u32,
+}
+
+impl Drop for OwnedPreview {
+    fn drop(&mut self) {
+        unsafe {
+            // Box-drop the per-window state stored in GWLP_USERDATA.
+            let ptr = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA);
+            if ptr != 0 {
+                let state = Box::from_raw(ptr as *mut PreviewWindowState);
+                let _ = DwmUnregisterThumbnail(state.thumbnail);
+                SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+            }
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+struct PreviewManager {
+    wm: Arc<dyn WindowManager>,
+    state: Arc<Mutex<CycleState>>,
+    config: Config,
+    positions: Arc<Mutex<PreviewPositions>>,
+    previews: HashMap<String, OwnedPreview>,
+    /// Where to drop the next never-seen-before preview. Increments
+    /// diagonally so multiple new clients don't stack on top of each other.
+    next_default_offset: i32,
+}
+
+impl PreviewManager {
+    fn reconcile(&mut self) {
+        let windows = {
+            let s = self.state.lock().unwrap();
+            s.get_windows().to_vec()
+        };
+
+        // Drop previews whose source EVE client is no longer present.
+        let live_names: std::collections::HashSet<String> =
+            windows.iter().map(|w| w.title.clone()).collect();
+        self.previews.retain(|name, _| live_names.contains(name));
+
+        // Spawn previews for new EVE clients; rebind thumbnails if HWNDs
+        // changed (EVE relaunched into the same character slot).
+        for window in &windows {
+            if let Some(existing) = self.previews.get(&window.title) {
+                if existing.source_id != window.id {
+                    // HWND changed — rebind thumbnail to the new source.
+                    let _ = self.rebind_preview(window);
+                }
+            } else if let Err(e) = self.create_preview(window) {
+                eprintln!("Failed to create preview for {}: {}", window.title, e);
+            }
+        }
+
+        // Re-assert topmost Z-order on every reconcile. WS_EX_TOPMOST puts
+        // us in the topmost tier, but other topmost apps (Discord overlay,
+        // pop-out browsers, etc.) can layer above us within that tier. This
+        // call keeps the previews at the front of the topmost stack. NOMOVE
+        // | NOSIZE | NOACTIVATE means it's a Z-order change only — no
+        // repaint, no focus steal, no flicker.
+        for preview in self.previews.values() {
+            unsafe {
+                let _ = SetWindowPos(
+                    preview.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    fn create_preview(&mut self, window: &crate::window_manager::EveWindow) -> Result<()> {
+        let (x, y) = self
+            .positions
+            .lock()
+            .unwrap()
+            .get(&window.title)
+            .filter(|(x, y)| position_on_screen(*x, *y))
+            .unwrap_or_else(|| {
+                let off = self.next_default_offset;
+                self.next_default_offset = (self.next_default_offset + 32) % 320;
+                (10 + off, 10 + off)
+            });
+
+        let width = self.config.preview_width as i32;
+        let height = self.config.preview_height as i32;
+
+        let class_name: Vec<u16> = PREVIEW_CLASS.encode_utf16().collect();
+        let title_w: Vec<u16> = window
+            .title
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let module = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW failed")?;
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title_w.as_ptr()),
+                WS_POPUP | WS_VISIBLE,
+                x,
+                y,
+                width,
+                height,
+                None,
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+        }
+        .context("CreateWindowExW failed for preview window")?;
+
+        // Register a DWM thumbnail mirroring the EVE source HWND into our
+        // window's client area below the title strip.
+        let thumbnail: Hthumbnail = unsafe {
+            DwmRegisterThumbnail(hwnd, id_to_hwnd(window.id))
+                .context("DwmRegisterThumbnail failed")?
+        };
+        update_thumbnail_rect(thumbnail, width, height);
+
+        let per_window = Box::new(PreviewWindowState {
+            source_id: window.id,
+            character_name: window.title.clone(),
+            thumbnail,
+            wm: Arc::clone(&self.wm),
+            positions: Arc::clone(&self.positions),
+            drag_active: false,
+            dragged: false,
+            drag_origin_screen: (0, 0),
+            drag_origin_window: (0, 0),
+        });
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(per_window) as isize);
+        }
+
+        // Belt-and-suspenders topmost — WS_EX_TOPMOST should already do it,
+        // but DWM compositing sometimes drops the order on EVE startup races.
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+
+        self.previews.insert(
+            window.title.clone(),
+            OwnedPreview {
+                hwnd,
+                source_id: window.id,
+            },
+        );
+        Ok(())
+    }
+
+    fn rebind_preview(&mut self, window: &crate::window_manager::EveWindow) -> Result<()> {
+        // The simplest correct rebind: drop the old preview and create a new
+        // one. Position is preserved because it's keyed on character name.
+        self.previews.remove(&window.title);
+        self.create_preview(window)
+    }
+}
+
+/// Recompute the DWM thumbnail destination rect. The thumbnail occupies
+/// everything below the title strip. We mirror the whole source window
+/// (including any title bar/border) — EVE's client area definition
+/// reportedly hides the actual game render surface, so SOURCECLIENTAREAONLY
+/// gives a blank preview.
+fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
+    let props = DWM_THUMBNAIL_PROPERTIES {
+        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
+        rcDestination: RECT {
+            left: 0,
+            top: TITLE_HEIGHT,
+            right: width,
+            bottom: height,
+        },
+        rcSource: RECT::default(),
+        opacity: 255,
+        fVisible: true.into(),
+        fSourceClientAreaOnly: false.into(),
+    };
+    unsafe {
+        let _ = DwmUpdateThumbnailProperties(thumbnail, &props);
+    }
+}
+
+/// Window procedure for preview windows. Pulls per-window state from
+/// GWLP_USERDATA. WM_DESTROY does not free the state — that happens in
+/// `OwnedPreview::drop` so the manager owns the lifetime.
+unsafe extern "system" fn preview_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PreviewWindowState;
+    let state = if state_ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    } else {
+        &mut *state_ptr
+    };
+
+    match msg {
+        WM_PAINT => {
+            paint_title_strip(hwnd, &state.character_name);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let (client_x, client_y) = unpack_xy(lparam);
+            let mut pt = POINT {
+                x: client_x,
+                y: client_y,
+            };
+            let _ = ClientToScreen(hwnd, &mut pt);
+
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rect);
+
+            state.drag_active = true;
+            state.dragged = false;
+            state.drag_origin_screen = (pt.x, pt.y);
+            state.drag_origin_window = (rect.left, rect.top);
+            let _ = SetCapture(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if state.drag_active {
+                let (client_x, client_y) = unpack_xy(lparam);
+                let mut pt = POINT {
+                    x: client_x,
+                    y: client_y,
+                };
+                let _ = ClientToScreen(hwnd, &mut pt);
+
+                let dx = pt.x - state.drag_origin_screen.0;
+                let dy = pt.y - state.drag_origin_screen.1;
+                if dx.abs() > DRAG_THRESHOLD_PX || dy.abs() > DRAG_THRESHOLD_PX {
+                    state.dragged = true;
+                }
+                if state.dragged {
+                    let new_x = state.drag_origin_window.0 + dx;
+                    let new_y = state.drag_origin_window.1 + dy;
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(HWND_TOPMOST),
+                        new_x,
+                        new_y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            if state.drag_active {
+                state.drag_active = false;
+                let _ = ReleaseCapture();
+                if state.dragged {
+                    // Persist the new position keyed by character name.
+                    let mut rect = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut rect);
+                    let mut positions = state.positions.lock().unwrap();
+                    positions.set(state.character_name.clone(), rect.left, rect.top);
+                    positions.save();
+                } else {
+                    // No drag — treat as click-to-activate.
+                    let _ = state.wm.activate_window(state.source_id);
+                }
+                state.dragged = false;
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            // State cleanup happens in OwnedPreview::drop. Don't double-free.
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn paint_title_strip(hwnd: HWND, character_name: &str) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+
+    let mut rect = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut rect);
+    let width = rect.right - rect.left;
+
+    let strip = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: TITLE_HEIGHT,
+    };
+
+    // Dark gray title strip
+    let bg = CreateSolidBrush(COLORREF(0x002A2A2A));
+    FillRect(hdc, &strip, bg);
+    let _ = DeleteObject(bg.into());
+
+    // White centered text. DrawTextW takes &mut [u16] but doesn't actually
+    // mutate it for the formatting flags we use.
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, COLORREF(0x00FFFFFF));
+    let mut text: Vec<u16> = character_name.encode_utf16().collect();
+    let mut text_rect = strip;
+    let _ = DrawTextW(
+        hdc,
+        &mut text,
+        &mut text_rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    let _ = EndPaint(hwnd, &ps);
+}
+
+/// Control-window procedure: the only message it cares about is WM_TIMER,
+/// which fires the reconcile pass against CycleState.
+unsafe extern "system" fn control_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_TIMER && wparam.0 == RECONCILE_TIMER_ID {
+        let mgr_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PreviewManager;
+        if !mgr_ptr.is_null() {
+            (*mgr_ptr).reconcile();
+        }
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn register_classes(module: HMODULE) -> Result<()> {
+    unsafe {
+        let cursor = LoadCursorW(None, IDC_ARROW).context("LoadCursorW failed")?;
+
+        let preview_class: Vec<u16> = PREVIEW_CLASS.encode_utf16().collect();
+        let preview_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: Default::default(),
+            lpfnWndProc: Some(preview_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: module.into(),
+            hIcon: HICON::default(),
+            hCursor: cursor,
+            hbrBackground: Default::default(),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: PCWSTR(preview_class.as_ptr()),
+            hIconSm: HICON::default(),
+        };
+        // RegisterClassExW returns 0 on failure but also fails harmlessly if
+        // already registered (e.g. if the daemon is restarted in-process for
+        // testing). Ignore the result.
+        let _ = RegisterClassExW(&preview_wc);
+
+        let control_class: Vec<u16> = CONTROL_CLASS.encode_utf16().collect();
+        let control_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: Default::default(),
+            lpfnWndProc: Some(control_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: module.into(),
+            hIcon: HICON::default(),
+            hCursor: HCURSOR::default(),
+            hbrBackground: Default::default(),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: PCWSTR(control_class.as_ptr()),
+            hIconSm: HICON::default(),
+        };
+        let _ = RegisterClassExW(&control_wc);
+    }
+    Ok(())
+}
+
+/// Spawn the preview-window manager thread. Runs forever (until the
+/// daemon process exits). Each EVE client gets a borderless top-most
+/// preview window with a 24px title strip and a DWM thumbnail mirror.
+pub fn spawn(
+    config: Config,
+    wm: Arc<dyn WindowManager>,
+    state: Arc<Mutex<CycleState>>,
+) -> Result<JoinHandle<()>> {
+    let handle = std::thread::spawn(move || {
+        if let Err(e) = run_manager(config, wm, state) {
+            eprintln!("Preview window manager exited with error: {}", e);
+        }
+    });
+    Ok(handle)
+}
+
+fn run_manager(
+    config: Config,
+    wm: Arc<dyn WindowManager>,
+    state: Arc<Mutex<CycleState>>,
+) -> Result<()> {
+    // Touch the thread ID so message routing works (and so any future
+    // PostThreadMessage senders have a stable ID to target).
+    let _tid = unsafe { GetCurrentThreadId() };
+
+    let module = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW failed")?;
+    register_classes(module)?;
+
+    // Create the hidden message-only control window that owns the
+    // reconcile timer.
+    let control_class: Vec<u16> = CONTROL_CLASS.encode_utf16().collect();
+    let control_title: Vec<u16> = "NicotineControl\0".encode_utf16().collect();
+    let control_hwnd = unsafe {
+        CreateWindowExW(
+            Default::default(),
+            PCWSTR(control_class.as_ptr()),
+            PCWSTR(control_title.as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(HINSTANCE(module.0)),
+            None,
+        )
+    }
+    .context("CreateWindowExW failed for control window")?;
+
+    let positions = Arc::new(Mutex::new(PreviewPositions::load()));
+
+    // Allocate the manager on the heap so we can stash a pointer in the
+    // control window's GWLP_USERDATA. The control wnd_proc reads this
+    // back to dispatch reconcile().
+    let manager = Box::new(PreviewManager {
+        wm,
+        state,
+        config,
+        positions,
+        previews: HashMap::new(),
+        next_default_offset: 0,
+    });
+    let manager_ptr = Box::into_raw(manager);
+    unsafe {
+        SetWindowLongPtrW(control_hwnd, GWLP_USERDATA, manager_ptr as isize);
+        let _ = SetTimer(
+            Some(control_hwnd),
+            RECONCILE_TIMER_ID,
+            RECONCILE_INTERVAL_MS,
+            None,
+        );
+    }
+
+    // Main message pump for the manager + all preview windows on this
+    // thread.
+    let mut msg = MSG::default();
+    loop {
+        let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        if !got.as_bool() {
+            break;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    // Cleanup on shutdown.
+    unsafe {
+        let _ = KillTimer(Some(control_hwnd), RECONCILE_TIMER_ID);
+        if !manager_ptr.is_null() {
+            // Drop the manager last — that drops the OwnedPreview map, which
+            // unregisters DWM thumbnails and destroys the preview windows.
+            drop(Box::from_raw(manager_ptr));
+        }
+        let _ = DestroyWindow(control_hwnd);
+    }
+    Ok(())
+}
+
+// Suppress unused warnings for symbols only meaningful in some build modes.
+#[allow(dead_code)]
+fn _unused() {
+    let _ = HMENU::default();
+}

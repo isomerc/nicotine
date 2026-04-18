@@ -1,34 +1,56 @@
 mod config;
 mod cycle_state;
 mod daemon;
-mod keyboard_listener;
-mod mouse_listener;
-mod overlay;
-mod version_check;
-mod wayland_backends;
+mod ipc;
+mod lock;
+mod paths;
 mod window_manager;
+
+#[cfg(unix)]
+mod version_check;
+
+#[cfg(unix)]
+mod keyboard_listener;
+#[cfg(unix)]
+mod mouse_listener;
+#[cfg(unix)]
+mod overlay;
+#[cfg(unix)]
+mod wayland_backends;
+#[cfg(unix)]
 mod x11_manager;
+
+#[cfg(windows)]
+mod preview_windows;
+#[cfg(windows)]
+mod windows_daemon;
+#[cfg(windows)]
+mod windows_input;
+#[cfg(windows)]
+mod windows_manager;
 
 use anyhow::Result;
 use config::Config;
 use cycle_state::CycleState;
 use daemon::Daemon;
-use daemonize::Daemonize;
-#[allow(deprecated)]
-use nix::fcntl::{flock, FlockArg};
-use overlay::run_overlay;
 use std::env;
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
+use window_manager::WindowManager;
+
+#[cfg(unix)]
+use daemonize::Daemonize;
+#[cfg(unix)]
+use overlay::run_overlay;
+#[cfg(unix)]
 use wayland_backends::{HyprlandManager, KWinManager, SwayManager};
+#[cfg(unix)]
 use window_manager::{
     detect_display_server, detect_wayland_compositor, DisplayServer, WaylandCompositor,
-    WindowManager,
 };
+#[cfg(unix)]
 use x11_manager::X11Manager;
 
+#[cfg(unix)]
 fn create_window_manager() -> Result<Arc<dyn WindowManager>> {
     let display_server = detect_display_server();
 
@@ -70,6 +92,124 @@ fn create_window_manager() -> Result<Arc<dyn WindowManager>> {
     }
 }
 
+#[cfg(windows)]
+fn create_window_manager() -> Result<Arc<dyn WindowManager>> {
+    println!("Using Windows backend");
+    Ok(Arc::new(windows_manager::WindowsManager::new()?))
+}
+
+enum CycleOp {
+    Forward,
+    Backward,
+    Switch(usize),
+}
+
+#[cfg(unix)]
+fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
+    let daemonize = Daemonize::new().working_directory("/tmp").umask(0o027);
+
+    match daemonize.start() {
+        Ok(_) => {
+            let wm_daemon = Arc::clone(&wm);
+            let config_daemon = config.clone();
+            let daemon_thread = std::thread::spawn(move || {
+                let mut daemon = Daemon::new(wm_daemon, config_daemon);
+                if let Err(e) = daemon.run() {
+                    eprintln!("Daemon error: {}", e);
+                }
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            if config.show_overlay {
+                let state = Arc::new(Mutex::new(CycleState::new()));
+                if let Ok(windows) = wm.get_eve_windows() {
+                    state.lock().unwrap().update_windows(windows);
+                }
+
+                if let Err(e) = run_overlay(wm, state, config.overlay_x, config.overlay_y, config) {
+                    eprintln!("Overlay error: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                println!("Overlay disabled - daemon running in background");
+                daemon_thread.join().unwrap();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Failed to daemonize: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
+    // The detached child re-execs with this env var set; on that side we just
+    // run the daemon directly instead of spawning another child.
+    if std::env::var("NICOTINE_DAEMON_CHILD").is_ok() {
+        let mut daemon = Daemon::new(wm, config);
+        daemon.run()?;
+        return Ok(());
+    }
+
+    windows_daemon::spawn_detached_self()?;
+    println!("✓ Daemon spawned in background");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stop_command() {
+    let _ = std::process::Command::new("pkill")
+        .arg("-9")
+        .arg("nicotine")
+        .output();
+    let _ = std::fs::remove_file("/tmp/nicotine.sock");
+    let _ = std::fs::remove_file(paths::lock_file_path());
+}
+
+#[cfg(windows)]
+fn stop_command() {
+    // Ask the daemon to quit cleanly; ignore errors (it may not be running).
+    let _ = ipc::send_line("quit");
+    // Force-kill any stragglers that didn't respond.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/IM", "nicotine.exe", "/F"])
+        .output();
+    let _ = std::fs::remove_file(paths::lock_file_path());
+    let _ = std::fs::remove_file(paths::index_file_path());
+}
+
+fn run_cycle_direct(wm: &Arc<dyn WindowManager>, config: &Config, op: CycleOp) -> Result<()> {
+    let windows = wm.get_eve_windows()?;
+    if windows.is_empty() {
+        return Ok(());
+    }
+
+    let mut state = CycleState::new();
+    state.update_windows(windows);
+
+    if let Ok(active) = wm.get_active_window() {
+        state.sync_with_active(active);
+    }
+
+    match op {
+        CycleOp::Forward => state.cycle_forward(&**wm, config.minimize_inactive)?,
+        CycleOp::Backward => state.cycle_backward(&**wm, config.minimize_inactive)?,
+        CycleOp::Switch(target) => {
+            let character_order = Config::load_characters();
+            state.switch_to(
+                target,
+                &**wm,
+                config.minimize_inactive,
+                character_order.as_deref(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -81,67 +221,25 @@ fn main() -> Result<()> {
         "start" => {
             println!("Starting Nicotine 🚬");
 
-            // Check for updates (non-blocking, silent on errors)
+            #[cfg(unix)]
             if let Ok(Some((new_version, url))) = version_check::check_for_updates() {
                 version_check::print_update_notification(&new_version, &url);
             }
 
-            // Daemonize the process (safe Rust wrapper)
-            let daemonize = Daemonize::new().working_directory("/tmp").umask(0o027);
-
-            match daemonize.start() {
-                Ok(_) => {
-                    // We're now in the daemon process
-                    // Start daemon in background thread
-                    let wm_daemon = Arc::clone(&wm);
-                    let config_daemon = config.clone();
-                    let daemon_thread = std::thread::spawn(move || {
-                        let mut daemon = Daemon::new(wm_daemon, config_daemon);
-                        if let Err(e) = daemon.run() {
-                            eprintln!("Daemon error: {}", e);
-                        }
-                    });
-
-                    // Wait a bit for daemon to initialize
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-
-                    if config.show_overlay {
-                        // Run overlay in main thread
-                        let state = Arc::new(Mutex::new(CycleState::new()));
-                        if let Ok(windows) = wm.get_eve_windows() {
-                            state.lock().unwrap().update_windows(windows);
-                        }
-
-                        if let Err(e) =
-                            run_overlay(wm, state, config.overlay_x, config.overlay_y, config)
-                        {
-                            eprintln!("Overlay error: {}", e);
-                            std::process::exit(1);
-                        }
-                    } else {
-                        // No overlay - just keep daemon running
-                        println!("Overlay disabled - daemon running in background");
-                        daemon_thread.join().unwrap();
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to daemonize: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            start_command(wm, config)?;
         }
 
         "daemon" => {
-            println!("Starting EVE Multibox daemon...");
+            println!("Starting Nicotine daemon...");
             let mut daemon = Daemon::new(wm, config);
             daemon.run()?;
         }
 
+        #[cfg(unix)]
         "overlay" => {
-            println!("Starting EVE Multibox Overlay...");
+            println!("Starting Nicotine Overlay...");
             let state = Arc::new(Mutex::new(CycleState::new()));
 
-            // Initialize windows
             if let Ok(windows) = wm.get_eve_windows() {
                 state.lock().unwrap().update_windows(windows);
             }
@@ -171,111 +269,23 @@ fn main() -> Result<()> {
         }
 
         "cycle-forward" | "forward" | "f" => {
-            // Try daemon first
             if daemon::send_command("forward").is_ok() {
                 return Ok(());
             }
-
-            // Fallback to direct mode
-
-            // Try to acquire lock, exit immediately if already running
-            let lock_file = "/tmp/nicotine-cycle.lock";
-            let file = match OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o644)
-                .open(lock_file)
-            {
-                Ok(f) => f,
-                Err(_) => return Ok(()), // Can't get lock, skip
-            };
-
-            // Try to lock (non-blocking)
-            #[allow(deprecated)]
-            if flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock).is_err() {
-                return Ok(()); // Already running, skip this cycle
-            }
-
-            let mut state = CycleState::new();
-            let windows = wm.get_eve_windows()?;
-
-            if windows.is_empty() {
-                return Ok(());
-            }
-
-            state.update_windows(windows);
-
-            // Sync with current active window
-            if let Ok(active) = wm.get_active_window() {
-                state.sync_with_active(active);
-            }
-
-            state.cycle_forward(&*wm, config.minimize_inactive)?;
-
-            // Lock is automatically released when file is dropped
+            lock::with_cycle_lock(|| run_cycle_direct(&wm, &config, CycleOp::Forward))?;
         }
 
         "cycle-backward" | "backward" | "b" => {
-            // Try daemon first
             if daemon::send_command("backward").is_ok() {
                 return Ok(());
             }
-
-            // Fallback to direct mode
-
-            // Try to acquire lock, exit immediately if already running
-            let lock_file = "/tmp/nicotine-cycle.lock";
-            let file = match OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o644)
-                .open(lock_file)
-            {
-                Ok(f) => f,
-                Err(_) => return Ok(()), // Can't get lock, skip
-            };
-
-            // Try to lock (non-blocking)
-            #[allow(deprecated)]
-            if flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock).is_err() {
-                return Ok(()); // Already running, skip this cycle
-            }
-
-            let mut state = CycleState::new();
-            let windows = wm.get_eve_windows()?;
-
-            if windows.is_empty() {
-                return Ok(());
-            }
-
-            state.update_windows(windows);
-
-            // Sync with current active window
-            if let Ok(active) = wm.get_active_window() {
-                state.sync_with_active(active);
-            }
-
-            state.cycle_backward(&*wm, config.minimize_inactive)?;
-
-            // Lock is automatically released when file is dropped
+            lock::with_cycle_lock(|| run_cycle_direct(&wm, &config, CycleOp::Backward))?;
         }
 
         "stop" => {
             println!("Stopping Nicotine...");
-
-            // Kill all nicotine processes
-            let _ = std::process::Command::new("pkill")
-                .arg("-9")
-                .arg("nicotine")
-                .output();
-
+            stop_command();
             println!("✓ Nicotine stopped");
-
-            // Clean up socket and lock files
-            let _ = std::fs::remove_file("/tmp/nicotine.sock");
-            let _ = std::fs::remove_file("/tmp/nicotine-cycle.lock");
         }
 
         "init-config" => {
@@ -293,49 +303,10 @@ fn main() -> Result<()> {
             };
 
             if let Some(target) = target {
-                // Try daemon first
                 if daemon::send_command(&format!("switch:{}", target)).is_ok() {
                     return Ok(());
                 }
-
-                // Fallback to direct mode
-                let lock_file = "/tmp/nicotine-cycle.lock";
-                let file = match OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o644)
-                    .open(lock_file)
-                {
-                    Ok(f) => f,
-                    Err(_) => return Ok(()),
-                };
-
-                #[allow(deprecated)]
-                if flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock).is_err() {
-                    return Ok(());
-                }
-
-                let mut state = CycleState::new();
-                let windows = wm.get_eve_windows()?;
-
-                if windows.is_empty() {
-                    return Ok(());
-                }
-
-                state.update_windows(windows);
-
-                if let Ok(active) = wm.get_active_window() {
-                    state.sync_with_active(active);
-                }
-
-                let character_order = Config::load_characters();
-                state.switch_to(
-                    target,
-                    &*wm,
-                    config.minimize_inactive,
-                    character_order.as_deref(),
-                )?;
+                lock::with_cycle_lock(|| run_cycle_direct(&wm, &config, CycleOp::Switch(target)))?;
             } else {
                 println!();
                 println!("🚬 N I C O T I N E 🚬");
@@ -344,7 +315,10 @@ fn main() -> Result<()> {
                 println!("Reach out to isomerc on Discord or open a Github issue");
                 println!();
                 println!("Usage:");
+                #[cfg(unix)]
                 println!("  nicotine start         - Start everything (daemon + overlay)");
+                #[cfg(windows)]
+                println!("  nicotine start         - Start everything (daemon + previews)");
                 println!("  nicotine stop          - Stop all Nicotine processes");
                 println!("  nicotine stack         - Stack all EVE windows");
                 println!("  nicotine forward       - Cycle forward");
@@ -355,6 +329,7 @@ fn main() -> Result<()> {
                 println!();
                 println!("Advanced:");
                 println!("  nicotine daemon        - Start daemon only");
+                #[cfg(unix)]
                 println!("  nicotine overlay       - Start overlay only");
                 println!();
                 println!("Quick start:");

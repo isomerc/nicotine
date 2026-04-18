@@ -1,16 +1,15 @@
 use crate::config::Config;
 use crate::cycle_state::CycleState;
+use crate::ipc;
+#[cfg(unix)]
 use crate::keyboard_listener::KeyboardListener;
+#[cfg(unix)]
 use crate::mouse_listener::MouseListener;
 use crate::window_manager::WindowManager;
 use anyhow::Result;
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use interprocess::local_socket::traits::ListenerExt as _;
+use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};
-
-const SOCKET_PATH: &str = "/tmp/nicotine.sock";
 
 #[derive(Debug)]
 pub enum Command {
@@ -73,13 +72,40 @@ impl Daemon {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        // Remove old socket if it exists
-        let _ = fs::remove_file(SOCKET_PATH);
+        let listener = ipc::bind_listener()?;
+        println!("Nicotine daemon listening for IPC commands");
 
-        let listener = UnixListener::bind(SOCKET_PATH)?;
-        println!("EVE Multibox daemon listening on {}", SOCKET_PATH);
+        // Spawn platform-specific input listeners.
+        self.spawn_input_listeners();
 
-        // Start mouse event listener if enabled
+        // Refresh window list periodically in background
+        let wm_clone = Arc::clone(&self.wm);
+        let state_clone = Arc::clone(&self.state);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Ok(windows) = wm_clone.get_eve_windows() {
+                state_clone.lock().unwrap().update_windows(windows);
+            }
+        });
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    if let Err(e) = self.handle_client(stream) {
+                        eprintln!("Error handling client: {}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Connection error: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn spawn_input_listeners(&self) {
         if self.config.enable_mouse_buttons {
             let mouse_listener = MouseListener::new(self.config.clone());
             let wm_clone = Arc::clone(&self.wm);
@@ -115,35 +141,33 @@ impl Daemon {
                 }
             }
         }
+    }
 
-        // Refresh window list periodically in background
+    #[cfg(windows)]
+    fn spawn_input_listeners(&self) {
+        // Hotkey + low-level mouse hook listener (always spawned).
         let wm_clone = Arc::clone(&self.wm);
         let state_clone = Arc::clone(&self.state);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if let Ok(windows) = wm_clone.get_eve_windows() {
-                state_clone.lock().unwrap().update_windows(windows);
-            }
-        });
+        match crate::windows_input::spawn(self.config.clone(), wm_clone, state_clone) {
+            Ok(_) => println!("Windows input listeners started"),
+            Err(e) => eprintln!("Warning: Could not start Windows input listeners: {}", e),
+        }
 
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    if let Err(e) = self.handle_client(stream) {
-                        eprintln!("Error handling client: {}", e);
-                    }
-                }
+        // DWM preview windows manager (gated by config; defaults to true).
+        if self.config.show_previews {
+            let wm_clone = Arc::clone(&self.wm);
+            let state_clone = Arc::clone(&self.state);
+            match crate::preview_windows::spawn(self.config.clone(), wm_clone, state_clone) {
+                Ok(_) => println!("DWM preview windows started"),
                 Err(e) => {
-                    eprintln!("Connection error: {}", e);
+                    eprintln!("Warning: Could not start preview window manager: {}", e)
                 }
             }
         }
-
-        Ok(())
     }
 
-    fn handle_client(&mut self, stream: UnixStream) -> Result<()> {
-        let mut reader = BufReader::new(&stream);
+    fn handle_client(&mut self, stream: interprocess::local_socket::Stream) -> Result<()> {
+        let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line)?;
 
@@ -199,12 +223,5 @@ impl Daemon {
 }
 
 pub fn send_command(command: &str) -> Result<()> {
-    if !Path::new(SOCKET_PATH).exists() {
-        anyhow::bail!("Daemon not running. Start with: eve-multibox daemon");
-    }
-
-    let mut stream = UnixStream::connect(SOCKET_PATH)?;
-    writeln!(stream, "{}", command)?;
-    stream.flush()?;
-    Ok(())
+    ipc::send_line(command)
 }

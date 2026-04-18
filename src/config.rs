@@ -36,30 +36,66 @@ pub struct Config {
     pub keyboard_device_path: Option<String>,
     #[serde(default = "default_modifier_key")]
     pub modifier_key: Option<u16>,
+    /// Width of preview windows in pixels (Windows only). Single global value
+    /// — every preview gets the same size. Aspect ratio is preserved on the
+    /// thumbnail; the window is sized exactly as configured.
+    #[serde(default = "default_preview_width")]
+    pub preview_width: u32,
+    /// Height of preview windows in pixels (Windows only).
+    #[serde(default = "default_preview_height")]
+    pub preview_height: u32,
+    /// Whether DWM preview windows are spawned at all (Windows only). When
+    /// false, the daemon runs headless and you cycle via hotkeys / CLI only.
+    #[serde(default = "default_show_previews")]
+    pub show_previews: bool,
 }
 
 fn default_enable_mouse() -> bool {
     true
 }
 
+#[cfg(unix)]
 fn default_forward_button() -> u16 {
-    276 // BTN_SIDE (forward button, mouse button 9)
+    276 // BTN_SIDE (forward button, mouse button 9) — evdev code
 }
 
+#[cfg(windows)]
+fn default_forward_button() -> u16 {
+    2 // XBUTTON2 (forward side button)
+}
+
+#[cfg(unix)]
 fn default_backward_button() -> u16 {
-    275 // BTN_EXTRA (backward button, mouse button 8)
+    275 // BTN_EXTRA (backward button, mouse button 8) — evdev code
+}
+
+#[cfg(windows)]
+fn default_backward_button() -> u16 {
+    1 // XBUTTON1 (backward side button)
 }
 
 fn default_enable_keyboard() -> bool {
     false // Disabled by default to avoid conflicts
 }
 
+#[cfg(unix)]
 fn default_forward_key() -> u16 {
-    15 // KEY_TAB
+    15 // KEY_TAB — evdev code
 }
 
+#[cfg(windows)]
+fn default_forward_key() -> u16 {
+    0x09 // VK_TAB
+}
+
+#[cfg(unix)]
 fn default_backward_key() -> u16 {
-    15 // KEY_TAB (Modifier applied if set)
+    15 // KEY_TAB (Modifier applied if set) — evdev code
+}
+
+#[cfg(windows)]
+fn default_backward_key() -> u16 {
+    0x09 // VK_TAB
 }
 
 fn default_show_overlay() -> bool {
@@ -84,6 +120,18 @@ fn default_keyboard_device_path() -> Option<String> {
 
 fn default_modifier_key() -> Option<u16> {
     None // No modifier for backward shifting by default
+}
+
+fn default_preview_width() -> u32 {
+    320
+}
+
+fn default_preview_height() -> u32 {
+    180
+}
+
+fn default_show_previews() -> bool {
+    true
 }
 
 impl Config {
@@ -119,8 +167,8 @@ impl Config {
         })
     }
 
+    #[cfg(unix)]
     fn detect_display_size() -> (u32, u32) {
-        // Try to detect display size using xrandr
         if let Ok(output) = std::process::Command::new("xrandr")
             .args(["--current"])
             .output()
@@ -140,47 +188,61 @@ impl Config {
                 }
             }
         }
-
-        // Fallback to common resolution
         (1920, 1080)
+    }
+
+    #[cfg(windows)]
+    fn detect_display_size() -> (u32, u32) {
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+        let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+        if w > 0 && h > 0 {
+            (w as u32, h as u32)
+        } else {
+            (1920, 1080)
+        }
+    }
+
+    fn build_default(display_width: u32, display_height: u32) -> Self {
+        Self {
+            display_width,
+            display_height,
+            panel_height: 0,
+            eve_width: (display_width as f32 * 0.54) as u32, // ~54% of width
+            eve_height: display_height,
+            overlay_x: 10.0,
+            overlay_y: 10.0,
+            enable_mouse_buttons: default_enable_mouse(),
+            forward_button: default_forward_button(),
+            backward_button: default_backward_button(),
+            enable_keyboard_buttons: default_enable_keyboard(),
+            forward_key: default_forward_key(),
+            backward_key: default_backward_key(),
+            show_overlay: default_show_overlay(),
+            mouse_device_name: default_mouse_device_name(),
+            mouse_device_path: default_mouse_device_path(),
+            minimize_inactive: default_minimize_inactive(),
+            keyboard_device_path: default_keyboard_device_path(),
+            modifier_key: default_modifier_key(),
+            preview_width: default_preview_width(),
+            preview_height: default_preview_height(),
+            show_previews: default_show_previews(),
+        }
     }
 
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path();
 
-        // Try to load existing config
         if let Ok(contents) = fs::read_to_string(&config_path) {
             return toml::from_str(&contents).context("Failed to parse config.toml");
         }
 
-        // Auto-generate config based on detected display
         println!("Generating config based on your display...");
         let (display_width, display_height) = Self::detect_display_size();
         println!("Detected display: {}x{}", display_width, display_height);
 
-        let config = Self {
-            display_width,
-            display_height,
-            panel_height: 0, // Assume no panel by default
-            eve_width: (display_width as f32 * 0.54) as u32, // ~54% of width
-            eve_height: display_height,
-            overlay_x: 10.0,
-            overlay_y: 10.0,
-            enable_mouse_buttons: true,
-            forward_button: 276,  // BTN_SIDE (button 9)
-            backward_button: 275, // BTN_EXTRA (button 8)
-            enable_keyboard_buttons: false,
-            forward_key: 15,  // KEY_TAB
-            backward_key: 15, // KEY_TAB (with Shift)
-            show_overlay: true,
-            mouse_device_name: None,
-            mouse_device_path: None,
-            minimize_inactive: false,
-            keyboard_device_path: None,
-            modifier_key: None,
-        };
+        let config = Self::build_default(display_width, display_height);
 
-        // Save the generated config
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -196,27 +258,7 @@ impl Config {
         let config_path = Self::config_path();
         let (display_width, display_height) = Self::detect_display_size();
 
-        let config = Self {
-            display_width,
-            display_height,
-            panel_height: 0,
-            eve_width: (display_width as f32 * 0.54) as u32,
-            eve_height: display_height,
-            overlay_x: 10.0,
-            overlay_y: 10.0,
-            enable_mouse_buttons: true,
-            forward_button: 276,
-            backward_button: 275,
-            enable_keyboard_buttons: false,
-            forward_key: 15,
-            backward_key: 15,
-            show_overlay: true,
-            mouse_device_name: None,
-            mouse_device_path: None,
-            minimize_inactive: false,
-            keyboard_device_path: None,
-            modifier_key: None,
-        };
+        let config = Self::build_default(display_width, display_height);
 
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)?;
@@ -258,6 +300,9 @@ mod tests {
             minimize_inactive: false,
             keyboard_device_path: None,
             modifier_key: None,
+            preview_width: 320,
+            preview_height: 180,
+            show_previews: true,
         };
 
         // Height should be: 1080 - 40 = 1040
@@ -286,6 +331,9 @@ mod tests {
             minimize_inactive: false,
             keyboard_device_path: None,
             modifier_key: None,
+            preview_width: 320,
+            preview_height: 180,
+            show_previews: true,
         };
 
         assert_eq!(config.eve_height_adjusted(), 1080);
@@ -313,6 +361,9 @@ mod tests {
             minimize_inactive: false,
             keyboard_device_path: None,
             modifier_key: None,
+            preview_width: 320,
+            preview_height: 180,
+            show_previews: true,
         };
 
         let toml_str = toml::to_string(&config).unwrap();

@@ -1,9 +1,7 @@
+use crate::paths;
 use crate::window_manager::{EveWindow, WindowManager};
 use anyhow::Result;
 use std::fs;
-use std::path::Path;
-
-const INDEX_FILE: &str = "/tmp/nicotine-index";
 
 pub struct CycleState {
     current_index: usize,
@@ -90,12 +88,13 @@ impl CycleState {
     }
 
     fn write_index(&self) {
-        let _ = fs::write(INDEX_FILE, self.current_index.to_string());
+        let _ = fs::write(paths::index_file_path(), self.current_index.to_string());
     }
 
     pub fn read_index_from_file() -> Option<usize> {
-        if Path::new(INDEX_FILE).exists() {
-            fs::read_to_string(INDEX_FILE)
+        let path = paths::index_file_path();
+        if path.exists() {
+            fs::read_to_string(&path)
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
         } else {
