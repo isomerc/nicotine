@@ -160,6 +160,12 @@ fn position_on_screen(x: i32, y: i32) -> bool {
 
 const PREVIEW_CLASS: &str = "NicotinePreviewWnd\0";
 const CONTROL_CLASS: &str = "NicotinePreviewCtrl\0";
+const LIST_CLASS: &str = "NicotineListWnd\0";
+
+/// Pixel dimensions for the client-list window.
+const LIST_WIDTH: i32 = 260;
+const LIST_ROW_HEIGHT: i32 = 24;
+const LIST_PADDING: i32 = 6;
 const RECONCILE_TIMER_ID: usize = 1;
 /// Reconcile tick interval in ms. Needs to be snappy enough that slider
 /// drags in the config panel feel live. 100ms = 10fps — enough for size
@@ -178,6 +184,10 @@ const NICOTINE_RED: COLORREF = COLORREF(0x003A_1EC4);
 /// Dark chrome color used for inactive previews — same as the title strip
 /// so the border blends in until a client becomes active.
 const CHROME_DARK: COLORREF = COLORREF(0x0000_0000);
+/// Cream background for the list window body (RGB 252, 250, 242).
+const NICOTINE_CREAM: COLORREF = COLORREF(0x00F2_FAFC);
+/// Text color for inactive rows in the list window.
+const LIST_TEXT_BLACK: COLORREF = COLORREF(0x0000_0000);
 
 /// Per-character preview window position. Persisted to disk so previews come
 /// back at the same place across daemon restarts.
@@ -280,10 +290,78 @@ struct PreviewManager {
     /// config panel). Checked on every reconcile tick; any difference from
     /// the cached config values triggers a resize pass over all previews.
     live: Arc<Mutex<LiveSettings>>,
+    /// Mirror of `live.display_mode` from the last reconcile. Used to
+    /// detect transitions so we can tear down the outgoing mode's windows
+    /// before spawning the incoming mode's.
+    current_mode: crate::config::DisplayMode,
+    /// Optional single-window list view; populated when `display_mode` is
+    /// `List`. Drop destroys the window.
+    list: Option<OwnedListWindow>,
+    /// Most recent foreground EVE window id. Used by the list window's
+    /// paint callback to decide which row to highlight.
+    active_id: u32,
+    /// Names rendered in the list window on the previous reconcile, in
+    /// order. Used to detect changes (add/remove/reorder) so we only
+    /// invalidate when something actually shifted — calling
+    /// InvalidateRect every 100ms otherwise produces a visible flicker
+    /// and feels sluggish.
+    list_last_names: Vec<String>,
+}
+
+/// Drop-guard for the list window — destroys the Win32 window and the
+/// heap-allocated drag state stored in its GWLP_USERDATA.
+struct OwnedListWindow {
+    hwnd: HWND,
+}
+
+impl Drop for OwnedListWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let ptr = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA);
+            if ptr != 0 {
+                drop(Box::from_raw(ptr as *mut ListWindowState));
+                SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+            }
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Per-window mutable state for the list window — mostly drag tracking.
+/// A Box<ListWindowState> is stashed in the window's GWLP_USERDATA and
+/// reclaimed when `OwnedListWindow` drops.
+struct ListWindowState {
+    drag_active: bool,
+    dragged: bool,
+    drag_origin_screen: (i32, i32),
+    drag_origin_window: (i32, i32),
 }
 
 impl PreviewManager {
     fn reconcile(&mut self) {
+        // Check whether the user toggled display mode since the last
+        // reconcile; if so, tear down the outgoing mode's windows.
+        let target_mode = self.live.lock().unwrap().display_mode;
+        if target_mode != self.current_mode {
+            match target_mode {
+                crate::config::DisplayMode::Previews => self.list = None,
+                crate::config::DisplayMode::List => self.previews.clear(),
+            }
+            self.current_mode = target_mode;
+        }
+
+        match self.current_mode {
+            crate::config::DisplayMode::Previews => self.reconcile_previews(),
+            crate::config::DisplayMode::List => self.reconcile_list(),
+        }
+
+        // Polling fallback in case the WinEvent hook missed something
+        // (rare). The hook is the primary path and updates instantly.
+        let active_id = self.wm.get_active_window().unwrap_or(0);
+        self.update_active(active_id);
+    }
+
+    fn reconcile_previews(&mut self) {
         // Apply any pending live-settings changes first — this lets the
         // user drag the size sliders in the config panel and see preview
         // windows resize in real time.
@@ -304,7 +382,6 @@ impl PreviewManager {
         for window in &windows {
             if let Some(existing) = self.previews.get(&window.title) {
                 if existing.source_id != window.id {
-                    // HWND changed — rebind thumbnail to the new source.
                     let _ = self.rebind_preview(window);
                 }
             } else if let Err(e) = self.create_preview(window) {
@@ -312,12 +389,7 @@ impl PreviewManager {
             }
         }
 
-        // Re-assert topmost Z-order on every reconcile. WS_EX_TOPMOST puts
-        // us in the topmost tier, but other topmost apps (Discord overlay,
-        // pop-out browsers, etc.) can layer above us within that tier. This
-        // call keeps the previews at the front of the topmost stack. NOMOVE
-        // | NOSIZE | NOACTIVATE means it's a Z-order change only — no
-        // repaint, no focus steal, no flicker.
+        // Re-assert topmost Z-order every tick.
         for preview in self.previews.values() {
             unsafe {
                 let _ = SetWindowPos(
@@ -331,11 +403,126 @@ impl PreviewManager {
                 );
             }
         }
+    }
 
-        // Polling fallback in case the WinEvent hook missed something
-        // (rare). The hook is the primary path and updates instantly.
-        let active_id = self.wm.get_active_window().unwrap_or(0);
-        self.update_active(active_id);
+    fn reconcile_list(&mut self) {
+        // Spawn the list window on first entry into this mode, or if it
+        // was torn down somehow.
+        if self.list.is_none() {
+            if let Err(e) = self.create_list_window() {
+                eprintln!("Failed to create list window: {}", e);
+                return;
+            }
+        }
+
+        // Pull the current ordered character list (stable, keyed on
+        // characters.txt) so we can compare against what we last painted.
+        let ordered_names: Vec<String> = {
+            let s = self.state.lock().unwrap();
+            s.get_ordered_windows()
+                .into_iter()
+                .map(|w| w.title)
+                .collect()
+        };
+        let names_changed = ordered_names != self.list_last_names;
+        let count = ordered_names.len();
+
+        if let Some(list) = &self.list {
+            // Resize only when the count actually changed — SetWindowPos
+            // with NOSIZE/NOMOVE is cheap, but SetWindowPos with size
+            // triggers a repaint.
+            if names_changed {
+                let target_h = list_window_height(count);
+                let mut rect = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(list.hwnd, &mut rect);
+                }
+                let current_h = rect.bottom - rect.top;
+                if current_h != target_h {
+                    unsafe {
+                        let _ = SetWindowPos(
+                            list.hwnd,
+                            Some(HWND_TOPMOST),
+                            0,
+                            0,
+                            LIST_WIDTH,
+                            target_h,
+                            SWP_NOMOVE | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+                // Repaint once. berase=false because paint_list fills
+                // the full window; no need to clear first.
+                unsafe {
+                    let _ = InvalidateRect(Some(list.hwnd), None, false);
+                }
+            }
+
+            // Re-assert topmost Z-order every tick; NOMOVE/NOSIZE/NOACTIVATE
+            // is a Z-only change, no repaint, no flicker.
+            unsafe {
+                let _ = SetWindowPos(
+                    list.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+
+        self.list_last_names = ordered_names;
+    }
+
+    fn create_list_window(&mut self) -> Result<()> {
+        let module = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW failed")?;
+        let class_name: Vec<u16> = LIST_CLASS.encode_utf16().collect();
+        let title: Vec<u16> = "Nicotine\0".encode_utf16().collect();
+
+        let windows_len = self.state.lock().unwrap().get_windows().len();
+        let height = list_window_height(windows_len);
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_POPUP | WS_VISIBLE,
+                20,
+                20,
+                LIST_WIDTH,
+                height,
+                None,
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+        }
+        .context("CreateWindowExW failed for list window")?;
+
+        let state = Box::new(ListWindowState {
+            drag_active: false,
+            dragged: false,
+            drag_origin_screen: (0, 0),
+            drag_origin_window: (0, 0),
+        });
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+
+        self.list = Some(OwnedListWindow { hwnd });
+        Ok(())
     }
 
     /// Read the shared LiveSettings and, if the user has adjusted preview
@@ -421,6 +608,19 @@ impl PreviewManager {
                     (*ptr).is_active = now_active;
                 }
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
+            }
+        }
+
+        // Repaint the list window whenever the active client changes so
+        // the red + cigarette row follows the real foreground window.
+        // berase=false because paint_list fills the full window — no
+        // need to erase first (and erase + paint flickers).
+        if self.active_id != active_id {
+            self.active_id = active_id;
+            if let Some(list) = &self.list {
+                unsafe {
+                    let _ = InvalidateRect(Some(list.hwnd), None, false);
+                }
             }
         }
     }
@@ -728,6 +928,177 @@ unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
     let _ = EndPaint(hwnd, &ps);
 }
 
+/// Height of the list window given a current client count.
+fn list_window_height(num_clients: usize) -> i32 {
+    let rows = num_clients.max(1) as i32;
+    TITLE_HEIGHT + rows * LIST_ROW_HEIGHT + LIST_PADDING
+}
+
+/// Window procedure for the single list-view window. Paints the title
+/// strip + one row per character, with the active character drawn in
+/// Nicotine red prefixed with a 🚬. Left-click drags the window.
+unsafe extern "system" fn list_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ListWindowState;
+    let state = if state_ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    } else {
+        &mut *state_ptr
+    };
+
+    match msg {
+        WM_PAINT => {
+            paint_list(hwnd);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let (cx, cy) = unpack_xy(lparam);
+            let mut pt = POINT { x: cx, y: cy };
+            let _ = ClientToScreen(hwnd, &mut pt);
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rect);
+            state.drag_active = true;
+            state.dragged = false;
+            state.drag_origin_screen = (pt.x, pt.y);
+            state.drag_origin_window = (rect.left, rect.top);
+            let _ = SetCapture(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if state.drag_active {
+                let (cx, cy) = unpack_xy(lparam);
+                let mut pt = POINT { x: cx, y: cy };
+                let _ = ClientToScreen(hwnd, &mut pt);
+                let dx = pt.x - state.drag_origin_screen.0;
+                let dy = pt.y - state.drag_origin_screen.1;
+                if dx.abs() > DRAG_THRESHOLD_PX || dy.abs() > DRAG_THRESHOLD_PX {
+                    state.dragged = true;
+                }
+                if state.dragged {
+                    let new_x = state.drag_origin_window.0 + dx;
+                    let new_y = state.drag_origin_window.1 + dy;
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(HWND_TOPMOST),
+                        new_x,
+                        new_y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            if state.drag_active {
+                state.drag_active = false;
+                let _ = ReleaseCapture();
+                state.dragged = false;
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => LRESULT(0),
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Paint the list window: red title strip at the top, then one row per
+/// character on a cream background. Active row is rendered in Nicotine
+/// red with a cigarette emoji prefix.
+unsafe fn paint_list(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+
+    let mut rect = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut rect);
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+
+    // Cream body
+    let body_brush = CreateSolidBrush(NICOTINE_CREAM);
+    let body_rect = RECT {
+        left: 0,
+        top: TITLE_HEIGHT,
+        right: width,
+        bottom: height,
+    };
+    FillRect(hdc, &body_rect, body_brush);
+    let _ = DeleteObject(body_brush.into());
+
+    // Red title strip
+    let title_brush = CreateSolidBrush(NICOTINE_RED);
+    let title_rect = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: TITLE_HEIGHT,
+    };
+    FillRect(hdc, &title_rect, title_brush);
+    let _ = DeleteObject(title_brush.into());
+
+    let _ = SetBkMode(hdc, TRANSPARENT);
+
+    // Title text
+    let _ = SetTextColor(hdc, COLORREF(0x00FF_FFFF));
+    let mut title_text: Vec<u16> = "NICOTINE".encode_utf16().collect();
+    let mut title_draw_rect = title_rect;
+    let _ = DrawTextW(
+        hdc,
+        &mut title_text,
+        &mut title_draw_rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    // Pull the latest window list + active id via MANAGER_PTR. Safe
+    // because the control thread (us) owns the manager memory.
+    let mgr_ptr = MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
+    if mgr_ptr.is_null() {
+        let _ = EndPaint(hwnd, &ps);
+        return;
+    }
+    let mgr = &*mgr_ptr;
+    let active_id = mgr.active_id;
+    // Use the stable character-order view so rows don't reorder as the
+    // user cycles (get_windows() is z-order from EnumWindows).
+    let windows = {
+        let s = mgr.state.lock().unwrap();
+        s.get_ordered_windows()
+    };
+
+    // Per-row text
+    let mut y = TITLE_HEIGHT + 2;
+    for window in &windows {
+        let is_active = window.id == active_id;
+        let text = if is_active {
+            format!("🚬 {}", window.title)
+        } else {
+            format!("     {}", window.title)
+        };
+        let color = if is_active {
+            NICOTINE_RED
+        } else {
+            LIST_TEXT_BLACK
+        };
+        let _ = SetTextColor(hdc, color);
+        let mut row_buf: Vec<u16> = text.encode_utf16().collect();
+        let mut row_rect = RECT {
+            left: 10,
+            top: y,
+            right: width - 6,
+            bottom: y + LIST_ROW_HEIGHT,
+        };
+        let _ = DrawTextW(hdc, &mut row_buf, &mut row_rect, DT_SINGLELINE | DT_VCENTER);
+        y += LIST_ROW_HEIGHT;
+    }
+
+    let _ = EndPaint(hwnd, &ps);
+}
+
 /// Control-window procedure: the only message it cares about is WM_TIMER,
 /// which fires the reconcile pass against CycleState.
 unsafe extern "system" fn control_wnd_proc(
@@ -793,6 +1164,26 @@ fn register_classes(module: HMODULE) -> Result<()> {
             hIconSm: HICON::default(),
         };
         let _ = RegisterClassExW(&control_wc);
+
+        // List window class — opaque cream background erased via
+        // hbrBackground so flicker-free when text rows change.
+        let list_bg = CreateSolidBrush(NICOTINE_CREAM);
+        let list_class: Vec<u16> = LIST_CLASS.encode_utf16().collect();
+        let list_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: Default::default(),
+            lpfnWndProc: Some(list_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: module.into(),
+            hIcon: HICON::default(),
+            hCursor: cursor,
+            hbrBackground: list_bg,
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: PCWSTR(list_class.as_ptr()),
+            hIconSm: HICON::default(),
+        };
+        let _ = RegisterClassExW(&list_wc);
     }
     Ok(())
 }
@@ -854,6 +1245,7 @@ fn run_manager(
     // Allocate the manager on the heap so we can stash a pointer in the
     // control window's GWLP_USERDATA. The control wnd_proc reads this
     // back to dispatch reconcile().
+    let initial_mode = live.lock().unwrap().display_mode;
     let manager = Box::new(PreviewManager {
         wm,
         state,
@@ -862,6 +1254,10 @@ fn run_manager(
         previews: HashMap::new(),
         next_default_offset: 0,
         live,
+        current_mode: initial_mode,
+        list: None,
+        active_id: 0,
+        list_last_names: Vec::new(),
     });
     let manager_ptr = Box::into_raw(manager);
     MANAGER_PTR.store(manager_ptr as usize, Ordering::Release);

@@ -1,4 +1,4 @@
-use crate::config::{Config, LiveSettings};
+use crate::config::{Config, DisplayMode, LiveSettings};
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 
@@ -175,6 +175,8 @@ impl eframe::App for ConfigPanel {
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.draw_display_mode_section(ui);
+                    ui.add_space(20.0);
                     self.draw_characters_section(ui);
                     ui.add_space(20.0);
                     self.draw_hotkeys_section(ui);
@@ -182,8 +184,6 @@ impl eframe::App for ConfigPanel {
                     self.draw_mouse_section(ui);
                     ui.add_space(20.0);
                     self.draw_previews_section(ui);
-                    ui.add_space(20.0);
-                    self.draw_misc_section(ui);
                 });
             });
     }
@@ -198,6 +198,41 @@ impl ConfigPanel {
                 .color(NICOTINE_RED),
         );
         ui.separator();
+    }
+
+    fn draw_display_mode_section(&mut self, ui: &mut egui::Ui) {
+        Self::draw_section_header(ui, "Display Mode");
+        ui.label(
+            egui::RichText::new(
+                "How Nicotine shows your running clients on screen. \
+                 Preview windows mirror each client live; the list view is \
+                 a compact always-on-top window of names.",
+            )
+            .size(11.0)
+            .color(NICOTINE_BLACK),
+        );
+        ui.add_space(4.0);
+
+        let prev = self.config.display_mode;
+        ui.horizontal(|ui| {
+            ui.radio_value(
+                &mut self.config.display_mode,
+                DisplayMode::Previews,
+                "Preview windows",
+            );
+            ui.add_space(12.0);
+            ui.radio_value(
+                &mut self.config.display_mode,
+                DisplayMode::List,
+                "Client list",
+            );
+        });
+        if self.config.display_mode != prev {
+            self.dirty = true;
+            // Push immediately to the shared LiveSettings so the preview
+            // manager swaps modes within its next reconcile tick.
+            self.live.lock().unwrap().display_mode = self.config.display_mode;
+        }
     }
 
     fn draw_characters_section(&mut self, ui: &mut egui::Ui) {
@@ -370,18 +405,6 @@ impl ConfigPanel {
                 live.preview_height = self.config.preview_height;
             }
         });
-    }
-
-    fn draw_misc_section(&mut self, ui: &mut egui::Ui) {
-        Self::draw_section_header(ui, "Behavior");
-        let prev = self.config.minimize_inactive;
-        ui.checkbox(
-            &mut self.config.minimize_inactive,
-            "Minimize inactive clients (saves CPU/GPU when not in focus)",
-        );
-        if self.config.minimize_inactive != prev {
-            self.dirty = true;
-        }
     }
 }
 

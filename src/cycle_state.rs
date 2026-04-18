@@ -49,6 +49,17 @@ impl CycleState {
         }
     }
 
+    /// Windows in the user-configured cycle order. When `character_order`
+    /// is set, returns only logged-in configured characters in that order;
+    /// otherwise falls back to whatever order the window manager reports.
+    /// Used by the list-view renderer so rows stay put as you cycle.
+    pub fn get_ordered_windows(&self) -> Vec<EveWindow> {
+        self.cycle_indices()
+            .into_iter()
+            .map(|i| self.windows[i].clone())
+            .collect()
+    }
+
     pub fn cycle_forward(&mut self, wm: &dyn WindowManager, minimize_inactive: bool) -> Result<()> {
         self.cycle_step(wm, minimize_inactive, 1)
     }

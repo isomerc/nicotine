@@ -4,6 +4,16 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// How the visible-at-a-glance view of clients is rendered.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayMode {
+    /// One DWM thumbnail window per EVE client (default).
+    Previews,
+    /// A single always-on-top window listing each character name. Active
+    /// character shown in Nicotine red with a 🚬 marker.
+    List,
+}
+
 /// Settings that components watch for *live* changes — e.g. the preview
 /// manager resizes windows as soon as these change, without waiting for a
 /// save-to-disk + hot-reload cycle. Shared via Arc<Mutex<>> between the
@@ -12,6 +22,7 @@ use std::sync::{Arc, Mutex};
 pub struct LiveSettings {
     pub preview_width: u32,
     pub preview_height: u32,
+    pub display_mode: DisplayMode,
 }
 
 impl LiveSettings {
@@ -19,6 +30,7 @@ impl LiveSettings {
         Arc::new(Mutex::new(Self {
             preview_width: config.preview_width,
             preview_height: config.preview_height,
+            display_mode: config.display_mode,
         }))
     }
 }
@@ -74,6 +86,9 @@ pub struct Config {
     /// reports (no stable ordering).
     #[serde(default)]
     pub characters: Vec<String>,
+    /// Which on-screen representation of running clients Nicotine shows.
+    #[serde(default = "default_display_mode")]
+    pub display_mode: DisplayMode,
 }
 
 fn default_enable_mouse() -> bool {
@@ -164,6 +179,10 @@ fn default_preview_height() -> u32 {
 
 fn default_show_previews() -> bool {
     true
+}
+
+fn default_display_mode() -> DisplayMode {
+    DisplayMode::Previews
 }
 
 impl Config {
@@ -257,6 +276,7 @@ impl Config {
             preview_height: default_preview_height(),
             show_previews: default_show_previews(),
             characters: Vec::new(),
+            display_mode: default_display_mode(),
         }
     }
 
@@ -334,6 +354,7 @@ mod tests {
             preview_height: 180,
             show_previews: true,
             characters: Vec::new(),
+            display_mode: DisplayMode::Previews,
         };
 
         // Height should be: 1080 - 40 = 1040
@@ -366,6 +387,7 @@ mod tests {
             preview_height: 180,
             show_previews: true,
             characters: Vec::new(),
+            display_mode: DisplayMode::Previews,
         };
 
         assert_eq!(config.eve_height_adjusted(), 1080);
@@ -397,6 +419,7 @@ mod tests {
             preview_height: 180,
             show_previews: true,
             characters: Vec::new(),
+            display_mode: DisplayMode::Previews,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
