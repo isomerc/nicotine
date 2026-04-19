@@ -15,6 +15,7 @@ mod daemon;
 mod ipc;
 mod lock;
 mod paths;
+mod telemetry;
 mod window_manager;
 
 #[cfg(unix)]

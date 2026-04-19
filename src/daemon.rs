@@ -5,6 +5,7 @@ use crate::ipc;
 use crate::keyboard_listener::KeyboardListener;
 #[cfg(unix)]
 use crate::mouse_listener::MouseListener;
+use crate::telemetry;
 use crate::window_manager::WindowManager;
 use anyhow::Result;
 use interprocess::local_socket::traits::ListenerExt as _;
@@ -55,6 +56,13 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(wm: Arc<dyn WindowManager>, config: Config, live: Arc<Mutex<LiveSettings>>) -> Self {
+        // Anonymous launch ping. Fires once per daemon start (which is
+        // also once per `nicotine start` / double-click on Windows), not
+        // per cycle command — those go over IPC and don't construct a
+        // new Daemon. Detached + best-effort, so a network failure or
+        // missing token never blocks startup.
+        telemetry::send_launch_ping();
+
         let state = Arc::new(Mutex::new(CycleState::new()));
 
         // Initialize windows

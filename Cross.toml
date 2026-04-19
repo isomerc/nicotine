@@ -1,0 +1,5 @@
+# `cross` runs the build inside an isolated Docker container, so any env
+# var that should be visible to build scripts (here: `option_env!` for
+# the telemetry token) must be explicitly forwarded.
+[build.env]
+passthrough = ["NICOTINE_TELEMETRY_TOKEN"]
