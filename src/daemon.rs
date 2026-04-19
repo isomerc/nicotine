@@ -175,6 +175,11 @@ impl Daemon {
                         crate::windows_input::resume_hotkeys();
                         last_hotkey_sig = new_sig;
                     }
+                    // Mouse-cycle toggle hot-reload. Atomic store is
+                    // cheap; no need to gate on a change check.
+                    crate::windows_input::set_mouse_cycle_enabled(
+                        fresh_config.enable_mouse_buttons,
+                    );
                 }
             }
         });

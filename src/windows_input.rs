@@ -59,6 +59,13 @@ static LISTENER_PAUSED: AtomicBool = AtomicBool::new(false);
 /// for mice that emit raw x-button events.
 static MOUSE_CYCLE_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Hot-reload setter for MOUSE_CYCLE_ENABLED. Called from the daemon
+/// config-watch thread so toggling `enable_mouse_buttons` in the
+/// config panel takes effect within ~500ms — no daemon restart.
+pub fn set_mouse_cycle_enabled(enabled: bool) {
+    MOUSE_CYCLE_ENABLED.store(enabled, Ordering::Release);
+}
+
 /// Ask the input listener to stop acting on hotkeys. This unregisters
 /// its global hotkeys so the keys become available to the focused
 /// window (the config panel) for capture. No-op if the listener isn't

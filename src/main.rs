@@ -18,7 +18,6 @@ mod paths;
 mod telemetry;
 mod window_manager;
 
-#[cfg(unix)]
 mod version_check;
 
 #[cfg(unix)]
@@ -161,6 +160,11 @@ fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
 #[cfg(windows)]
 fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
     let live = LiveSettings::from_config(&config);
+
+    // Kick off the GitHub-release check on a detached thread. The
+    // config panel's footer renders a "NEW VERSION AVAILABLE" link
+    // once the result lands (~1s after launch on a normal connection).
+    version_check::spawn_check();
 
     // If a separate daemon is already running (e.g. the user invoked
     // `nicotine.exe daemon` in headless mode), don't spawn a duplicate —

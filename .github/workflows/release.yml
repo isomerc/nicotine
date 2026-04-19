@@ -81,14 +81,11 @@ jobs:
           NICOTINE_TELEMETRY_TOKEN: ${{ secrets.NICOTINE_TELEMETRY_TOKEN }}
         run: cargo xwin build --release --target x86_64-pc-windows-msvc
 
-      - name: Rename binary
-        run: mv target/x86_64-pc-windows-msvc/release/Nicotine.exe target/x86_64-pc-windows-msvc/release/Nicotine-windows-x86_64.exe
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: nicotine-x86_64-pc-windows-msvc
-          path: target/x86_64-pc-windows-msvc/release/Nicotine-windows-x86_64.exe
+          path: target/x86_64-pc-windows-msvc/release/Nicotine.exe
 
   release:
     name: Create GitHub Release
@@ -118,7 +115,7 @@ jobs:
           files: |
             artifacts/nicotine-x86_64-unknown-linux-gnu/nicotine-linux-x86_64
             artifacts/nicotine-aarch64-unknown-linux-gnu/nicotine-linux-aarch64
-            artifacts/nicotine-x86_64-pc-windows-msvc/Nicotine-windows-x86_64.exe
+            artifacts/nicotine-x86_64-pc-windows-msvc/Nicotine.exe
             assets/icon.png
             assets/nicotine.desktop
         env:

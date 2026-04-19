@@ -35,6 +35,9 @@ const NICOTINE_RED: egui::Color32 = egui::Color32::from_rgb(196, 30, 58);
 const NICOTINE_GOLD: egui::Color32 = egui::Color32::from_rgb(180, 155, 105);
 const NICOTINE_CREAM: egui::Color32 = egui::Color32::from_rgb(252, 250, 242);
 const NICOTINE_BLACK: egui::Color32 = egui::Color32::from_rgb(30, 30, 30);
+/// Used only for the "LATEST VERSION" footer badge — chosen to read
+/// clearly against cream while harmonizing with the warm palette.
+const NICOTINE_GREEN: egui::Color32 = egui::Color32::from_rgb(60, 140, 70);
 
 pub struct ConfigPanel {
     config: Config,
@@ -280,6 +283,40 @@ impl eframe::App for ConfigPanel {
                             .color(NICOTINE_RED),
                         "https://www.illuminatedcorp.com",
                     );
+
+                    // Right-aligned update badge. `right_to_left`
+                    // consumes the remaining horizontal space and lays
+                    // out items from the right edge so this lands in
+                    // the bottom-right corner regardless of panel width.
+                    // Three states:
+                    //   - `Outdated` → red "NEW VERSION AVAILABLE" link
+                    //     to the GitHub release page
+                    //   - `UpToDate` → green "LATEST VERSION" label
+                    //   - `None` (check pending or failed) → render
+                    //     nothing so we don't show stale claims
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        match crate::version_check::get_update_status() {
+                            Some(crate::version_check::UpdateStatus::Outdated { version, url }) => {
+                                ui.hyperlink_to(
+                                    egui::RichText::new(format!(
+                                        "NEW VERSION AVAILABLE (v{})",
+                                        version
+                                    ))
+                                    .strong()
+                                    .color(NICOTINE_RED),
+                                    url,
+                                );
+                            }
+                            Some(crate::version_check::UpdateStatus::UpToDate) => {
+                                ui.label(
+                                    egui::RichText::new("LATEST VERSION")
+                                        .strong()
+                                        .color(NICOTINE_GREEN),
+                                );
+                            }
+                            None => {}
+                        }
+                    });
                 });
             });
 
@@ -598,6 +635,25 @@ impl ConfigPanel {
                 .color(NICOTINE_BLACK),
             );
         });
+
+        ui.add_space(8.0);
+        let prev_mouse = self.config.enable_mouse_buttons;
+        ui.checkbox(
+            &mut self.config.enable_mouse_buttons,
+            "Cycle on mouse side buttons (XBUTTON1/XBUTTON2)",
+        );
+        if self.config.enable_mouse_buttons != prev_mouse {
+            self.touch();
+        }
+        ui.label(
+            egui::RichText::new(
+                "Off by default. Turn on only if you don't already remap your mouse \
+                 side buttons via driver software (Logi Options+, Razer Synapse, etc.) \
+                 — otherwise this will hijack the buttons in browsers/games too.",
+            )
+            .size(10.0)
+            .color(NICOTINE_BLACK),
+        );
     }
 
     /// Button that toggles capture for a given config field. When

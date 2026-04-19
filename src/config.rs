@@ -122,8 +122,19 @@ pub struct Config {
     pub character_hotkeys: HashMap<String, CharacterHotkey>,
 }
 
+#[cfg(unix)]
 fn default_enable_mouse() -> bool {
     true
+}
+
+// Off by default on Windows — most users remap side buttons at the
+// driver level (Logi Options+, etc.) and use Nicotine's keyboard
+// hotkeys instead. When the native hook is on, it intercepts XBUTTON1/2
+// from games and browsers (back/forward) which surprises users who
+// didn't ask for cycling there.
+#[cfg(windows)]
+fn default_enable_mouse() -> bool {
+    false
 }
 
 #[cfg(unix)]
