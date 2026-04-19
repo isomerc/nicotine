@@ -21,10 +21,15 @@ pub trait WindowManager: Send + Sync {
     /// Get the currently active window ID
     fn get_active_window(&self) -> Result<u32>;
 
-    /// Find a window by its title (returns window ID if found)
+    /// Find a window by its title (returns window ID if found). Used by
+    /// the Linux overlay window only — Windows builds don't call this,
+    /// hence the dead-code suppression for the cross-platform trait.
+    #[allow(dead_code)]
     fn find_window_by_title(&self, title: &str) -> Result<Option<u32>>;
 
-    /// Move a window to a specific position (X11 only, no-op on Wayland)
+    /// Move a window to a specific position (X11 only, no-op on Wayland).
+    /// Like `find_window_by_title`, only the Linux overlay calls this.
+    #[allow(dead_code)]
     fn move_window(&self, window_id: u32, x: i32, y: i32) -> Result<()> {
         // Default implementation: no-op (Wayland doesn't allow arbitrary window positioning)
         let _ = (window_id, x, y);
@@ -38,12 +43,14 @@ pub trait WindowManager: Send + Sync {
     fn restore_window(&self, window_id: u32) -> Result<()>;
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayServer {
     X11,
     Wayland,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaylandCompositor {
     Kde,      // KDE Plasma / KWin
@@ -54,6 +61,7 @@ pub enum WaylandCompositor {
 }
 
 /// Detect which display server is running
+#[cfg(unix)]
 pub fn detect_display_server() -> DisplayServer {
     if let Ok(session_type) = std::env::var("XDG_SESSION_TYPE") {
         if session_type == "wayland" {
@@ -71,6 +79,7 @@ pub fn detect_display_server() -> DisplayServer {
 }
 
 /// Detect which Wayland compositor is running
+#[cfg(unix)]
 pub fn detect_wayland_compositor() -> WaylandCompositor {
     // Check XDG_CURRENT_DESKTOP first
     if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {

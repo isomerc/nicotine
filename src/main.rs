@@ -8,6 +8,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod config;
+#[cfg(windows)]
 mod config_panel;
 mod cycle_state;
 mod daemon;
@@ -42,7 +43,9 @@ use config::{Config, LiveSettings};
 use cycle_state::CycleState;
 use daemon::Daemon;
 use std::env;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 use window_manager::WindowManager;
 
 #[cfg(unix)]

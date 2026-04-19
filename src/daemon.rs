@@ -46,6 +46,10 @@ pub struct Daemon {
     state: Arc<Mutex<CycleState>>,
     config: Config,
     character_order: Option<Vec<String>>,
+    /// Read by the Windows preview manager via `spawn_input_listeners`.
+    /// On Linux nothing reads it — kept for ABI symmetry with the Windows
+    /// daemon constructor.
+    #[cfg_attr(unix, allow(dead_code))]
     live: Arc<Mutex<LiveSettings>>,
 }
 

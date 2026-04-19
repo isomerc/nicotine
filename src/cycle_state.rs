@@ -53,6 +53,9 @@ impl CycleState {
     /// is set, returns only logged-in configured characters in that order;
     /// otherwise falls back to whatever order the window manager reports.
     /// Used by the list-view renderer so rows stay put as you cycle.
+    /// Windows-only consumer (preview manager); kept cross-platform so
+    /// future Linux UI can reuse it.
+    #[cfg_attr(unix, allow(dead_code))]
     pub fn get_ordered_windows(&self) -> Vec<EveWindow> {
         self.cycle_indices()
             .into_iter()
@@ -62,7 +65,8 @@ impl CycleState {
 
     /// Activate the EVE client whose title exactly matches `name`.
     /// No-op if that character isn't currently logged in. Used by
-    /// per-character global hotkeys.
+    /// per-character global hotkeys (Windows only).
+    #[cfg_attr(unix, allow(dead_code))]
     pub fn switch_to_character(
         &mut self,
         name: &str,
@@ -171,6 +175,12 @@ impl CycleState {
         let _ = fs::write(paths::index_file_path(), self.current_index.to_string());
     }
 
+    // The next three methods are called by the Linux overlay and the
+    // unit tests but not by any release-mode Windows code path.
+    // `#[allow(dead_code)]` keeps them defined cross-platform without
+    // tripping the Windows `cargo clippy -- -D warnings` job.
+
+    #[allow(dead_code)]
     pub fn read_index_from_file() -> Option<usize> {
         let path = paths::index_file_path();
         if path.exists() {
@@ -186,10 +196,12 @@ impl CycleState {
         &self.windows
     }
 
+    #[allow(dead_code)]
     pub fn get_current_index(&self) -> usize {
         self.current_index
     }
 
+    #[allow(dead_code)]
     pub fn set_current_index(&mut self, index: usize) {
         if index < self.windows.len() || self.windows.is_empty() {
             self.current_index = index;

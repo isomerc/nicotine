@@ -27,3 +27,38 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy -- -D warnings
+
+  windows-check:
+    name: Windows compile check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # cargo-xwin invokes `clang-cl` (provided by the `clang` package; it
+      # symlinks to `clang` and switches to MSVC mode based on argv[0]).
+      # `llvm` provides `llvm-rc-NN` which build.rs uses to compile the
+      # .exe icon resource.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      # The xwin SDK download is several hundred MB — cache it across
+      # CI runs so we only pay the cost on the first run after a key bust.
+      - name: Cache xwin SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: cargo-xwin-ubuntu-latest-v1
+
+      - name: Install cargo-xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      - name: Clippy on Windows target
+        run: cargo xwin clippy --release --target x86_64-pc-windows-msvc -- -D warnings

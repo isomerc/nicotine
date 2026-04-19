@@ -29,7 +29,11 @@ pub enum DisplayMode {
 /// manager resizes windows as soon as these change, without waiting for a
 /// save-to-disk + hot-reload cycle. Shared via Arc<Mutex<>> between the
 /// config panel (writer) and the preview manager (reader).
+// LiveSettings fields are read by the Windows preview manager only.
+// On Linux they're allocated and written by `from_config` but never
+// read, so suppress the unused-field lint there.
 #[derive(Debug, Clone)]
+#[cfg_attr(unix, allow(dead_code))]
 pub struct LiveSettings {
     pub preview_width: u32,
     pub preview_height: u32,
@@ -225,13 +229,10 @@ impl Config {
         path
     }
 
-    /// Public accessor for `config.toml`'s on-disk path.
-    pub fn config_path_for_display() -> PathBuf {
-        Self::config_path()
-    }
-
     /// Persist the current Config back to disk. Used by the config panel
-    /// to commit user edits.
+    /// to commit user edits. Only called from the Windows config panel,
+    /// hence the dead-code allow on Linux.
+    #[cfg_attr(unix, allow(dead_code))]
     pub fn save(&self) -> Result<()> {
         let config_path = Self::config_path();
         if let Some(parent) = config_path.parent() {

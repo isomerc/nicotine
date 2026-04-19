@@ -15,8 +15,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::{
     DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
-    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
-    DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
     AddFontMemResourceEx, BeginPaint, ClientToScreen, CreateFontIndirectW, CreateSolidBrush,
@@ -35,9 +34,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetTimer, SetWindowLongPtrW, SetWindowPos, TranslateMessage, EVENT_SYSTEM_FOREGROUND,
     GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST, IDC_ARROW, MSG, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    SWP_NOSIZE, WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_VISIBLE,
 };
 
 /// Type alias for DWM thumbnail handles. windows-rs 0.59 doesn't expose a
@@ -931,14 +930,9 @@ fn register_embedded_fonts() {
             include_bytes!("../assets/fonts/Marlboro.ttf"),
         ];
         for bytes in FONTS {
-            let mut count: u32 = 0;
+            let count: u32 = 0;
             unsafe {
-                AddFontMemResourceEx(
-                    bytes.as_ptr() as *const _,
-                    bytes.len() as u32,
-                    None,
-                    &mut count,
-                );
+                AddFontMemResourceEx(bytes.as_ptr() as *const _, bytes.len() as u32, None, &count);
             }
         }
     });

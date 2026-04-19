@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: Build release binaries
+    name: Build Linux release binaries
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -41,9 +41,54 @@ jobs:
           name: nicotine-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/nicotine-linux-*
 
+  build-windows:
+    name: Build Windows release binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # cargo-xwin invokes `clang-cl` (provided by the `clang` package; it
+      # symlinks to `clang` and switches to MSVC mode based on argv[0]).
+      # `llvm` provides `llvm-rc-NN` which build.rs uses to compile the
+      # .exe icon resource.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      # The xwin SDK download is several hundred MB — cache it across
+      # CI runs so we only pay the cost on the first run after a key bust.
+      - name: Cache xwin SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: cargo-xwin-ubuntu-latest-v1
+
+      - name: Install cargo-xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      - name: Build binary
+        run: cargo xwin build --release --target x86_64-pc-windows-msvc
+
+      - name: Rename binary
+        run: mv target/x86_64-pc-windows-msvc/release/Nicotine.exe target/x86_64-pc-windows-msvc/release/Nicotine-windows-x86_64.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nicotine-x86_64-pc-windows-msvc
+          path: target/x86_64-pc-windows-msvc/release/Nicotine-windows-x86_64.exe
+
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -66,6 +111,7 @@ jobs:
           files: |
             artifacts/nicotine-x86_64-unknown-linux-gnu/nicotine-linux-x86_64
             artifacts/nicotine-aarch64-unknown-linux-gnu/nicotine-linux-aarch64
+            artifacts/nicotine-x86_64-pc-windows-msvc/Nicotine-windows-x86_64.exe
             assets/icon.png
             assets/nicotine.desktop
         env:
