@@ -6,6 +6,12 @@
 
 High-performance EVE Online multiboxing tool for Linux (X11 & Wayland), inspired by EVE-O Preview.
 
+<div align="center">
+
+### 💬 [**Join the Nicotine Discord**](https://discord.gg/N82KJcS47f) 💬
+
+</div>
+
 [Illuminated is recruiting!](https://illuminatedcorp.com)
 
 ## Features
