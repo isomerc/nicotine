@@ -4,7 +4,7 @@
 
 # Nicotine 🚬
 
-High-performance EVE Online multiboxing tool for Linux (X11 & Wayland), inspired by EVE-O Preview.
+High-performance EVE Online multiboxing tool for Linux (X11 & Wayland) and Windows.
 
 <div align="center">
 
@@ -17,19 +17,18 @@ High-performance EVE Online multiboxing tool for Linux (X11 & Wayland), inspired
 ## Features
 
 - **Instant client cycling** with mouse buttons (forward/backward) or targeted switching (jump to client N)
-- **Always-on-top overlay** showing all clients and their status
+- **Live preview windows** per EVE client — XComposite + XRender on Linux, DWM thumbnails on Windows
+- **List display mode** — compact roster window as an alternative to per-client previews
+- **Config panel** for character order, per-character jump hotkeys, preview sizing, and display mode
 - **Daemon architecture** for near-zero-latency window switching
 - **Auto-stack windows** to perfectly center multiple EVE clients
-- **Draggable overlay** with middle-mouse button (X11 only)
-- **Auto-detects display resolution** - works on any monitor setup
-- **Multi-compositor support** - Works on X11, KDE Plasma (Wayland), Sway, and Hyprland
-- **Minimize inactive clients** - Optional feature to reduce resource usage by minimizing unfocused clients
+- **Drag-to-position with snap-to-dock** on previews and the list window; lockable layout for play
+- **Multi-compositor support** — X11, KDE Plasma (Wayland), Sway, Hyprland
+- **Minimize inactive clients** — optional, reduces resource usage when cycling away
 
 ## Roadmap
 - Comprehensive documentation
 - More configuration options
-- Optional preview windows
-- Overlay redesign
 
 ## Quick Install
 
@@ -177,12 +176,14 @@ cat /proc/bus/input/devices | grep -B 5 "kbd" | grep -E "Name|Handlers"
 sudo evtest /dev/input/eventX # Replace X with the correct event number i.e event11
 ```
 
-### Overlay Controls
+### Config Panel & Previews
 
-- **Restack Windows** - Re-center all EVE clients
-- **Daemon status** - Green = running, Red = stopped
-- **Client list** - Shows all EVE clients with active indicator (>)
-- **Middle-click drag** - Move the overlay (X11 only)
+`nicotine start` opens the config panel and spawns one preview window per running EVE client. The panel has four sections: **Display Mode** (Previews vs List), **Cycle Order** (character list + per-character jump hotkeys), **Keyboard Hotkeys**, and **Preview Windows** (size sliders, show/hide toggle). Changes apply live; saves debounce to disk.
+
+Previews and the list window:
+- **Left-click-drag** to reposition; edges snap to adjacent windows
+- **Click without drag** on a preview to foreground that EVE client
+- **Lock positions** in the panel to freeze the layout during play
 
 ## Configuration
 
@@ -196,14 +197,18 @@ display_height = 1080
 panel_height = 0           # Set this if you have a taskbar/panel
 eve_width = 1037           # ~54% of display width
 eve_height = 1080
-overlay_x = 10.0
-overlay_y = 10.0
-show_overlay = true        # Set to false to run daemon-only mode (no GUI)
+show_previews = true       # Spawn preview windows (false = daemon-only)
+preview_width = 320        # Preview window width in px
+preview_height = 180       # Preview window height in px
+display_mode = "Previews"  # "Previews" or "List"
+positions_locked = false   # Disable drag on previews + list
 enable_mouse_buttons = true
 forward_button = 276       # Button 9
 backward_button = 275      # Button 8
 minimize_inactive = false  # Minimize clients when cycling away (saves resources)
 ```
+
+Per-character jump hotkeys live under `[character_hotkeys."Name"]` with `vk` and optional `modifier`; the config panel writes them for you.
 
 ## Architecture
 
@@ -254,11 +259,10 @@ For **mouse button support**, add yourself to the `input` group (see Mouse Bindi
 - Mouse buttons (native evdev support, no external tools needed)
 - Window detection and cycling (all supported compositors)
 - Window stacking (KDE/Sway/Hyprland)
+- Preview windows (XComposite + XRender via XWayland)
 - Auto-detection of display server and compositor
 
 **Limitations:**
-- Overlay dragging disabled on Wayland (security model prevents arbitrary window positioning)
-  - Workaround: Use compositor window management (e.g., Super+drag)
 - GNOME not supported (restrictive window management APIs)
 
 ## Building from Source

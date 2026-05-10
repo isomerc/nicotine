@@ -8,28 +8,33 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod config;
-#[cfg(windows)]
 mod config_panel;
 mod cycle_state;
 mod daemon;
 mod ipc;
 mod lock;
 mod paths;
+mod preview_common;
+mod preview_positions;
 mod telemetry;
 mod window_manager;
 
 mod version_check;
 
 #[cfg(unix)]
+mod eve_match;
+#[cfg(unix)]
 mod keyboard_listener;
 #[cfg(unix)]
 mod mouse_listener;
 #[cfg(unix)]
-mod overlay;
+mod preview_x11;
 #[cfg(unix)]
 mod wayland_backends;
 #[cfg(unix)]
 mod x11_manager;
+#[cfg(unix)]
+mod xdg_activation;
 
 #[cfg(windows)]
 mod preview_windows;
@@ -44,14 +49,10 @@ use cycle_state::CycleState;
 use daemon::Daemon;
 use std::env;
 use std::sync::Arc;
-#[cfg(unix)]
-use std::sync::Mutex;
 use window_manager::WindowManager;
 
 #[cfg(unix)]
 use daemonize::Daemonize;
-#[cfg(unix)]
-use overlay::run_overlay;
 #[cfg(unix)]
 use wayland_backends::{HyprlandManager, KWinManager, SwayManager};
 #[cfg(unix)]
@@ -118,43 +119,66 @@ enum CycleOp {
 #[cfg(unix)]
 fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
     let live = LiveSettings::from_config(&config);
-    let daemonize = Daemonize::new().working_directory("/tmp").umask(0o027);
 
-    match daemonize.start() {
-        Ok(_) => {
-            let wm_daemon = Arc::clone(&wm);
-            let config_daemon = config.clone();
-            let live_daemon = Arc::clone(&live);
-            let daemon_thread = std::thread::spawn(move || {
-                let mut daemon = Daemon::new(wm_daemon, config_daemon, live_daemon);
-                if let Err(e) = daemon.run() {
-                    eprintln!("Daemon error: {}", e);
-                }
-            });
-
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            if config.show_overlay {
-                let state = Arc::new(Mutex::new(CycleState::new()));
-                if let Ok(windows) = wm.get_eve_windows() {
-                    state.lock().unwrap().update_windows(windows);
-                }
-
-                if let Err(e) = run_overlay(wm, state, config.overlay_x, config.overlay_y, config) {
-                    eprintln!("Overlay error: {}", e);
-                    std::process::exit(1);
-                }
-            } else {
-                println!("Overlay disabled - daemon running in background");
-                daemon_thread.join().unwrap();
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Failed to daemonize: {}", e);
-            std::process::exit(1);
-        }
+    // Daemonize so the launching terminal returns immediately while the
+    // config panel + daemon thread keep running in the background — same
+    // UX as `nicotine.exe` start on Windows where the GUI process detaches
+    // from any console. Pipe child stdout/stderr to a log file under
+    // /tmp so a panicking egui/winit init doesn't disappear into /dev/null.
+    let stdout = std::fs::File::create("/tmp/nicotine.out").unwrap_or_else(|_| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open("/dev/null")
+            .expect("/dev/null")
+    });
+    let stderr = std::fs::File::create("/tmp/nicotine.err").unwrap_or_else(|_| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open("/dev/null")
+            .expect("/dev/null")
+    });
+    let daemonize = Daemonize::new()
+        .working_directory("/tmp")
+        .umask(0o027)
+        .stdout(stdout)
+        .stderr(stderr);
+    if let Err(e) = daemonize.start() {
+        eprintln!("Failed to daemonize: {}", e);
+        std::process::exit(1);
     }
+
+    // Async update check so the panel's footer can show "NEW VERSION
+    // AVAILABLE" once the result lands — same pattern as Windows.
+    version_check::spawn_check();
+
+    // Daemon (cycling, hotkey listeners, preview manager) runs in a
+    // worker thread; the config panel owns the main thread so eframe's
+    // event loop can pump there.
+    if !ipc::daemon_running() {
+        let wm_daemon = Arc::clone(&wm);
+        let config_daemon = config.clone();
+        let live_daemon = Arc::clone(&live);
+        std::thread::spawn(move || {
+            let mut daemon = Daemon::new(wm_daemon, config_daemon, live_daemon);
+            if let Err(e) = daemon.run() {
+                eprintln!("Daemon error: {}", e);
+            }
+        });
+        // Brief pause so the IPC socket is bound before the panel opens.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Config panel = the visible app, like the Windows side. Blocks
+    // until the user closes the window, at which point the process
+    // exits and the daemon thread terminates with it.
+    if let Err(e) = config_panel::run(config, live) {
+        eprintln!("Config panel error: {}", e);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -197,11 +221,20 @@ fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
 
 #[cfg(unix)]
 fn stop_command() {
+    // pkill matches against `comm` (the kernel's short process name)
+    // which is the binary's filename. That's `Nicotine` (capital N) —
+    // the Cargo.toml renames it for Windows Explorer convention, with
+    // the install scripts dropping a lowercase symlink so the CLI verb
+    // stays lowercase. The pre-0.5 stop path was `pkill -9 nicotine`
+    // which matched case-sensitively and silently no-op'd. `-i` makes
+    // it case-insensitive so the kill works regardless of which name
+    // the user invoked. pkill excludes its own process and parent by
+    // default, so the calling `Nicotine stop` doesn't kill itself.
     let _ = std::process::Command::new("pkill")
-        .arg("-9")
-        .arg("nicotine")
+        .args(["-9", "-i", "nicotine"])
         .output();
     let _ = std::fs::remove_file("/tmp/nicotine.sock");
+    let _ = std::fs::remove_file("/tmp/nicotine-index");
     let _ = std::fs::remove_file(paths::lock_file_path());
 }
 
@@ -279,12 +312,6 @@ fn main() -> Result<()> {
     match command {
         "start" => {
             println!("Starting Nicotine 🚬");
-
-            #[cfg(unix)]
-            if let Ok(Some((new_version, url))) = version_check::check_for_updates() {
-                version_check::print_update_notification(&new_version, &url);
-            }
-
             start_command(wm, config)?;
         }
 
@@ -293,21 +320,6 @@ fn main() -> Result<()> {
             let live = LiveSettings::from_config(&config);
             let mut daemon = Daemon::new(wm, config, live);
             daemon.run()?;
-        }
-
-        #[cfg(unix)]
-        "overlay" => {
-            println!("Starting Nicotine Overlay...");
-            let state = Arc::new(Mutex::new(CycleState::new()));
-
-            if let Ok(windows) = wm.get_eve_windows() {
-                state.lock().unwrap().update_windows(windows);
-            }
-
-            if let Err(e) = run_overlay(wm, state, config.overlay_x, config.overlay_y, config) {
-                eprintln!("Overlay error: {}", e);
-                std::process::exit(1);
-            }
         }
 
         "stack" => {
@@ -352,9 +364,9 @@ fn main() -> Result<()> {
             Config::save_default()?;
         }
 
-        // Windows double-click: no command arg → go straight to the GUI
-        // start path rather than printing help to a hidden console.
-        #[cfg(windows)]
+        // No command arg → go straight to the GUI start path. On Windows
+        // this matches a double-click from Explorer; on Linux it matches
+        // launching from a `.desktop` entry where no args are passed.
         "" => {
             start_command(wm, config)?;
         }
@@ -382,10 +394,7 @@ fn main() -> Result<()> {
                 println!("Reach out to isomerc on Discord or open a Github issue");
                 println!();
                 println!("Usage:");
-                #[cfg(unix)]
-                println!("  nicotine start         - Start everything (daemon + overlay)");
-                #[cfg(windows)]
-                println!("  nicotine start         - Start everything (daemon + previews)");
+                println!("  nicotine start         - Start everything (daemon + previews + control panel)");
                 println!("  nicotine stop          - Stop all Nicotine processes");
                 println!("  nicotine stack         - Stack all EVE windows");
                 println!("  nicotine forward       - Cycle forward");
@@ -395,9 +404,7 @@ fn main() -> Result<()> {
                 println!("  nicotine init-config   - Create default config.toml");
                 println!();
                 println!("Advanced:");
-                println!("  nicotine daemon        - Start daemon only");
-                #[cfg(unix)]
-                println!("  nicotine overlay       - Start overlay only");
+                println!("  nicotine daemon        - Start daemon only (headless)");
                 println!();
                 println!("Quick start:");
                 println!("  nicotine start         # Starts in background automatically");
