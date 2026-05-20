@@ -385,6 +385,32 @@ impl PreviewManager {
     }
 
     fn reconcile(&mut self) -> Result<()> {
+        // Panel show/hide toggle. Drop all surfaces when the user
+        // unchecks "Show preview windows" so the manager goes truly
+        // dark (no override_redirect windows lingering, no XComposite
+        // redirect on EVE surfaces). When the user re-checks it, set
+        // needs_window_scan so reconcile_previews actually rebuilds —
+        // its normal gate only fires on _NET_CLIENT_LIST changes,
+        // which won't fire just because we want to repopulate after
+        // being hidden.
+        let show_previews = self.live.lock_recover().show_previews;
+        if !show_previews {
+            if !self.previews.is_empty() {
+                self.previews.clear();
+            }
+            if self.list_window.is_some() {
+                self.list_window = None;
+            }
+            // Stay quiet — don't run the rest of reconcile.
+            return Ok(());
+        }
+        if self.previews.is_empty() && self.list_window.is_none() {
+            // Either we just toggled back on or we started clean;
+            // either way, re-enumerate EVE windows on the next
+            // reconcile_previews pass.
+            self.needs_window_scan = true;
+        }
+
         // Display-mode transition (panel toggled Previews ↔ List).
         // Tear down the outgoing mode's surfaces before the matching
         // mode-specific reconcile spawns the new one.
