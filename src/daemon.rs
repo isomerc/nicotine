@@ -294,21 +294,20 @@ impl Daemon {
             Err(e) => eprintln!("Warning: Could not start Windows input listeners: {}", e),
         }
 
-        // DWM preview windows manager (gated by config; defaults to true).
-        if self.config.show_previews {
-            let wm_clone = Arc::clone(&self.wm);
-            let state_clone = Arc::clone(&self.state);
-            let live_clone = Arc::clone(&self.live);
-            match crate::preview_windows::spawn(
-                self.config.clone(),
-                wm_clone,
-                state_clone,
-                live_clone,
-            ) {
-                Ok(_) => println!("DWM preview windows started"),
-                Err(e) => {
-                    eprintln!("Warning: Could not start preview window manager: {}", e)
-                }
+        // DWM preview windows manager — always spawned. The manager
+        // self-gates each reconcile on LiveSettings.show_previews so the
+        // panel checkbox can hide/show previews live without a daemon
+        // restart. Initial state of LiveSettings.show_previews mirrors
+        // config.show_previews, so a user who starts with previews off
+        // sees no windows until they tick the box.
+        let wm_clone = Arc::clone(&self.wm);
+        let state_clone = Arc::clone(&self.state);
+        let live_clone = Arc::clone(&self.live);
+        match crate::preview_windows::spawn(self.config.clone(), wm_clone, state_clone, live_clone)
+        {
+            Ok(_) => println!("DWM preview windows manager started"),
+            Err(e) => {
+                eprintln!("Warning: Could not start preview window manager: {}", e)
             }
         }
     }

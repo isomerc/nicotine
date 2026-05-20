@@ -164,7 +164,10 @@ impl MouseListener {
             let n = match poll(&mut pollfds, PollTimeout::from(POLL_TIMEOUT_MS)) {
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!("Mouse poll failed ({}); dropping devices and rescanning.", e);
+                    eprintln!(
+                        "Mouse poll failed ({}); dropping devices and rescanning.",
+                        e
+                    );
                     devices.clear();
                     continue;
                 }
@@ -213,8 +216,7 @@ impl MouseListener {
                         }
                         let code = key.code();
                         if code == snap.forward_button {
-                            if let Err(e) =
-                                Self::cycle_forward(&wm, &state, snap.minimize_inactive)
+                            if let Err(e) = Self::cycle_forward(&wm, &state, snap.minimize_inactive)
                             {
                                 eprintln!("Failed to cycle forward: {}", e);
                             }

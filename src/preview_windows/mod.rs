@@ -264,9 +264,32 @@ struct ListWindowState {
 
 impl PreviewManager {
     fn reconcile(&mut self) {
+        // Read both live toggles up front so we drop the lock before
+        // any of the per-window work below grabs other mutexes.
+        let (show_previews, target_mode) = {
+            let live = self.live.lock().unwrap();
+            (live.show_previews, live.display_mode)
+        };
+
+        // Master gate: the panel "Show preview windows" checkbox.
+        // When off, tear down any previews and the list window so the
+        // user sees the toggle take effect immediately; skip the rest
+        // of reconcile until they flip it back on. The manager thread
+        // keeps running so the next toggle-on reconcile spawns windows
+        // without a daemon restart.
+        if !show_previews {
+            if !self.previews.is_empty() {
+                self.previews.clear();
+            }
+            if self.list.is_some() {
+                self.list = None;
+                self.list_last_names.clear();
+            }
+            return;
+        }
+
         // Check whether the user toggled display mode since the last
         // reconcile; if so, tear down the outgoing mode's windows.
-        let target_mode = self.live.lock().unwrap().display_mode;
         if target_mode != self.current_mode {
             match target_mode {
                 crate::config::DisplayMode::Previews => self.list = None,

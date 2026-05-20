@@ -338,6 +338,10 @@ impl ConfigPanel {
         ui.checkbox(&mut self.config.show_previews, "Show preview windows");
         if self.config.show_previews != prev_show {
             self.touch();
+            // Push to LiveSettings so the preview manager spawns or tears
+            // down its windows on its next reconcile tick instead of
+            // waiting for a daemon restart.
+            self.live.lock().unwrap().show_previews = self.config.show_previews;
         }
         ui.add_enabled_ui(self.config.show_previews, |ui| {
             // Widen sliders so a 1px step is actually reachable without

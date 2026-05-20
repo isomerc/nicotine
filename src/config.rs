@@ -42,6 +42,11 @@ pub struct LiveSettings {
     /// ignore mouse drags so they can't accidentally be knocked out of
     /// position mid-game. Click-to-activate still works on previews.
     pub positions_locked: bool,
+    /// Mirror of `config.show_previews`, updated by the panel toggle so
+    /// the preview manager can self-gate live (tear down its windows
+    /// when false, spawn them when flipped back on) without a daemon
+    /// restart.
+    pub show_previews: bool,
 }
 
 impl LiveSettings {
@@ -51,6 +56,7 @@ impl LiveSettings {
             preview_height: config.preview_height,
             display_mode: config.display_mode,
             positions_locked: config.positions_locked,
+            show_previews: config.show_previews,
         }))
     }
 }
