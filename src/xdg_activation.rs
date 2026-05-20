@@ -81,18 +81,23 @@ impl XdgActivation {
     /// prevention level to decide whether to honor them. On default
     /// settings this should pass.
     pub fn request_token(&self) -> Result<String> {
-        let mut state = TokenState { token: None };
-        let request = self.activation.get_activation_token(&self.queue_handle, ());
-        request.set_app_id("nicotine".to_string());
-        request.commit();
-        // Single connection means single event_queue; lock for the
-        // duration of one token round-trip. Cycle activations are
-        // serialized through this mutex, which is fine — they're
-        // user-paced (mouse clicks / hotkeys) and the wait is short.
+        // Lock BEFORE sending the request, not after. If two threads
+        // race here and both call get_activation_token, then race for
+        // the queue lock, the winning thread's dispatcher would see
+        // events for both tokens and stash them onto its local
+        // TokenState — returning the wrong token to the wrong caller.
+        // Holding the mutex around the whole send+dispatch
+        // transaction serializes correctly. Cycle activations are
+        // user-paced (mouse clicks / hotkeys), so the held duration
+        // is bounded by TOKEN_TIMEOUT.
         let mut event_queue = self
             .event_queue
             .lock()
             .map_err(|_| anyhow::anyhow!("event queue mutex poisoned"))?;
+        let mut state = TokenState { token: None };
+        let request = self.activation.get_activation_token(&self.queue_handle, ());
+        request.set_app_id("nicotine".to_string());
+        request.commit();
         let _ = self.conn.flush();
         let deadline = Instant::now() + TOKEN_TIMEOUT;
         while state.token.is_none() {

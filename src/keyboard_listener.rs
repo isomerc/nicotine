@@ -84,13 +84,19 @@ impl KeyboardListener {
             }
 
             if device.is_none() || current_dev_path != snap.keyboard_device_path {
+                // Drop the old device first — see the matching note in
+                // mouse_listener: a `device = match { Err => continue }`
+                // doesn't assign on the Err path, which would otherwise
+                // leave us using the stale device after a failed
+                // device-path change.
+                device = None;
                 current_dev_path = snap.keyboard_device_path.clone();
                 pressed_modifiers.clear();
-                device = match Self::find_keyboard_device(snap.keyboard_device_path.as_deref()) {
+                match Self::find_keyboard_device(snap.keyboard_device_path.as_deref()) {
                     Ok(d) => {
                         announced_idle = false;
                         announced_listening = false;
-                        Some(d)
+                        device = Some(d);
                     }
                     Err(e) => {
                         eprintln!(
@@ -102,7 +108,7 @@ impl KeyboardListener {
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     }
-                };
+                }
             }
 
             if !announced_listening {
@@ -213,21 +219,8 @@ impl KeyboardListener {
                     continue;
                 }
 
-                // Per-character hotkey. vk == 0 means the panel saved a
-                // modifier-only placeholder before a key was bound;
-                // skip those.
-                let target = snap
-                    .character_hotkeys
-                    .iter()
-                    .find(|(_, hk)| {
-                        hk.vk != 0
-                            && hk.vk == code
-                            && match hk.modifier {
-                                None => true,
-                                Some(m) => pressed_modifiers.contains(&m),
-                            }
-                    })
-                    .map(|(name, _)| name.clone());
+                let target =
+                    resolve_character_hotkey(code, &pressed_modifiers, &snap.character_hotkeys);
                 if let Some(name) = target {
                     if let Err(e) =
                         Self::switch_to_character(&name, &wm, &state, snap.minimize_inactive)
@@ -331,5 +324,167 @@ impl KeyboardListener {
         }
         state.switch_to_character(name, &**wm, minimize_inactive)?;
         Ok(())
+    }
+}
+
+/// Pick the character (if any) whose hotkey matches a key press.
+///
+/// Two-pass match so a binding *with* a modifier wins when its modifier
+/// is held, even if a different character has the same key bound
+/// *without* a modifier. The naive single-pass `HashMap::iter().find()`
+/// returns whichever entry the hash function happens to visit first —
+/// pressing "Shift+F1" when both "Shift+F1 → Alpha" and "F1 → Beta" are
+/// bound would non-deterministically resolve to Alpha or Beta.
+///
+/// `vk == 0` is treated as a placeholder (the panel writes a
+/// modifier-only entry before any key is bound) and never matches.
+fn resolve_character_hotkey(
+    code: u16,
+    pressed_modifiers: &HashSet<u16>,
+    hotkeys: &HashMap<String, CharacterHotkey>,
+) -> Option<String> {
+    // First pass: modifier-bearing bindings whose modifier is held.
+    let with_modifier = hotkeys.iter().find(|(_, hk)| {
+        hk.vk != 0
+            && hk.vk == code
+            && match hk.modifier {
+                Some(m) => pressed_modifiers.contains(&m),
+                None => false,
+            }
+    });
+    if let Some((name, _)) = with_modifier {
+        return Some(name.clone());
+    }
+    // Second pass: no-modifier bindings.
+    hotkeys
+        .iter()
+        .find(|(_, hk)| hk.vk != 0 && hk.vk == code && hk.modifier.is_none())
+        .map(|(name, _)| name.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hk(vk: u16, modifier: Option<u16>) -> CharacterHotkey {
+        CharacterHotkey { vk, modifier }
+    }
+
+    #[test]
+    fn unmatched_code_returns_none() {
+        let mut hotkeys = HashMap::new();
+        hotkeys.insert("Alpha".to_string(), hk(0x70, None)); // F1
+        let pressed: HashSet<u16> = HashSet::new();
+        assert_eq!(resolve_character_hotkey(0x71, &pressed, &hotkeys), None);
+    }
+
+    #[test]
+    fn placeholder_vk_zero_never_matches() {
+        // Panel writes vk=0 when the user picks a modifier before a
+        // key. Pressing any key (including code 0, theoretically)
+        // shouldn't dispatch a placeholder.
+        let mut hotkeys = HashMap::new();
+        hotkeys.insert("Alpha".to_string(), hk(0, Some(42)));
+        let pressed: HashSet<u16> = [42].into_iter().collect();
+        assert_eq!(resolve_character_hotkey(0, &pressed, &hotkeys), None);
+    }
+
+    #[test]
+    fn no_modifier_binding_matches_when_no_modifier_held() {
+        let mut hotkeys = HashMap::new();
+        hotkeys.insert("Alpha".to_string(), hk(0x70, None));
+        let pressed: HashSet<u16> = HashSet::new();
+        assert_eq!(
+            resolve_character_hotkey(0x70, &pressed, &hotkeys),
+            Some("Alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn modifier_binding_requires_modifier_held() {
+        let mut hotkeys = HashMap::new();
+        hotkeys.insert("Alpha".to_string(), hk(0x70, Some(0x10)));
+        // Press F1 without Shift held.
+        assert_eq!(
+            resolve_character_hotkey(0x70, &HashSet::new(), &hotkeys),
+            None
+        );
+        // Press F1 with Shift held.
+        let pressed: HashSet<u16> = [0x10].into_iter().collect();
+        assert_eq!(
+            resolve_character_hotkey(0x70, &pressed, &hotkeys),
+            Some("Alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn modifier_binding_beats_no_modifier_binding_when_modifier_held() {
+        // Regression guard for Bug C: HashMap iteration order would
+        // otherwise pick either binding non-deterministically. This
+        // pins down the contract: modifier-bearing match wins.
+        //
+        // We run the resolution many times so that even if a future
+        // change re-introduces HashMap-order dependence, the test
+        // catches it in expectation rather than relying on a single
+        // hash seed.
+        let mut hotkeys = HashMap::new();
+        hotkeys.insert("AlphaWithShift".to_string(), hk(0x70, Some(0x10))); // Shift+F1
+        hotkeys.insert("BetaPlain".to_string(), hk(0x70, None)); // F1
+        let pressed: HashSet<u16> = [0x10].into_iter().collect();
+        for _ in 0..32 {
+            assert_eq!(
+                resolve_character_hotkey(0x70, &pressed, &hotkeys),
+                Some("AlphaWithShift".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn falls_back_to_no_modifier_binding_when_modifier_not_held() {
+        // Same setup as above, but no modifier is held — should
+        // resolve to the no-modifier binding.
+        let mut hotkeys = HashMap::new();
+        hotkeys.insert("AlphaWithShift".to_string(), hk(0x70, Some(0x10)));
+        hotkeys.insert("BetaPlain".to_string(), hk(0x70, None));
+        let pressed: HashSet<u16> = HashSet::new();
+        assert_eq!(
+            resolve_character_hotkey(0x70, &pressed, &hotkeys),
+            Some("BetaPlain".to_string())
+        );
+    }
+
+    #[test]
+    fn multiple_distinct_modifiers_pick_the_matching_one() {
+        // Hotkeys: Shift+F1 → Alpha, Ctrl+F1 → Beta.
+        // Pressing F1 with Ctrl held should pick Beta. Pressing F1
+        // with Shift held should pick Alpha.
+        let mut hotkeys = HashMap::new();
+        hotkeys.insert("Alpha".to_string(), hk(0x70, Some(0x10)));
+        hotkeys.insert("Beta".to_string(), hk(0x70, Some(0x11)));
+
+        let shift_only: HashSet<u16> = [0x10].into_iter().collect();
+        assert_eq!(
+            resolve_character_hotkey(0x70, &shift_only, &hotkeys),
+            Some("Alpha".to_string())
+        );
+
+        let ctrl_only: HashSet<u16> = [0x11].into_iter().collect();
+        assert_eq!(
+            resolve_character_hotkey(0x70, &ctrl_only, &hotkeys),
+            Some("Beta".to_string())
+        );
+    }
+
+    #[test]
+    fn modifier_binding_doesnt_match_when_no_modifier_held() {
+        // Hotkey "Shift+F1 → Alpha" should NOT fire on plain F1, even
+        // if no other binding exists for F1. The first-pass filter
+        // requires the modifier to be in pressed_modifiers.
+        let mut hotkeys = HashMap::new();
+        hotkeys.insert("Alpha".to_string(), hk(0x70, Some(0x10)));
+        assert_eq!(
+            resolve_character_hotkey(0x70, &HashSet::new(), &hotkeys),
+            None
+        );
     }
 }
