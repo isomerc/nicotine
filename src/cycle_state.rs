@@ -26,6 +26,17 @@ impl CycleState {
         self.character_order = order;
     }
 
+    /// Live view of the configured cycle order. The Daemon used to
+    /// cache its own copy here, but the hot-reload thread only updated
+    /// the copy on CycleState, not the Daemon's — `nicotine N` ended
+    /// up using a snapshot from daemon startup instead of the latest
+    /// panel-edited list. Callers should read this each time they
+    /// need the order, never cache it for longer than a single
+    /// operation.
+    pub fn character_order(&self) -> Option<&[String]> {
+        self.character_order.as_deref()
+    }
+
     /// Indices into `self.windows` in the order forward-cycling should
     /// traverse them. If `character_order` is set, only listed characters
     /// who are currently logged in are included, in list order. Otherwise
@@ -192,6 +203,10 @@ impl CycleState {
         }
     }
 
+    /// Windows preview manager reads this for paint; on Linux the
+    /// XComposite preview manager enumerates X11 windows directly so
+    /// nothing in the Linux build calls it. Tests use it on both.
+    #[cfg_attr(unix, allow(dead_code))]
     pub fn get_windows(&self) -> &[EveWindow] {
         &self.windows
     }
@@ -490,10 +505,6 @@ mod tests {
             Ok(0)
         }
 
-        fn find_window_by_title(&self, _title: &str) -> anyhow::Result<Option<u32>> {
-            Ok(None)
-        }
-
         fn minimize_window(&self, _window_id: u32) -> anyhow::Result<()> {
             Ok(())
         }
@@ -619,5 +630,128 @@ mod tests {
         // Switch with no windows
         state.switch_to(1, &wm, false, None).unwrap();
         assert!(wm.get_activated().is_empty());
+    }
+
+    #[test]
+    fn test_character_order_getter_starts_none() {
+        let state = CycleState::new();
+        assert!(state.character_order().is_none());
+    }
+
+    #[test]
+    fn test_character_order_getter_returns_latest_after_set() {
+        // Regression guard for the daemon-side cycle-order staleness
+        // bug. Daemon used to hold its own snapshot of the order and
+        // pass it to switch_to; the hot-reload thread only refreshed
+        // the copy on CycleState, so `nicotine N` used the stale
+        // snapshot from daemon startup. The fix routes the daemon's
+        // Switch handler through this getter — so we need to know
+        // that the getter sees every update.
+        let mut state = CycleState::new();
+        let first = vec!["Alpha".to_string(), "Beta".to_string()];
+        state.set_character_order(Some(first.clone()));
+        assert_eq!(state.character_order(), Some(first.as_slice()));
+
+        let second = vec!["Beta".to_string(), "Alpha".to_string(), "Gamma".to_string()];
+        state.set_character_order(Some(second.clone()));
+        assert_eq!(state.character_order(), Some(second.as_slice()));
+
+        state.set_character_order(None);
+        assert!(state.character_order().is_none());
+    }
+
+    #[test]
+    fn test_switch_to_uses_latest_character_order() {
+        // End-to-end: after set_character_order replaces the order,
+        // a switch_to call driven by the daemon (which now pulls the
+        // order from CycleState every call) hits the right window.
+        // The numbered targets must follow the latest list, not any
+        // earlier one.
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(100, "Alpha"),
+            create_test_window(200, "Beta"),
+            create_test_window(300, "Gamma"),
+        ]);
+
+        let wm = MockWindowManager::new();
+
+        // Old order: target 1 = Alpha (id 100).
+        let old_order = vec!["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()];
+        state.set_character_order(Some(old_order));
+
+        // User edits the panel — new order puts Gamma first.
+        let new_order = vec!["Gamma".to_string(), "Alpha".to_string(), "Beta".to_string()];
+        state.set_character_order(Some(new_order));
+
+        // The fixed daemon code reads the live order each call:
+        let order: Vec<String> = state.character_order().unwrap().to_vec();
+        state.switch_to(1, &wm, false, Some(&order)).unwrap();
+
+        // Target 1 under the new order is Gamma (id 300). If the
+        // daemon still cached the old order, this would have been
+        // 100 (Alpha).
+        assert_eq!(wm.get_activated(), vec![300]);
+    }
+
+    // --- switch_to_character (used by the Linux per-character
+    // hotkeys path; previously only had Windows callers) ----------
+
+    #[test]
+    fn switch_to_character_activates_matching_window() {
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(100, "Alpha"),
+            create_test_window(200, "Beta"),
+        ]);
+        state.current_index = 0;
+
+        let wm = MockWindowManager::new();
+        state.switch_to_character("Beta", &wm, false).unwrap();
+
+        assert_eq!(wm.get_activated(), vec![200]);
+        assert_eq!(state.get_current_index(), 1);
+    }
+
+    #[test]
+    fn switch_to_character_unknown_name_is_noop() {
+        // Per-character hotkey for a character that isn't logged in
+        // should silently do nothing — not error, not change focus.
+        // Matches the user-facing expectation that "I have F4 bound
+        // to Charlie, but Charlie isn't logged in right now" doesn't
+        // dump a stack trace.
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(100, "Alpha"),
+            create_test_window(200, "Beta"),
+        ]);
+        state.current_index = 0;
+
+        let wm = MockWindowManager::new();
+        state.switch_to_character("Charlie", &wm, false).unwrap();
+
+        assert!(wm.get_activated().is_empty());
+        assert_eq!(state.get_current_index(), 0);
+    }
+
+    #[test]
+    fn switch_to_character_already_active_reactivates() {
+        // If the user's hotkey fires for the currently-active
+        // character, the previous behavior of "no-op" felt broken —
+        // the user expects the window to be re-foregrounded in case
+        // some other app stole focus. switch_to_character should
+        // re-activate without touching the index.
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(100, "Alpha"),
+            create_test_window(200, "Beta"),
+        ]);
+        state.current_index = 1; // On Beta
+
+        let wm = MockWindowManager::new();
+        state.switch_to_character("Beta", &wm, false).unwrap();
+
+        assert_eq!(wm.get_activated(), vec![200]);
+        assert_eq!(state.get_current_index(), 1);
     }
 }

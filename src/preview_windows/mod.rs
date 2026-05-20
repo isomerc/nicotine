@@ -1,11 +1,12 @@
 use crate::config::{Config, LiveSettings};
 use crate::cycle_state::CycleState;
+use crate::preview_common::{
+    snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
+};
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -95,68 +96,6 @@ unsafe extern "system" fn foreground_event_proc(
     (*ptr).update_active(hwnd_to_id(hwnd));
 }
 
-/// Adjust a proposed window position so it docks to nearby preview windows.
-/// Each axis snaps independently so you can edge-touch on one side while
-/// also aligning a perpendicular edge (e.g., dock to the right of A AND
-/// align tops). The first match per axis wins — once snapped, further
-/// candidates on that axis are ignored to avoid thrash when previews are
-/// stacked tightly.
-fn snap_position(
-    proposed_x: i32,
-    proposed_y: i32,
-    width: i32,
-    height: i32,
-    others: &[RECT],
-) -> (i32, i32) {
-    let mut x = proposed_x;
-    let mut y = proposed_y;
-    let mut x_snapped = false;
-    let mut y_snapped = false;
-    let drag_right = proposed_x + width;
-    let drag_bottom = proposed_y + height;
-    let snap = px(SNAP_THRESHOLD);
-
-    for other in others {
-        // Edge-to-edge docking on the X axis.
-        if !x_snapped && (drag_right - other.left).abs() <= snap {
-            x = other.left - width;
-            x_snapped = true;
-        }
-        if !x_snapped && (proposed_x - other.right).abs() <= snap {
-            x = other.right;
-            x_snapped = true;
-        }
-        // Edge-to-edge docking on the Y axis.
-        if !y_snapped && (drag_bottom - other.top).abs() <= snap {
-            y = other.top - height;
-            y_snapped = true;
-        }
-        if !y_snapped && (proposed_y - other.bottom).abs() <= snap {
-            y = other.bottom;
-            y_snapped = true;
-        }
-        // Parallel-edge alignment so docked previews share a baseline.
-        if !y_snapped && (proposed_y - other.top).abs() <= snap {
-            y = other.top;
-            y_snapped = true;
-        }
-        if !y_snapped && (drag_bottom - other.bottom).abs() <= snap {
-            y = other.bottom - height;
-            y_snapped = true;
-        }
-        if !x_snapped && (proposed_x - other.left).abs() <= snap {
-            x = other.left;
-            x_snapped = true;
-        }
-        if !x_snapped && (drag_right - other.right).abs() <= snap {
-            x = other.right - width;
-            x_snapped = true;
-        }
-    }
-
-    (x, y)
-}
-
 /// True if (x, y) lies somewhere inside the multi-monitor virtual screen.
 /// Used to reject saved positions from a previous build that wrote
 /// off-screen coordinates due to a sign-extension bug — without this,
@@ -205,12 +144,9 @@ const RECONCILE_TIMER_ID: usize = 1;
 const RECONCILE_INTERVAL_MS: u32 = 100;
 const TITLE_HEIGHT: i32 = 24;
 const BORDER_WIDTH: i32 = 3;
-const DRAG_THRESHOLD_PX: i32 = 4;
-/// Reference-pixel grace band within which a dragged preview snaps to
-/// align with another preview's edge. Generous enough to make docking
-/// feel deliberate but tight enough that you can place windows freely
-/// between previews.
-const SNAP_THRESHOLD: i32 = 12;
+
+// DRAG_THRESHOLD_PX and SNAP_THRESHOLD_PX live in `preview_common`
+// since both managers use them. Imported above.
 
 /// Win32 COLORREF is 0x00BBGGRR. Nicotine red is RGB(196, 30, 58).
 const NICOTINE_RED: COLORREF = COLORREF(0x003A_1EC4);
@@ -222,56 +158,10 @@ const NICOTINE_CREAM: COLORREF = COLORREF(0x00F2_FAFC);
 /// Text color for inactive rows in the list window.
 const LIST_TEXT_BLACK: COLORREF = COLORREF(0x0000_0000);
 
-/// Per-character preview window position. Persisted to disk so previews come
-/// back at the same place across daemon restarts.
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct PreviewPositions {
-    #[serde(default)]
-    pub positions: HashMap<String, (i32, i32)>,
-    /// Last-known position of the single list-view window (Display Mode =
-    /// List). Saved on drag-end, restored on window (re)create. Without
-    /// this, toggling display mode would reset the list window back to
-    /// its default spawn position every time.
-    #[serde(default)]
-    pub list_position: Option<(i32, i32)>,
-}
-
-impl PreviewPositions {
-    fn config_path() -> PathBuf {
-        let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-        p.push("nicotine");
-        p.push("preview_positions.toml");
-        p
-    }
-
-    pub fn load() -> Self {
-        let path = Self::config_path();
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            if let Ok(p) = toml::from_str::<Self>(&s) {
-                return p;
-            }
-        }
-        Self::default()
-    }
-
-    pub fn save(&self) {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(s) = toml::to_string_pretty(self) {
-            let _ = std::fs::write(&path, s);
-        }
-    }
-
-    fn get(&self, name: &str) -> Option<(i32, i32)> {
-        self.positions.get(name).copied()
-    }
-
-    fn set(&mut self, name: String, x: i32, y: i32) {
-        self.positions.insert(name, (x, y));
-    }
-}
+// Per-character preview position type lives in the cross-platform
+// preview_positions module so the Linux XComposite manager and the
+// Windows DWM thumbnail manager share schema + file location.
+use crate::preview_positions::PreviewPositions;
 
 /// State for a single preview window. The pointer is stored in the
 /// window's GWLP_USERDATA so the wnd_proc can recover it.
@@ -281,10 +171,9 @@ struct PreviewWindowState {
     thumbnail: Hthumbnail,
     wm: Arc<dyn WindowManager>,
     positions: Arc<Mutex<PreviewPositions>>,
-    drag_active: bool,
-    dragged: bool,
-    drag_origin_screen: (i32, i32),
-    drag_origin_window: (i32, i32),
+    /// Press / motion / release bookkeeping. See `DragState` in
+    /// `preview_common` for field semantics.
+    drag: DragState,
     /// True when this preview's source EVE client is the system foreground
     /// window. Read from WM_PAINT to choose border color. Updated by
     /// reconcile via the GWLP_USERDATA pointer.
@@ -370,17 +259,37 @@ impl Drop for OwnedListWindow {
 /// A Box<ListWindowState> is stashed in the window's GWLP_USERDATA and
 /// reclaimed when `OwnedListWindow` drops.
 struct ListWindowState {
-    drag_active: bool,
-    dragged: bool,
-    drag_origin_screen: (i32, i32),
-    drag_origin_window: (i32, i32),
+    drag: DragState,
 }
 
 impl PreviewManager {
     fn reconcile(&mut self) {
+        // Read both live toggles up front so we drop the lock before
+        // any of the per-window work below grabs other mutexes.
+        let (show_previews, target_mode) = {
+            let live = self.live.lock().unwrap();
+            (live.show_previews, live.display_mode)
+        };
+
+        // Master gate: the panel "Show preview windows" checkbox.
+        // When off, tear down any previews and the list window so the
+        // user sees the toggle take effect immediately; skip the rest
+        // of reconcile until they flip it back on. The manager thread
+        // keeps running so the next toggle-on reconcile spawns windows
+        // without a daemon restart.
+        if !show_previews {
+            if !self.previews.is_empty() {
+                self.previews.clear();
+            }
+            if self.list.is_some() {
+                self.list = None;
+                self.list_last_names.clear();
+            }
+            return;
+        }
+
         // Check whether the user toggled display mode since the last
         // reconcile; if so, tear down the outgoing mode's windows.
-        let target_mode = self.live.lock().unwrap().display_mode;
         if target_mode != self.current_mode {
             match target_mode {
                 crate::config::DisplayMode::Previews => self.list = None,
@@ -553,10 +462,7 @@ impl PreviewManager {
         .context("CreateWindowExW failed for list window")?;
 
         let state = Box::new(ListWindowState {
-            drag_active: false,
-            dragged: false,
-            drag_origin_screen: (0, 0),
-            drag_origin_window: (0, 0),
+            drag: DragState::default(),
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -618,7 +524,7 @@ impl PreviewManager {
     /// Snapshot of all preview window rects in screen coordinates,
     /// excluding the one identified by `exclude`. Used by the drag handler
     /// for snap-to-dock calculations.
-    fn collect_other_rects(&self, exclude: HWND) -> Vec<RECT> {
+    fn collect_other_rects(&self, exclude: HWND) -> Vec<DragRect> {
         let mut rects = Vec::with_capacity(self.previews.len());
         for preview in self.previews.values() {
             if preview.hwnd == exclude {
@@ -626,7 +532,12 @@ impl PreviewManager {
             }
             let mut rect = RECT::default();
             if unsafe { GetWindowRect(preview.hwnd, &mut rect) }.is_ok() {
-                rects.push(rect);
+                rects.push(DragRect {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                });
             }
         }
         rects
@@ -732,10 +643,7 @@ impl PreviewManager {
             thumbnail,
             wm: Arc::clone(&self.wm),
             positions: Arc::clone(&self.positions),
-            drag_active: false,
-            dragged: false,
-            drag_origin_screen: (0, 0),
-            drag_origin_window: (0, 0),
+            drag: DragState::default(),
             is_active: false,
         });
         unsafe {
@@ -834,10 +742,10 @@ unsafe extern "system" fn preview_wnd_proc(
             let mut rect = RECT::default();
             let _ = GetWindowRect(hwnd, &mut rect);
 
-            state.drag_active = true;
-            state.dragged = false;
-            state.drag_origin_screen = (pt.x, pt.y);
-            state.drag_origin_window = (rect.left, rect.top);
+            state.drag.active = true;
+            state.drag.dragged = false;
+            state.drag.origin_screen = (pt.x, pt.y);
+            state.drag.origin_window = (rect.left, rect.top);
             let _ = SetCapture(hwnd);
             LRESULT(0)
         }
@@ -845,7 +753,7 @@ unsafe extern "system" fn preview_wnd_proc(
             // Positions locked: don't track motion. Keeping drag_active
             // true means the subsequent WM_LBUTTONUP's `!dragged` path
             // still fires, so click-to-activate keeps working.
-            if state.drag_active && !positions_locked() {
+            if state.drag.active && !positions_locked() {
                 let (client_x, client_y) = unpack_xy(lparam);
                 let mut pt = POINT {
                     x: client_x,
@@ -853,15 +761,15 @@ unsafe extern "system" fn preview_wnd_proc(
                 };
                 let _ = ClientToScreen(hwnd, &mut pt);
 
-                let dx = pt.x - state.drag_origin_screen.0;
-                let dy = pt.y - state.drag_origin_screen.1;
+                let dx = pt.x - state.drag.origin_screen.0;
+                let dy = pt.y - state.drag.origin_screen.1;
                 let threshold = px(DRAG_THRESHOLD_PX);
                 if dx.abs() > threshold || dy.abs() > threshold {
-                    state.dragged = true;
+                    state.drag.dragged = true;
                 }
-                if state.dragged {
-                    let mut new_x = state.drag_origin_window.0 + dx;
-                    let mut new_y = state.drag_origin_window.1 + dy;
+                if state.drag.dragged {
+                    let mut new_x = state.drag.origin_window.0 + dx;
+                    let mut new_y = state.drag.origin_window.1 + dy;
 
                     // Snap to dock with other previews if any of our edges
                     // come within SNAP_THRESHOLD of theirs.
@@ -872,7 +780,14 @@ unsafe extern "system" fn preview_wnd_proc(
                         let mgr_ptr = MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
                         if !mgr_ptr.is_null() {
                             let others = (*mgr_ptr).collect_other_rects(hwnd);
-                            let (sx, sy) = snap_position(new_x, new_y, width, height, &others);
+                            let (sx, sy) = snap_position(
+                                new_x,
+                                new_y,
+                                width,
+                                height,
+                                &others,
+                                px(SNAP_THRESHOLD_PX),
+                            );
                             new_x = sx;
                             new_y = sy;
                         }
@@ -892,10 +807,10 @@ unsafe extern "system" fn preview_wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            if state.drag_active {
-                state.drag_active = false;
+            if state.drag.active {
+                state.drag.active = false;
                 let _ = ReleaseCapture();
-                if state.dragged {
+                if state.drag.dragged {
                     // Persist the new position keyed by character name.
                     let mut rect = RECT::default();
                     let _ = GetWindowRect(hwnd, &mut rect);
@@ -906,7 +821,7 @@ unsafe extern "system" fn preview_wnd_proc(
                     // No drag — treat as click-to-activate.
                     let _ = state.wm.activate_window(state.source_id);
                 }
-                state.dragged = false;
+                state.drag.dragged = false;
             }
             LRESULT(0)
         }
@@ -926,8 +841,8 @@ fn register_embedded_fonts() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
         const FONTS: &[&[u8]] = &[
-            include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
-            include_bytes!("../assets/fonts/Marlboro.ttf"),
+            include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf"),
+            include_bytes!("../../assets/fonts/Marlboro.ttf"),
         ];
         for bytes in FONTS {
             let count: u32 = 0;
@@ -1085,28 +1000,28 @@ unsafe extern "system" fn list_wnd_proc(
             let _ = ClientToScreen(hwnd, &mut pt);
             let mut rect = RECT::default();
             let _ = GetWindowRect(hwnd, &mut rect);
-            state.drag_active = true;
-            state.dragged = false;
-            state.drag_origin_screen = (pt.x, pt.y);
-            state.drag_origin_window = (rect.left, rect.top);
+            state.drag.active = true;
+            state.drag.dragged = false;
+            state.drag.origin_screen = (pt.x, pt.y);
+            state.drag.origin_window = (rect.left, rect.top);
             let _ = SetCapture(hwnd);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
             // Positions locked: drag the list window is a no-op.
-            if state.drag_active && !positions_locked() {
+            if state.drag.active && !positions_locked() {
                 let (cx, cy) = unpack_xy(lparam);
                 let mut pt = POINT { x: cx, y: cy };
                 let _ = ClientToScreen(hwnd, &mut pt);
-                let dx = pt.x - state.drag_origin_screen.0;
-                let dy = pt.y - state.drag_origin_screen.1;
+                let dx = pt.x - state.drag.origin_screen.0;
+                let dy = pt.y - state.drag.origin_screen.1;
                 let threshold = px(DRAG_THRESHOLD_PX);
                 if dx.abs() > threshold || dy.abs() > threshold {
-                    state.dragged = true;
+                    state.drag.dragged = true;
                 }
-                if state.dragged {
-                    let new_x = state.drag_origin_window.0 + dx;
-                    let new_y = state.drag_origin_window.1 + dy;
+                if state.drag.dragged {
+                    let new_x = state.drag.origin_window.0 + dx;
+                    let new_y = state.drag.origin_window.1 + dy;
                     let _ = SetWindowPos(
                         hwnd,
                         Some(HWND_TOPMOST),
@@ -1121,10 +1036,10 @@ unsafe extern "system" fn list_wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            if state.drag_active {
-                state.drag_active = false;
+            if state.drag.active {
+                state.drag.active = false;
                 let _ = ReleaseCapture();
-                if state.dragged {
+                if state.drag.dragged {
                     // Persist the new list-view position so it survives
                     // a display-mode toggle (which destroys/recreates
                     // this window) or a daemon restart.
@@ -1137,7 +1052,7 @@ unsafe extern "system" fn list_wnd_proc(
                         positions.save();
                     }
                 }
-                state.dragged = false;
+                state.drag.dragged = false;
             }
             LRESULT(0)
         }
@@ -1472,3 +1387,6 @@ fn run_manager(
 fn _unused() {
     let _ = HMENU::default();
 }
+
+#[cfg(test)]
+mod tests;

@@ -42,6 +42,11 @@ pub struct LiveSettings {
     /// ignore mouse drags so they can't accidentally be knocked out of
     /// position mid-game. Click-to-activate still works on previews.
     pub positions_locked: bool,
+    /// Mirror of `config.show_previews`, updated by the panel toggle so
+    /// the preview manager can self-gate live (tear down its windows
+    /// when false, spawn them when flipped back on) without a daemon
+    /// restart.
+    pub show_previews: bool,
 }
 
 impl LiveSettings {
@@ -51,6 +56,7 @@ impl LiveSettings {
             preview_height: config.preview_height,
             display_mode: config.display_mode,
             positions_locked: config.positions_locked,
+            show_previews: config.show_previews,
         }))
     }
 }
@@ -62,8 +68,6 @@ pub struct Config {
     pub panel_height: u32,
     pub eve_width: u32,
     pub eve_height: u32,
-    pub overlay_x: f32,
-    pub overlay_y: f32,
     #[serde(default = "default_enable_mouse")]
     pub enable_mouse_buttons: bool,
     #[serde(default = "default_forward_button")]
@@ -76,8 +80,6 @@ pub struct Config {
     pub forward_key: u16, // KEY_TAB (15) - Tab for forward, Shift+Tab for backward
     #[serde(default = "default_backward_key")]
     pub backward_key: u16, // KEY_TAB (15) - Track SHIFT modifier internally
-    #[serde(default = "default_show_overlay")]
-    pub show_overlay: bool,
     #[serde(default = "default_mouse_device_name")]
     pub mouse_device_name: Option<String>,
     #[serde(default = "default_mouse_device_path")]
@@ -187,10 +189,6 @@ fn default_backward_key() -> u16 {
     0x79 // VK_F10
 }
 
-fn default_show_overlay() -> bool {
-    true
-}
-
 fn default_mouse_device_name() -> Option<String> {
     None
 }
@@ -297,15 +295,12 @@ impl Config {
             panel_height: 0,
             eve_width: (display_width as f32 * 0.54) as u32, // ~54% of width
             eve_height: display_height,
-            overlay_x: 10.0,
-            overlay_y: 10.0,
             enable_mouse_buttons: default_enable_mouse(),
             forward_button: default_forward_button(),
             backward_button: default_backward_button(),
             enable_keyboard_buttons: default_enable_keyboard(),
             forward_key: default_forward_key(),
             backward_key: default_backward_key(),
-            show_overlay: default_show_overlay(),
             mouse_device_name: default_mouse_device_name(),
             mouse_device_path: default_mouse_device_path(),
             minimize_inactive: default_minimize_inactive(),
@@ -377,15 +372,12 @@ mod tests {
             panel_height: 40,
             eve_width: 1000,
             eve_height: 1080,
-            overlay_x: 10.0,
-            overlay_y: 10.0,
             enable_mouse_buttons: true,
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
             forward_key: 15,
             backward_key: 15,
-            show_overlay: true,
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
@@ -412,15 +404,12 @@ mod tests {
             panel_height: 0,
             eve_width: 1000,
             eve_height: 1080,
-            overlay_x: 10.0,
-            overlay_y: 10.0,
             enable_mouse_buttons: true,
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
             forward_key: 15,
             backward_key: 15,
-            show_overlay: true,
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
@@ -446,15 +435,12 @@ mod tests {
             panel_height: 0,
             eve_width: 4147,
             eve_height: 2160,
-            overlay_x: 10.0,
-            overlay_y: 10.0,
             enable_mouse_buttons: true,
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
             forward_key: 15,
             backward_key: 15,
-            show_overlay: true,
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,

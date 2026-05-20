@@ -1,15 +1,25 @@
 use crate::config::Config;
+use crate::eve_match::pid_is_eve_client;
 use crate::window_manager::{EveWindow, WindowManager};
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 
+/// Latches once we've warned the user that an EVE-titled window had
+/// no `_NET_WM_PID`. The window-enumeration loop runs every 500ms
+/// from the daemon's background thread, so a per-call eprintln would
+/// be log spam; a single breadcrumb is enough to diagnose a future
+/// XWayland / launcher regression that stops setting the property.
+static WARNED_MISSING_PID: AtomicBool = AtomicBool::new(false);
+
 pub struct X11Manager {
     conn: Arc<RustConnection>,
     screen_num: usize,
     net_active_window_atom: Atom,
+    net_wm_pid_atom: Atom,
 }
 
 impl X11Manager {
@@ -24,12 +34,42 @@ impl X11Manager {
             .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
             .reply()?
             .atom;
+        // Used to filter the EVE-window enumeration by process identity
+        // (`exefile.exe`) so we don't cycle into browser tabs or other
+        // apps that happen to be titled "EVE - …".
+        let net_wm_pid_atom = conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
 
         Ok(Self {
             conn,
             screen_num,
             net_active_window_atom,
+            net_wm_pid_atom,
         })
+    }
+
+    /// Read _NET_WM_PID from a window. Returns None for missing /
+    /// malformed / zero — treated as "we don't know what owns this
+    /// window" and rejected by the EVE filter.
+    fn read_net_wm_pid(&self, window: u32) -> Option<u32> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.net_wm_pid_atom,
+                AtomEnum::CARDINAL,
+                0,
+                1,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        let pid = reply.value32()?.next()?;
+        if pid == 0 {
+            None
+        } else {
+            Some(pid)
+        }
     }
 
     pub fn get_eve_windows(&self) -> Result<Vec<EveWindow>> {
@@ -57,15 +97,35 @@ impl X11Manager {
         let mut eve_windows = Vec::new();
 
         for &window in &windows {
-            if let Ok(title) = self.get_window_title(window) {
-                // Filter for EVE windows (steam_app_8500) and exclude launcher
-                if title.starts_with("EVE - ") && !title.contains("Launcher") {
-                    eve_windows.push(EveWindow {
-                        id: window,
-                        title: title.trim_start_matches("EVE - ").to_string(),
-                    });
-                }
+            let Ok(title) = self.get_window_title(window) else {
+                continue;
+            };
+            if !title.starts_with("EVE - ") {
+                continue;
             }
+            // Reliable filter: confirm the underlying process is the
+            // actual EVE client (`exefile.exe`). Without this we'd
+            // also match browser tabs and other "EVE - …" titled
+            // windows. See src/eve_match.rs.
+            let Some(pid) = self.read_net_wm_pid(window) else {
+                if !WARNED_MISSING_PID.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "Warning: window titled '{}' has no _NET_WM_PID; \
+                         skipping EVE-client process check. If EVE clients \
+                         are missing from cycling, verify your compositor \
+                         is setting _NET_WM_PID on XWayland clients.",
+                        title
+                    );
+                }
+                continue;
+            };
+            if !pid_is_eve_client(pid) {
+                continue;
+            }
+            eve_windows.push(EveWindow {
+                id: window,
+                title: title.trim_start_matches("EVE - ").to_string(),
+            });
         }
 
         Ok(eve_windows)
@@ -178,44 +238,6 @@ impl X11Manager {
         Ok(String::new())
     }
 
-    pub fn find_window_by_title(&self, title: &str) -> Result<Option<u32>> {
-        let screen = &self.conn.setup().roots[self.screen_num];
-        let root = screen.root;
-
-        let net_client_list = self
-            .conn
-            .intern_atom(false, b"_NET_CLIENT_LIST")?
-            .reply()?
-            .atom;
-
-        let client_list_reply = self
-            .conn
-            .get_property(false, root, net_client_list, AtomEnum::WINDOW, 0, u32::MAX)?
-            .reply()?;
-
-        let windows: Vec<u32> = client_list_reply
-            .value32()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get window list"))?
-            .collect();
-
-        for &window in &windows {
-            if let Ok(window_title) = self.get_window_title(window) {
-                if window_title == title {
-                    return Ok(Some(window));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    pub fn move_window(&self, window_id: u32, x: i32, y: i32) -> Result<()> {
-        let values = ConfigureWindowAux::new().x(x).y(y);
-        self.conn.configure_window(window_id, &values)?;
-        self.conn.flush()?;
-        Ok(())
-    }
-
     pub fn minimize_window(&self, window_id: u32) -> Result<()> {
         // Use WM_CHANGE_STATE with IconicState to minimize
         let wm_change_state = self
@@ -276,14 +298,6 @@ impl WindowManager for X11Manager {
 
     fn get_active_window(&self) -> Result<u32> {
         self.get_active_window()
-    }
-
-    fn find_window_by_title(&self, title: &str) -> Result<Option<u32>> {
-        self.find_window_by_title(title)
-    }
-
-    fn move_window(&self, window_id: u32, x: i32, y: i32) -> Result<()> {
-        self.move_window(window_id, x, y)
     }
 
     fn minimize_window(&self, window_id: u32) -> Result<()> {

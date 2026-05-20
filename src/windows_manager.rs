@@ -2,14 +2,18 @@ use crate::config::Config;
 use crate::window_manager::{EveWindow, WindowManager};
 use anyhow::{Context, Result};
 use std::ffi::c_void;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE, WPARAM};
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::core::PWSTR;
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, TRUE, WPARAM};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindowVisible, SendMessageW, SetForegroundWindow,
-    SetWindowPos, ShowWindow, HWND_TOP, SC_MINIMIZE, SC_RESTORE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_MINIMIZE, SW_RESTORE, WM_SYSCOMMAND,
+    SetWindowPos, ShowWindow, HWND_TOP, SC_MINIMIZE, SC_RESTORE, SWP_NOZORDER, SW_MINIMIZE,
+    SW_RESTORE, WM_SYSCOMMAND,
 };
 
 pub struct WindowsManager;
@@ -42,6 +46,36 @@ fn read_window_title(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..copied as usize])
 }
 
+/// Process-name filter for EVE clients. The title-only check
+/// `starts_with("EVE - ")` is satisfied by browser tabs, Discord
+/// channels, and other apps that happen to use that prefix in their
+/// window title. The reliable signal is that the owning process's
+/// image is `exefile.exe` — the actual EVE client binary.
+fn pid_is_eve_client(pid: u32) -> bool {
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = CloseHandle(handle);
+        if result.is_err() {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        path.rsplit('\\')
+            .next()
+            .map(|name| name.eq_ignore_ascii_case("exefile.exe"))
+            .unwrap_or(false)
+    }
+}
+
 unsafe extern "system" fn enum_collect_eve(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let windows = &mut *(lparam.0 as *mut Vec<EveWindow>);
 
@@ -50,12 +84,22 @@ unsafe extern "system" fn enum_collect_eve(hwnd: HWND, lparam: LPARAM) -> BOOL {
     }
 
     let title = read_window_title(hwnd);
-    if title.starts_with("EVE - ") && !title.contains("Launcher") {
-        windows.push(EveWindow {
-            id: hwnd_to_id(hwnd),
-            title: title.trim_start_matches("EVE - ").to_string(),
-        });
+    if !title.starts_with("EVE - ") {
+        return TRUE;
     }
+    // Process gate: reject anything titled "EVE - …" whose owning
+    // process isn't the actual game (`exefile.exe`). Closes the bug
+    // where preview windows got created for non-EVE apps (browser
+    // tabs etc.) that happened to start with the EVE title prefix.
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 || !pid_is_eve_client(pid) {
+        return TRUE;
+    }
+    windows.push(EveWindow {
+        id: hwnd_to_id(hwnd),
+        title: title.trim_start_matches("EVE - ").to_string(),
+    });
 
     TRUE
 }
@@ -166,55 +210,6 @@ impl WindowManager for WindowsManager {
     fn get_active_window(&self) -> Result<u32> {
         let hwnd = unsafe { GetForegroundWindow() };
         Ok(hwnd_to_id(hwnd))
-    }
-
-    fn find_window_by_title(&self, title: &str) -> Result<Option<u32>> {
-        struct Search {
-            needle: String,
-            found: Option<u32>,
-        }
-        let mut search = Search {
-            needle: title.to_string(),
-            found: None,
-        };
-
-        unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            let s = &mut *(lparam.0 as *mut Search);
-            if s.found.is_some() {
-                return BOOL(0);
-            }
-            if !IsWindowVisible(hwnd).as_bool() {
-                return TRUE;
-            }
-            if read_window_title(hwnd) == s.needle {
-                s.found = Some(hwnd_to_id(hwnd));
-                return BOOL(0);
-            }
-            TRUE
-        }
-
-        unsafe {
-            // Returning false from the callback to short-circuit surfaces as
-            // an Err from EnumWindows; ignore it.
-            let _ = EnumWindows(Some(cb), LPARAM(&mut search as *mut _ as isize));
-        }
-        Ok(search.found)
-    }
-
-    fn move_window(&self, window_id: u32, x: i32, y: i32) -> Result<()> {
-        unsafe {
-            SetWindowPos(
-                id_to_hwnd(window_id),
-                Some(HWND_TOP),
-                x,
-                y,
-                0,
-                0,
-                SWP_NOZORDER | SWP_NOSIZE,
-            )
-            .ok();
-        }
-        Ok(())
     }
 
     fn minimize_window(&self, window_id: u32) -> Result<()> {

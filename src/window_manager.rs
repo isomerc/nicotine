@@ -21,21 +21,6 @@ pub trait WindowManager: Send + Sync {
     /// Get the currently active window ID
     fn get_active_window(&self) -> Result<u32>;
 
-    /// Find a window by its title (returns window ID if found). Used by
-    /// the Linux overlay window only — Windows builds don't call this,
-    /// hence the dead-code suppression for the cross-platform trait.
-    #[allow(dead_code)]
-    fn find_window_by_title(&self, title: &str) -> Result<Option<u32>>;
-
-    /// Move a window to a specific position (X11 only, no-op on Wayland).
-    /// Like `find_window_by_title`, only the Linux overlay calls this.
-    #[allow(dead_code)]
-    fn move_window(&self, window_id: u32, x: i32, y: i32) -> Result<()> {
-        // Default implementation: no-op (Wayland doesn't allow arbitrary window positioning)
-        let _ = (window_id, x, y);
-        Ok(())
-    }
-
     /// Minimize a window
     fn minimize_window(&self, window_id: u32) -> Result<()>;
 

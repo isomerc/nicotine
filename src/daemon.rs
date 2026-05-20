@@ -2,9 +2,9 @@ use crate::config::{Config, LiveSettings};
 use crate::cycle_state::CycleState;
 use crate::ipc;
 #[cfg(unix)]
-use crate::keyboard_listener::KeyboardListener;
+use crate::keyboard_listener::{KeyboardConfig, KeyboardListener};
 #[cfg(unix)]
-use crate::mouse_listener::MouseListener;
+use crate::mouse_listener::{MouseConfig, MouseListener};
 use crate::telemetry;
 use crate::window_manager::WindowManager;
 use anyhow::Result;
@@ -18,6 +18,7 @@ pub enum Command {
     Backward,
     Switch(usize),
     Refresh,
+    Stack,
     Quit,
 }
 
@@ -28,6 +29,7 @@ impl Command {
             "forward" => Some(Command::Forward),
             "backward" => Some(Command::Backward),
             "refresh" => Some(Command::Refresh),
+            "stack" => Some(Command::Stack),
             "quit" => Some(Command::Quit),
             _ => {
                 // Check for switch:N format
@@ -46,12 +48,20 @@ pub struct Daemon {
     wm: Arc<dyn WindowManager>,
     state: Arc<Mutex<CycleState>>,
     config: Config,
-    character_order: Option<Vec<String>>,
     /// Read by the Windows preview manager via `spawn_input_listeners`.
     /// On Linux nothing reads it — kept for ABI symmetry with the Windows
     /// daemon constructor.
     #[cfg_attr(unix, allow(dead_code))]
     live: Arc<Mutex<LiveSettings>>,
+    /// Live mouse-cycle settings shared with the Linux input listener
+    /// thread. Hot-reload thread updates this on config changes; the
+    /// listener picks them up within `POLL_TIMEOUT_MS` (200 ms).
+    #[cfg(unix)]
+    mouse_config: Arc<Mutex<MouseConfig>>,
+    /// Same idea for the Linux keyboard cycle + per-character hotkey
+    /// listener.
+    #[cfg(unix)]
+    keyboard_config: Arc<Mutex<KeyboardConfig>>,
 }
 
 impl Daemon {
@@ -90,12 +100,20 @@ impl Daemon {
             .unwrap()
             .set_character_order(character_order.clone());
 
+        #[cfg(unix)]
+        let mouse_config = Arc::new(Mutex::new(MouseConfig::from_config(&config)));
+        #[cfg(unix)]
+        let keyboard_config = Arc::new(Mutex::new(KeyboardConfig::from_config(&config)));
+
         Self {
             wm,
             state,
             config,
-            character_order,
             live,
+            #[cfg(unix)]
+            mouse_config,
+            #[cfg(unix)]
+            keyboard_config,
         }
     }
 
@@ -117,6 +135,13 @@ impl Daemon {
         } else {
             Some(self.config.characters.clone())
         };
+        // Shared listener-config mutexes; the hot-reload thread writes
+        // fresh snapshots into them so the always-running listener
+        // threads pick up panel-driven changes within ~200ms.
+        #[cfg(unix)]
+        let mouse_config_clone = Arc::clone(&self.mouse_config);
+        #[cfg(unix)]
+        let keyboard_config_clone = Arc::clone(&self.keyboard_config);
         // Signature of all hotkey-related fields, used to detect changes
         // and trigger a daemon-side rebind without restart.
         #[cfg(windows)]
@@ -166,6 +191,30 @@ impl Daemon {
                     last_order = new_order;
                 }
 
+                // Linux input listeners read live bindings from the
+                // shared MouseConfig/KeyboardConfig mutexes; the
+                // listener threads pick up changes within ~200ms
+                // (their poll timeout). The PartialEq gate avoids
+                // re-locking the mutexes 2x/second when nothing
+                // changed.
+                #[cfg(unix)]
+                {
+                    let new_mouse = MouseConfig::from_config(&fresh_config);
+                    {
+                        let mut guard = mouse_config_clone.lock().unwrap();
+                        if *guard != new_mouse {
+                            *guard = new_mouse;
+                        }
+                    }
+                    let new_keyboard = KeyboardConfig::from_config(&fresh_config);
+                    {
+                        let mut guard = keyboard_config_clone.lock().unwrap();
+                        if *guard != new_keyboard {
+                            *guard = new_keyboard;
+                        }
+                    }
+                }
+
                 // Hotkey-config change → rebind so the new keys take
                 // effect without a daemon restart.
                 #[cfg(windows)]
@@ -202,39 +251,35 @@ impl Daemon {
 
     #[cfg(unix)]
     fn spawn_input_listeners(&self) {
-        if self.config.enable_mouse_buttons {
-            let mouse_listener = MouseListener::new(self.config.clone());
+        // Always spawn the listener threads — they read live config
+        // from the shared MouseConfig/KeyboardConfig mutexes and idle
+        // when `enable` is false. That way flipping `enable_*` on in
+        // the panel after startup actually does something instead of
+        // requiring a daemon restart.
+        MouseListener::spawn(
+            Arc::clone(&self.mouse_config),
+            Arc::clone(&self.wm),
+            Arc::clone(&self.state),
+        );
+        KeyboardListener::spawn(
+            Arc::clone(&self.keyboard_config),
+            Arc::clone(&self.wm),
+            Arc::clone(&self.state),
+        );
+        println!("Mouse + keyboard listeners spawned (live config hot-reload enabled)");
+
+        // Linux preview manager — XComposite redirect + XRender server-
+        // side composite. Gated by config.show_previews to mirror the
+        // Windows daemon. Failure to start is non-fatal; cycling and the
+        // config panel keep working.
+        if self.config.show_previews {
             let wm_clone = Arc::clone(&self.wm);
             let state_clone = Arc::clone(&self.state);
-
-            match mouse_listener.spawn(wm_clone, state_clone) {
-                Ok(_) => println!("Mouse button listener started"),
-                Err(e) => {
-                    eprintln!("Warning: Could not start mouse listener: {}", e);
-                    eprintln!(
-                        "Mouse buttons will not work. You can disable this warning by setting"
-                    );
-                    eprintln!("'enable_mouse_buttons = false' in ~/.config/nicotine/config.toml");
-                }
-            }
-        }
-
-        if self.config.enable_keyboard_buttons {
-            let keyboard_listener = KeyboardListener::new(self.config.clone());
-            let wm_clone = Arc::clone(&self.wm);
-            let state_clone = Arc::clone(&self.state);
-
-            match keyboard_listener.spawn(wm_clone, state_clone) {
-                Ok(_) => println!("Keyboard key listener started"),
-                Err(e) => {
-                    eprintln!("Warning: Could not start keyboard listener: {}", e);
-                    eprintln!(
-                        "Keyboard keys will not work.  You can disable this warning by setting"
-                    );
-                    eprintln!(
-                        "'enable_keyboard_buttons = false' in ~/.config/nicotine/config.toml"
-                    );
-                }
+            let live_clone = Arc::clone(&self.live);
+            match crate::preview_x11::spawn(self.config.clone(), wm_clone, state_clone, live_clone)
+            {
+                Ok(_) => println!("Linux preview windows started (XRender path)"),
+                Err(e) => eprintln!("Warning: Could not start Linux preview manager: {}", e),
             }
         }
     }
@@ -249,21 +294,20 @@ impl Daemon {
             Err(e) => eprintln!("Warning: Could not start Windows input listeners: {}", e),
         }
 
-        // DWM preview windows manager (gated by config; defaults to true).
-        if self.config.show_previews {
-            let wm_clone = Arc::clone(&self.wm);
-            let state_clone = Arc::clone(&self.state);
-            let live_clone = Arc::clone(&self.live);
-            match crate::preview_windows::spawn(
-                self.config.clone(),
-                wm_clone,
-                state_clone,
-                live_clone,
-            ) {
-                Ok(_) => println!("DWM preview windows started"),
-                Err(e) => {
-                    eprintln!("Warning: Could not start preview window manager: {}", e)
-                }
+        // DWM preview windows manager — always spawned. The manager
+        // self-gates each reconcile on LiveSettings.show_previews so the
+        // panel checkbox can hide/show previews live without a daemon
+        // restart. Initial state of LiveSettings.show_previews mirrors
+        // config.show_previews, so a user who starts with previews off
+        // sees no windows until they tick the box.
+        let wm_clone = Arc::clone(&self.wm);
+        let state_clone = Arc::clone(&self.state);
+        let live_clone = Arc::clone(&self.live);
+        match crate::preview_windows::spawn(self.config.clone(), wm_clone, state_clone, live_clone)
+        {
+            Ok(_) => println!("DWM preview windows manager started"),
+            Err(e) => {
+                eprintln!("Warning: Could not start preview window manager: {}", e)
             }
         }
     }
@@ -303,16 +347,31 @@ impl Daemon {
                         state.sync_with_active(active);
                     }
 
+                    // Read the cycle order from CycleState (kept fresh
+                    // by the hot-reload thread above). Cloning is
+                    // necessary because switch_to borrows &mut state.
+                    let order = state.character_order().map(|s| s.to_vec());
                     state.switch_to(
                         target,
                         &*self.wm,
                         self.config.minimize_inactive,
-                        self.character_order.as_deref(),
+                        order.as_deref(),
                     )?;
                 }
                 Command::Refresh => {
                     let windows = self.wm.get_eve_windows()?;
                     self.state.lock().unwrap().update_windows(windows);
+                }
+                Command::Stack => {
+                    // Re-center every EVE client to the configured stack
+                    // geometry. Mirror of the CLI `nicotine stack` path —
+                    // same wm.stack_windows call, just driven by IPC so
+                    // the config panel can fire it without spawning a
+                    // new process.
+                    let windows = self.wm.get_eve_windows()?;
+                    if let Err(e) = self.wm.stack_windows(&windows, &self.config) {
+                        eprintln!("Restack failed: {}", e);
+                    }
                 }
                 Command::Quit => {
                     std::process::exit(0);
