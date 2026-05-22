@@ -86,6 +86,26 @@ jobs:
           sudo apt-get install -y xvfb openbox wmctrl \
             libxkbcommon-x11-0 libgl1 libwayland-client0
 
+      # Phase 3 input-simulation tests create uinput virtual
+      # keyboards / mice through /dev/uinput. Two pieces of access
+      # are needed on the runner:
+      # (1) /dev/uinput itself — root-only by default; chmod 666
+      #     lets the test ioctl into it.
+      # (2) The /dev/input/event* nodes the kernel creates for each
+      #     virtual device — udev sets them to `root:input 0660` by
+      #     default, and the ubuntu-latest `runner` user isn't in
+      #     `input`. A udev rule loosens MODE so the daemon
+      #     subprocess (also running as `runner`) can read events
+      #     emitted through the virtual devices.
+      - name: Enable uinput + permissive event-device perms
+        run: |
+          sudo modprobe uinput
+          sudo chmod 666 /dev/uinput
+          echo 'KERNEL=="event*", MODE="0666"' | \
+            sudo tee /etc/udev/rules.d/99-nicotine-test.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger
+
       - name: Run integration tests under Xvfb
         run: |
           set -e
@@ -122,3 +142,79 @@ jobs:
       - name: Run integration tests
         shell: bash
         run: cargo test --test fake_eve -- --ignored --test-threads=1 --nocapture
+
+  wayland-xdg-activation:
+    name: Wayland xdg-activation (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Sway is a tiling Wayland compositor (wlroots-based) that has
+      # advertised `xdg_activation_v1` since 1.7. The `weston`
+      # ubuntu-latest ships doesn't expose it via the headless
+      # backend (either too old or the desktop-shell module is
+      # stripped); sway's headless mode via WLR_BACKENDS=headless
+      # exposes the full protocol surface including xdg-activation.
+      # Catches the class of regression we'd hit if a
+      # `wayland-client` version bump or protocol-schema change
+      # broke our dispatch loop / token extraction.
+      - name: Install Sway
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sway
+
+      - name: Start Sway (headless) and run xdg_activation test
+        run: |
+          set -e
+          # Sway needs XDG_RUNTIME_DIR with 0700 perms. The
+          # systemd-spawned dir on real desktops is /run/user/<uid>;
+          # the runner doesn't have one, so create our own.
+          export XDG_RUNTIME_DIR=/tmp/wayland-runtime
+          mkdir -p $XDG_RUNTIME_DIR
+          chmod 700 $XDG_RUNTIME_DIR
+
+          # Minimal sway config — just a virtual output so wlroots
+          # has something to render to. No keybindings or workspaces
+          # needed; we only use sway for its Wayland protocol surface.
+          cat > /tmp/sway-test.conf <<'EOF'
+          output HEADLESS-1 mode 1280x800
+          EOF
+
+          # WLR_BACKENDS=headless: use the wlroots headless backend
+          # (no GPU / framebuffer required).
+          # WLR_LIBINPUT_NO_DEVICES=1: don't fail when /dev/input/*
+          # devices aren't present on the runner (they aren't unless
+          # the integration-linux job already created uinput nodes).
+          WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 \
+            sway -c /tmp/sway-test.conf >/tmp/sway.log 2>&1 &
+          SWAY_PID=$!
+
+          # Wait for sway's Wayland socket to appear. Sway names it
+          # `wayland-N`; we pick the first one that shows up.
+          WAYLAND_SOCK=""
+          for _ in $(seq 1 50); do
+            WAYLAND_SOCK=$(ls "$XDG_RUNTIME_DIR" 2>/dev/null \
+              | grep -E '^wayland-[0-9]+$' | head -1 || true)
+            if [ -n "$WAYLAND_SOCK" ]; then
+              break
+            fi
+            sleep 0.1
+          done
+
+          if [ -z "$WAYLAND_SOCK" ]; then
+            echo "Sway never bound a Wayland socket. Log:"
+            cat /tmp/sway.log
+            kill $SWAY_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          export WAYLAND_DISPLAY=$WAYLAND_SOCK
+          echo "Sway running, WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+          cargo test --bin Nicotine xdg_activation -- --ignored --nocapture
+          STATUS=$?
+          kill $SWAY_PID 2>/dev/null || true
+          exit $STATUS

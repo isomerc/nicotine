@@ -170,6 +170,12 @@ impl TestDaemon {
                 "NICOTINE_CONFIG_DIR".to_string(),
                 config_dir.to_string_lossy().into_owned(),
             ),
+            // Turn on the daemon's input-pipeline diagnostic log
+            // (Windows: mouse hook -> listener -> force_activate;
+            // Linux: noop today). Cheap when nothing's happening;
+            // surfaces the cycle path's intermediate state when a
+            // test calls `diagnostic_log()` after failure.
+            ("NICOTINE_DEBUG_INPUT".to_string(), "1".to_string()),
         ];
 
         let mut cmd = Command::new(nicotine_binary());
@@ -321,11 +327,25 @@ impl TestDaemon {
         std::fs::write(&tmp, toml)?;
         std::fs::rename(&tmp, &self.config_path)?;
 
+        // Any one of these log lines confirms the daemon's hot-reload
+        // thread processed our new config:
+        //   - "Reloaded N character(s) ..."     — character_order changed
+        //   - "Character list cleared ..."      — character_order cleared
+        //   - "Hot-reload: mouse config ..."    — mouse_device_path / buttons / enable_mouse
+        //   - "Hot-reload: keyboard config ..." — keyboard_device_path / character_hotkeys / etc.
+        //   - "Hot-reload: hotkey config ..."   — Windows-only RegisterHotKey rebind path
+        const RELOAD_MARKERS: &[&str] = &[
+            "Reloaded ",
+            "Character list cleared",
+            "Hot-reload: mouse config",
+            "Hot-reload: keyboard config",
+            "Hot-reload: hotkey config",
+        ];
         let deadline = Instant::now() + Duration::from_millis(5000);
         while Instant::now() < deadline {
             let now = self.stdout_log_contents();
             if let Some(diff) = now.strip_prefix(&baseline) {
-                if diff.contains("Reloaded ") || diff.contains("Character list cleared") {
+                if RELOAD_MARKERS.iter().any(|m| diff.contains(m)) {
                     // Give the daemon one more tick to also apply
                     // any side effects (hotkey rebind on Windows,
                     // listener mutex updates on Linux). 100ms is
@@ -361,6 +381,41 @@ impl TestDaemon {
 
     fn stderr_log_contents(&self) -> String {
         std::fs::read_to_string(self.base_dir.join("daemon.stderr.log")).unwrap_or_default()
+    }
+
+    /// Public accessor for the daemon's captured stderr. Tests that
+    /// need to parse the `NICOTINE_DEBUG_INPUT` diagnostic stream
+    /// (e.g. to assert on `force_activate: target=` lines) use this
+    /// rather than going through `diagnostic_log` which is formatted
+    /// for human reading. Only the Windows mouse-button test
+    /// currently parses this; cfg-gate the dead_code allow so
+    /// non-windows builds don't warn.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn stderr_log_contents_pub(&self) -> String {
+        self.stderr_log_contents()
+    }
+
+    /// Concatenated stdout + stderr from the daemon, formatted for
+    /// inclusion in test failure messages. Tests should call this in
+    /// assertion failure paths so CI logs surface the daemon's view of
+    /// the world (open-failed devices, parse errors, etc.) rather
+    /// than just "got X expected Y".
+    pub fn diagnostic_log(&self) -> String {
+        let stdout = self.stdout_log_contents();
+        let stderr = self.stderr_log_contents();
+        format!(
+            "\n--- daemon stdout ---\n{}\n--- daemon stderr ---\n{}",
+            if stdout.is_empty() {
+                "(empty)"
+            } else {
+                &stdout
+            },
+            if stderr.is_empty() {
+                "(empty)"
+            } else {
+                &stderr
+            }
+        )
     }
 }
 

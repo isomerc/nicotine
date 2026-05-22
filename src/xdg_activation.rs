@@ -206,4 +206,69 @@ mod tests {
             "XdgActivation::new() should return Err when no Wayland connection is available"
         );
     }
+
+    /// Positive end-to-end test: connect to a real Wayland compositor,
+    /// bind `xdg_activation_v1`, and verify `request_token` round-trips
+    /// to a non-empty string within the protocol timeout. Catches the
+    /// class of regression where a `wayland-client` version bump or a
+    /// protocol-schema change breaks our dispatch loop or token
+    /// extraction.
+    ///
+    /// Marked `#[ignore]` because it requires `WAYLAND_DISPLAY` to
+    /// point at a live compositor that advertises `xdg_activation_v1`
+    /// (Weston, KWin, Sway, Hyprland, Mutter — basically all modern
+    /// ones). CI runs this under a headless Weston session via
+    /// `cargo test --ignored xdg_activation`. On a developer
+    /// machine in a Wayland session, run the same command and it
+    /// will exercise the real compositor.
+    #[test]
+    #[ignore = "requires a running Wayland compositor with xdg_activation_v1"]
+    fn request_token_round_trips_against_real_compositor() {
+        let activation = XdgActivation::new().unwrap_or_else(|e| {
+            panic!(
+                "XdgActivation::new() failed — is WAYLAND_DISPLAY set and does the \
+                 compositor advertise xdg_activation_v1? Error: {e:?}"
+            )
+        });
+
+        // Round-trip a token request. The point of the test is the
+        // Wayland protocol plumbing — we connect, bind, request,
+        // dispatch events, and pull a Done(token) reply back. Catches
+        // regressions like a `wayland-client` version bump breaking
+        // event dispatch or a protocol schema change reshaping the
+        // request signature.
+        let token = activation
+            .request_token()
+            .expect("request_token must round-trip without hanging or erroring");
+        assert!(
+            !token.is_empty(),
+            "compositor returned an empty activation token"
+        );
+
+        // NOTE on token contents: real-world compositors return one
+        // of two kinds of strings depending on whether they decide
+        // to grant the activation.
+        // - Granted: an opaque per-request token (KWin returns
+        //   ~64-char hex). The X11 side stamps this on
+        //   `_NET_STARTUP_ID` of the target window and the EWMH
+        //   activate ClientMessage is honored with surface focus.
+        // - Not granted: a sentinel like KWin's "not-granted-666"
+        //   when focus-stealing prevention denies the request (the
+        //   requesting process has no recent user input — typical
+        //   for this isolated test fixture, where no real input has
+        //   reached us).
+        // Both cases are correct protocol behavior — the
+        // grant/deny decision is the compositor's, not Nicotine's.
+        // We only assert the protocol succeeded; the production
+        // code path is identical either way (stamp the token,
+        // send the EWMH message, let the compositor decide).
+
+        // Second round-trip: catches a class of regression where the
+        // EventQueue is left in a half-drained state after the first
+        // request, causing subsequent requests to hang.
+        let token2 = activation
+            .request_token()
+            .expect("second request_token should also succeed");
+        assert!(!token2.is_empty(), "second request returned empty token");
+    }
 }

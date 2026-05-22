@@ -9,12 +9,17 @@
 //! Cleanup runs on `Drop`: child processes are killed and reaped;
 //! X11 windows go away with the connection.
 
+use evdev::{
+    uinput::{VirtualDevice, VirtualDeviceBuilder},
+    AttributeSet, EventType, InputEvent, Key,
+};
 use nix::libc;
 use nix::sys::prctl;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag};
 use nix::unistd::{fork, ForkResult, Pid};
 use std::ffi::CStr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
@@ -280,4 +285,104 @@ pub fn window_root_geometry(window: u32) -> anyhow::Result<(i32, i32, u32, u32)>
         geom.width as u32,
         geom.height as u32,
     ))
+}
+
+/// Synthetic input device: registers as a real keyboard / mouse with
+/// the kernel via uinput, so events emitted through it flow through
+/// the standard /dev/input/eventN node the daemon's evdev listener
+/// already polls. Tests use this to drive the
+/// keyboard_listener / mouse_listener layer end-to-end without
+/// needing a real keyboard or mouse on the runner.
+///
+/// On Linux the test runner needs read/write access to `/dev/uinput`.
+/// Local NixOS sessions usually get an ACL granting the active user.
+/// GitHub `ubuntu-latest` runners require a one-line `chmod` in the
+/// CI step (`sudo chmod 666 /dev/uinput`) — applied in the workflow.
+pub struct VirtualInput {
+    dev: VirtualDevice,
+    devnode: PathBuf,
+}
+
+impl VirtualInput {
+    /// Build a virtual keyboard advertising the given key codes. The
+    /// path returned by [`Self::devnode`] is what the test's
+    /// daemon-config should put in `keyboard_device_path`.
+    pub fn keyboard(keys: &[Key]) -> anyhow::Result<Self> {
+        let mut keyset = AttributeSet::<Key>::new();
+        for k in keys {
+            keyset.insert(*k);
+        }
+        let mut dev = VirtualDeviceBuilder::new()?
+            .name(b"nicotine-test-vkbd")
+            .with_keys(&keyset)?
+            .build()?;
+        let devnode = Self::resolve_devnode(&mut dev)?;
+        Ok(Self { dev, devnode })
+    }
+
+    /// Build a virtual mouse advertising the given button codes (e.g.
+    /// `Key::BTN_SIDE`, `Key::BTN_EXTRA`). Same `devnode` convention
+    /// as `keyboard` — feed it to `mouse_device_path` in the test
+    /// config.
+    pub fn mouse(buttons: &[Key]) -> anyhow::Result<Self> {
+        let mut buttonset = AttributeSet::<Key>::new();
+        for b in buttons {
+            buttonset.insert(*b);
+        }
+        let mut dev = VirtualDeviceBuilder::new()?
+            .name(b"nicotine-test-vmouse")
+            .with_keys(&buttonset)?
+            .build()?;
+        let devnode = Self::resolve_devnode(&mut dev)?;
+        Ok(Self { dev, devnode })
+    }
+
+    /// `/dev/input/eventN` for this device. Used by tests to populate
+    /// the daemon's `keyboard_device_path` / `mouse_device_path`
+    /// config so the listener attaches to THIS virtual device instead
+    /// of auto-detecting whatever real hardware is plugged in.
+    pub fn devnode(&self) -> &PathBuf {
+        &self.devnode
+    }
+
+    /// Press then release a key. Emits two `EV_KEY` events + the
+    /// trailing `EV_SYN` so the evdev consumer treats them as a
+    /// single atomic press+release.
+    pub fn tap(&mut self, key: Key) -> anyhow::Result<()> {
+        self.dev.emit(&[
+            InputEvent::new(EventType::KEY, key.code(), 1),
+            InputEvent::new(EventType::KEY, key.code(), 0),
+        ])?;
+        Ok(())
+    }
+
+    /// Press `modifier`, tap `key`, release `modifier`. Used for
+    /// Shift+F1-style hotkeys where the listener needs to see the
+    /// modifier state held across the main key event.
+    pub fn tap_with_modifier(&mut self, modifier: Key, key: Key) -> anyhow::Result<()> {
+        self.dev.emit(&[
+            InputEvent::new(EventType::KEY, modifier.code(), 1),
+            InputEvent::new(EventType::KEY, key.code(), 1),
+            InputEvent::new(EventType::KEY, key.code(), 0),
+            InputEvent::new(EventType::KEY, modifier.code(), 0),
+        ])?;
+        Ok(())
+    }
+
+    /// Newly-created uinput devices don't publish their /dev/input
+    /// node instantly — udev needs to process the kernel uevent and
+    /// create the node. Poll the device's enumerated devnodes for up
+    /// to a second; this is plenty even on a slow CI runner.
+    fn resolve_devnode(dev: &mut VirtualDevice) -> anyhow::Result<PathBuf> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Ok(mut nodes) = dev.enumerate_dev_nodes_blocking() {
+                if let Some(Ok(path)) = nodes.next() {
+                    return Ok(path);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        anyhow::bail!("virtual uinput device never published a /dev/input/eventN node within 2s")
+    }
 }

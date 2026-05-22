@@ -22,10 +22,14 @@
 
 mod common;
 
+#[cfg(unix)]
+use common::VirtualInput;
 use common::{
     activate_window_directly, nicotine_binary, skip_if_no_display, window_root_geometry,
     FakeEveHarness, TestDaemon,
 };
+#[cfg(unix)]
+use evdev::Key;
 use std::collections::HashSet;
 use std::process::Command;
 
@@ -579,6 +583,573 @@ characters = [\"Gamma\", \"Beta\", \"Alpha\"]
         active, "Gamma",
         "with characters=[Gamma,Beta,Alpha] in config, switch:1 (1-indexed) should land on Gamma; got {:?}",
         active
+    );
+}
+
+// ===== Phase 3: input-simulation tests =====================================
+//
+// These tests inject real keyboard / mouse events through a virtual
+// device (uinput on Linux, SendInput on Windows — Windows half is a
+// follow-up). They exercise the daemon's keyboard_listener and
+// mouse_listener layers end-to-end, which the IPC-driven tests above
+// skip entirely. The class of regression they catch is the F16+ binding
+// bug + multi-device mouse bug fixed in earlier sessions.
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires DISPLAY + /dev/uinput rw access (NixOS user ACL or `chmod 666 /dev/uinput` on CI)"]
+fn per_character_hotkey_activates_target_window() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+
+    // Build the virtual keyboard BEFORE the daemon so the device
+    // node exists when keyboard_listener tries to open it on its
+    // first tick. F16 is the key under test (KEY_F16 = 186).
+    let mut vkbd = VirtualInput::keyboard(&[Key::KEY_F16, Key::KEY_LEFTSHIFT])
+        .expect("create virtual keyboard");
+    let kbd_path = vkbd.devnode().to_string_lossy().into_owned();
+
+    // Bootstrap focus on Alpha so we have a known starting point
+    // and the daemon's foreground-tracking code path is exercised.
+    activate_window_directly(harness.clients[0].window).expect("bootstrap focus");
+
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    // Bind F16 → "Beta" via hot-reloaded config. Also explicitly
+    // point keyboard_device_path at our virtual device so the
+    // listener doesn't pick a real keyboard on a dev machine.
+    let config = format!(
+        "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = false
+enable_keyboard_buttons = true
+keyboard_device_path = \"{kbd_path}\"
+characters = [\"Alpha\", \"Beta\", \"Gamma\"]
+[character_hotkeys.Beta]
+vk = 186
+"
+    );
+    daemon.rewrite_config(&config).expect("rewrite config");
+
+    // Give the listener a beat to (re-)attach to the virtual device
+    // after picking up the new path from hot-reload. The listener's
+    // poll loop opens / re-opens the device on path change.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    vkbd.tap(Key::KEY_F16).expect("tap F16");
+    // Daemon's listener -> hotkey planner -> activate is synchronous
+    // once the key event arrives, but the WM applies focus a few
+    // frames later. 400ms is comfortably above KWin / Mutter latency.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let active = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        active,
+        "Beta",
+        "F16 bound to Beta should activate Beta when pressed; got {active:?}{}",
+        daemon.diagnostic_log()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires DISPLAY + /dev/uinput rw access"]
+fn modifier_combo_hotkey_activates_target_window() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+    let mut vkbd = VirtualInput::keyboard(&[Key::KEY_F1, Key::KEY_LEFTSHIFT]).expect("vkbd");
+    let kbd_path = vkbd.devnode().to_string_lossy().into_owned();
+
+    // Bootstrap on Gamma so the test can prove Shift+F1 actually
+    // moved focus (not just happened to keep Alpha selected).
+    activate_window_directly(harness.clients[2].window).expect("bootstrap focus");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    // Bind Shift+F1 → "Alpha". KEY_F1 = 59, KEY_LEFTSHIFT = 42 on
+    // Linux evdev. The character_hotkeys entry stores `modifier`
+    // alongside `vk` so the planner's modifier-aware resolution path
+    // is exercised.
+    let config = format!(
+        "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = false
+enable_keyboard_buttons = true
+keyboard_device_path = \"{kbd_path}\"
+characters = [\"Alpha\", \"Beta\", \"Gamma\"]
+[character_hotkeys.Alpha]
+vk = 59
+modifier = 42
+"
+    );
+    daemon.rewrite_config(&config).expect("rewrite config");
+
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    vkbd.tap_with_modifier(Key::KEY_LEFTSHIFT, Key::KEY_F1)
+        .expect("Shift+F1");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let active = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        active,
+        "Alpha",
+        "Shift+F1 bound to Alpha should activate Alpha; got {active:?}{}",
+        daemon.diagnostic_log()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires DISPLAY + /dev/uinput rw access"]
+fn mouse_side_button_cycles_forward() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+
+    // BTN_SIDE = 275, BTN_EXTRA = 276 — the daemon's default mouse
+    // forward button is 276 (BTN_EXTRA on evdev). We register both
+    // codes on the virtual mouse so we can also click backward in
+    // future tests without rebuilding the device.
+    let mut vmouse = VirtualInput::mouse(&[Key::BTN_SIDE, Key::BTN_EXTRA]).expect("vmouse");
+    let mouse_path = vmouse.devnode().to_string_lossy().into_owned();
+
+    activate_window_directly(harness.clients[0].window).expect("bootstrap focus");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    let config = format!(
+        "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = true
+enable_keyboard_buttons = false
+mouse_device_path = \"{mouse_path}\"
+"
+    );
+    daemon.rewrite_config(&config).expect("rewrite config");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // Anchor on whatever the daemon sees first post-bootstrap so the
+    // expected-next computation is platform-agnostic. The mouse
+    // listener fires forward → daemon cycles → activate; same code
+    // path as IPC "forward".
+    let initial = common_list_names(&daemon);
+    let anchor = &initial[0];
+    let post_activate_id = harness
+        .clients
+        .iter()
+        .find(|c| c.name == *anchor)
+        .map(|c| c.window)
+        .unwrap();
+    activate_window_directly(post_activate_id).unwrap();
+    daemon.wait_for_enum_tick();
+
+    let post_order = common_list_names(&daemon);
+    let anchor_pos = post_order.iter().position(|n| n == anchor).unwrap();
+    let expected_next = post_order[(anchor_pos + 1) % post_order.len()].clone();
+
+    vmouse.tap(Key::BTN_EXTRA).expect("click BTN_EXTRA");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let active = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        active,
+        expected_next,
+        "BTN_EXTRA (forward) should advance cycle in post-activation order {post_order:?}; got {active:?}{}",
+        daemon.diagnostic_log()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires DISPLAY + /dev/uinput rw access"]
+fn hotkey_rebind_via_hot_reload_takes_effect() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    // Start with F16 → Beta. Hit F16, assert Beta activated. Then
+    // rewrite config so F16 → Gamma. Hit F16 again, assert Gamma
+    // activated. Catches regressions in the daemon's keyboard
+    // hot-reload path (the shared KeyboardConfig mutex listener
+    // threads read on each poll tick).
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+    let mut vkbd = VirtualInput::keyboard(&[Key::KEY_F16]).expect("vkbd");
+    let kbd_path = vkbd.devnode().to_string_lossy().into_owned();
+    activate_window_directly(harness.clients[0].window).expect("bootstrap");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    let config_beta = format!(
+        "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = false
+enable_keyboard_buttons = true
+keyboard_device_path = \"{kbd_path}\"
+characters = [\"Alpha\", \"Beta\", \"Gamma\"]
+[character_hotkeys.Beta]
+vk = 186
+"
+    );
+    daemon.rewrite_config(&config_beta).expect("config -> Beta");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    vkbd.tap(Key::KEY_F16).expect("first F16");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let after_first = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        after_first,
+        "Beta",
+        "first F16 should activate Beta under the initial binding; got {after_first:?}{}",
+        daemon.diagnostic_log()
+    );
+
+    let config_gamma = format!(
+        "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = false
+enable_keyboard_buttons = true
+keyboard_device_path = \"{kbd_path}\"
+characters = [\"Alpha\", \"Beta\", \"Gamma\"]
+[character_hotkeys.Gamma]
+vk = 186
+"
+    );
+    daemon
+        .rewrite_config(&config_gamma)
+        .expect("config -> Gamma");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    vkbd.tap(Key::KEY_F16).expect("second F16");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let after_second = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        after_second,
+        "Gamma",
+        "second F16 should activate Gamma after hot-reloading the binding; got {after_second:?}{}",
+        daemon.diagnostic_log()
+    );
+}
+
+/// Tiny helper used by input-sim tests. Same shape as
+/// `daemon_list_order` but accessible from a `cfg(unix)` block; the
+/// alias keeps the cfg gating local to where it's used.
+#[cfg(unix)]
+fn common_list_names(daemon: &TestDaemon) -> Vec<String> {
+    daemon_list_order(daemon)
+}
+
+// ===== Phase 3 (Windows): input-simulation tests ============================
+//
+// Mirror of the Linux uinput tests above, but driving the daemon
+// through `SendInput` instead. Windows hotkeys go through
+// `RegisterHotKey` (system-wide) which `SendInput` triggers exactly
+// like a real keypress; the daemon's mouse-side-button cycling goes
+// through a `WH_MOUSE_LL` hook which also sees injected events.
+//
+// VK_ constants are 1:1 with the Win32 virtual-key codes used in
+// `windows::Win32::UI::Input::KeyboardAndMouse::VK_*`. We define
+// them here as plain `u16` so the test body can pass them to both
+// `VirtualInput::tap` (raw VK) and the daemon's config TOML (which
+// stores `vk = <u16>`).
+
+#[cfg(windows)]
+const VK_F1: u16 = 0x70;
+#[cfg(windows)]
+const VK_F16: u16 = 0x7F;
+#[cfg(windows)]
+const VK_LSHIFT: u16 = 0xA0;
+
+/// XBUTTON1 = back, XBUTTON2 = forward — same encoding the daemon's
+/// low-level mouse hook reads from `MSLLHOOKSTRUCT::mouseData`.
+#[cfg(windows)]
+const XBUTTON2_FORWARD: u16 = 2;
+
+#[cfg(windows)]
+#[test]
+#[ignore = "needs an interactive Windows session (windows-latest runner has one)"]
+fn per_character_hotkey_activates_target_window_windows() {
+    use common::VirtualInput;
+
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+    let mut vkbd = VirtualInput::keyboard(&[VK_F16]).expect("vkbd");
+
+    // Bootstrap focus so the daemon's force_activate has a known
+    // foreground to do its AttachThreadInput dance against.
+    activate_window_directly(harness.clients[0].window).expect("bootstrap");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    let config = format!(
+        "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = false
+enable_keyboard_buttons = true
+characters = [\"Alpha\", \"Beta\", \"Gamma\"]
+[character_hotkeys.Beta]
+vk = {VK_F16}
+"
+    );
+    daemon.rewrite_config(&config).expect("rewrite config");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    vkbd.tap(VK_F16).expect("tap VK_F16");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let active = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        active,
+        "Beta",
+        "VK_F16 bound to Beta should activate Beta; got {active:?}{}",
+        daemon.diagnostic_log()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "needs an interactive Windows session"]
+fn modifier_combo_hotkey_activates_target_window_windows() {
+    use common::VirtualInput;
+
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+    let mut vkbd = VirtualInput::keyboard(&[VK_F1, VK_LSHIFT]).expect("vkbd");
+
+    activate_window_directly(harness.clients[2].window).expect("bootstrap on Gamma");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    let config = format!(
+        "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = false
+enable_keyboard_buttons = true
+characters = [\"Alpha\", \"Beta\", \"Gamma\"]
+[character_hotkeys.Alpha]
+vk = {VK_F1}
+modifier = {VK_LSHIFT}
+"
+    );
+    daemon.rewrite_config(&config).expect("rewrite config");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    vkbd.tap_with_modifier(VK_LSHIFT, VK_F1).expect("Shift+F1");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let active = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        active,
+        "Alpha",
+        "Shift+F1 bound to Alpha should activate Alpha; got {active:?}{}",
+        daemon.diagnostic_log()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "needs an interactive Windows session"]
+fn mouse_side_button_cycles_forward_windows() {
+    use common::VirtualInput;
+
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+    let mut vmouse = VirtualInput::mouse(&[XBUTTON2_FORWARD]).expect("vmouse");
+
+    activate_window_directly(harness.clients[0].window).expect("bootstrap");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    let config = "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = true
+enable_keyboard_buttons = false
+forward_button = 2
+backward_button = 1
+"
+    .to_string();
+    daemon.rewrite_config(&config).expect("rewrite config");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // Re-anchor so EnumWindows post-activation order is deterministic.
+    let initial = daemon_list_order(&daemon);
+    let anchor_name = initial[0].clone();
+    let anchor_id = harness
+        .clients
+        .iter()
+        .find(|c| c.name == anchor_name)
+        .map(|c| c.window)
+        .unwrap();
+    activate_window_directly(anchor_id).unwrap();
+    daemon.wait_for_enum_tick();
+    let post_order = daemon_list_order(&daemon);
+    let anchor_pos = post_order.iter().position(|n| n == &anchor_name).unwrap();
+    let expected_next = post_order[(anchor_pos + 1) % post_order.len()].clone();
+
+    // Find the expected target HWND so we can assert on the
+    // daemon's force_activate intent rather than on the OS-level
+    // focus change. Windows CI runners deny cross-process
+    // SetForegroundWindow even with the canonical workarounds
+    // (AttachThreadInput, AllowSetForegroundWindow) because the
+    // session is non-interactive enough that the OS won't honor
+    // synthetic-input-triggered foreground changes. The daemon's
+    // *intent* is what we actually want to test — that the mouse
+    // hook → classify → PostThreadMessage → listener → cycle →
+    // force_activate pipeline produced the right target. The final
+    // OS-applied focus is environmental and verified manually +
+    // implicitly by the IPC cycle tests on Windows (which work
+    // because their daemon thread has its own input recency).
+    let expected_target_hwnd = harness
+        .clients
+        .iter()
+        .find(|c| c.name == expected_next)
+        .map(|c| c.window)
+        .expect("expected_next must be a known harness client");
+
+    common::grant_set_foreground_to_all();
+    vmouse.tap_xbutton(XBUTTON2_FORWARD).expect("XBUTTON2");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // Parse the daemon stderr (NICOTINE_DEBUG_INPUT is on) for the
+    // last `force_activate: target=0x<hex>` line. The daemon emits
+    // one per activation attempt; if cycle dispatch worked, this
+    // line records the HWND the daemon TRIED to focus. Compare to
+    // expected_next's HWND.
+    let log = daemon.stderr_log_contents_pub();
+    let last_target = log
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.find("force_activate: target=0x").and_then(|i| {
+                let rest = &line[i + "force_activate: target=0x".len()..];
+                let hex_end = rest
+                    .find(|c: char| !c.is_ascii_hexdigit())
+                    .unwrap_or(rest.len());
+                u64::from_str_radix(&rest[..hex_end], 16).ok()
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no `force_activate: target=` line in daemon stderr — the cycle dispatch never ran:{}",
+                daemon.diagnostic_log()
+            )
+        });
+
+    assert_eq!(
+        last_target as u32,
+        expected_target_hwnd,
+        "XBUTTON2 (forward) should have advanced cycle to {expected_next} (HWND {:#x}) in post-activation order {post_order:?}; daemon's force_activate targeted {last_target:#x}{}",
+        expected_target_hwnd,
+        daemon.diagnostic_log()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "needs an interactive Windows session"]
+fn hotkey_rebind_via_hot_reload_takes_effect_windows() {
+    use common::VirtualInput;
+
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+    let mut vkbd = VirtualInput::keyboard(&[VK_F16]).expect("vkbd");
+    activate_window_directly(harness.clients[0].window).expect("bootstrap");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    let config_beta = format!(
+        "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = false
+enable_keyboard_buttons = true
+characters = [\"Alpha\", \"Beta\", \"Gamma\"]
+[character_hotkeys.Beta]
+vk = {VK_F16}
+"
+    );
+    daemon.rewrite_config(&config_beta).expect("config -> Beta");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    vkbd.tap(VK_F16).expect("first F16");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let after_first = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        after_first,
+        "Beta",
+        "first F16 should activate Beta; got {after_first:?}{}",
+        daemon.diagnostic_log()
+    );
+
+    let config_gamma = format!(
+        "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = false
+enable_keyboard_buttons = true
+characters = [\"Alpha\", \"Beta\", \"Gamma\"]
+[character_hotkeys.Gamma]
+vk = {VK_F16}
+"
+    );
+    daemon
+        .rewrite_config(&config_gamma)
+        .expect("config -> Gamma");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    vkbd.tap(VK_F16).expect("second F16");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let after_second = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        after_second,
+        "Gamma",
+        "second F16 should activate Gamma after rebind; got {after_second:?}{}",
+        daemon.diagnostic_log()
     );
 }
 

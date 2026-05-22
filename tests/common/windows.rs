@@ -17,9 +17,15 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
+    AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    SetForegroundWindow, ASFW_ANY,
 };
 
 /// One fake EVE client: a spawned `exefile.exe` child + its
@@ -153,22 +159,41 @@ impl Drop for FakeEveHarness {
 }
 
 /// Activate one of the harness's fake EVE windows directly, bypassing
-/// Nicotine. SetForegroundWindow is the obvious choice; on modern
-/// Windows it's subject to focus-stealing restrictions, but our test
-/// process is the foreground one when we call this so it succeeds.
+/// Nicotine. On modern Windows `SetForegroundWindow` is denied unless
+/// the caller has input-chain rights (recently received user input,
+/// is the foreground process, etc.). Our test process running under
+/// `cargo test` on a CI runner usually has NONE of those — the runner
+/// agent or some background process owns the input chain. The
+/// canonical workaround: attach our thread's input queue to whatever
+/// process is currently foreground, perform SetForegroundWindow
+/// (which now succeeds because we share the foreground thread's
+/// queue), then detach.
+///
+/// Returns `Err` if the foreground didn't actually shift to `window`
+/// within a generous timeout — tests need to fail loudly here rather
+/// than silently proceeding with a stale foreground, because the
+/// daemon's later force_activate relies on the foreground being a
+/// known fake EVE window to attach to.
 pub fn activate_window_directly(window: u32) -> anyhow::Result<()> {
     let hwnd = HWND(window as usize as *mut std::ffi::c_void);
     unsafe {
-        // Best-effort: SetForegroundWindow can return FALSE under
-        // focus restrictions even when the foreground change DID
-        // happen. Don't error on FALSE; later assertions will reveal
-        // whether the activation actually landed.
+        let current_thread = GetCurrentThreadId();
+        let foreground = GetForegroundWindow();
+        let foreground_thread = if foreground.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, None)
+        };
+        let attached = foreground_thread != 0
+            && foreground_thread != current_thread
+            && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
         let _ = SetForegroundWindow(hwnd);
+        let _ = BringWindowToTop(hwnd);
+        if attached {
+            let _ = AttachThreadInput(current_thread, foreground_thread, false);
+        }
     }
-    // Poll GetForegroundWindow until it reflects our request or we
-    // time out. Mirrors the Linux activate_window_directly contract
-    // so tests see a deterministic starting focus.
-    let deadline = Instant::now() + Duration::from_millis(500);
+    let deadline = Instant::now() + Duration::from_millis(800);
     while Instant::now() < deadline {
         let current = unsafe { GetForegroundWindow() };
         if current == hwnd {
@@ -176,7 +201,40 @@ pub fn activate_window_directly(window: u32) -> anyhow::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    Ok(())
+    let final_fg = unsafe { GetForegroundWindow() };
+    anyhow::bail!(
+        "activate_window_directly: foreground didn't become {:?} within 800ms; \
+         final foreground = {:?}. The test runner may not allow cross-process \
+         foreground changes — check that the test isn't running in a \
+         service-isolated session.",
+        hwnd.0,
+        final_fg.0
+    )
+}
+
+/// Grant ALL processes the right to call `SetForegroundWindow`
+/// during the next user input event. This is the documented Windows
+/// API for automation: by default a process can only take foreground
+/// if it was the most-recent input chain owner, which our daemon
+/// isn't (we're injecting input from the *test* process, not the
+/// daemon process). Without this grant, the daemon's
+/// `SetForegroundWindow(target)` is refused by the OS even when the
+/// fallback `AttachThreadInput` dance is set up correctly.
+///
+/// Production users don't need this — a real mouse click is delivered
+/// to the actually-focused window, which gives the daemon's hook
+/// implicit foreground-stealing rights for the cycle's target. The
+/// grant is test-only and lasts only until the next input event.
+///
+/// `ASFW_ANY` is `u32::MAX` — see Microsoft's docs on
+/// `AllowSetForegroundWindow`. Failure (rare; happens if the
+/// calling process itself doesn't have foreground rights, e.g. when
+/// the desktop is locked) is best-effort; the assertion that follows
+/// will surface the underlying problem.
+pub fn grant_set_foreground_to_all() {
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
 }
 
 /// Read screen-space geometry (x, y, w, h) of a window. The Linux
@@ -242,4 +300,144 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     acc.found = Some(hwnd);
     // Returning FALSE from an EnumWindows callback halts the walk.
     windows::Win32::Foundation::FALSE
+}
+
+/// Synthetic input on Windows — wraps `SendInput`. Unlike the Linux
+/// uinput-backed counterpart, there's no virtual /dev/input/eventN
+/// node here; `SendInput` injects events directly into the system
+/// input queue, which is what `RegisterHotKey` watches and what the
+/// low-level mouse hook (`WH_MOUSE_LL`) intercepts. The struct is
+/// unit-shaped because there's no per-device state.
+///
+/// The API mirrors the Linux version so cross-platform test code can
+/// stay symmetric: `keyboard` / `mouse` "register" a logical set of
+/// keys/buttons (no-op on Windows, just for API parity),
+/// `devnode` returns `None` (Windows has no device path),
+/// `tap` / `tap_with_modifier` inject the events.
+pub struct VirtualInput;
+
+impl VirtualInput {
+    /// Construct a virtual keyboard. The `_keys` slice is ignored on
+    /// Windows (kept for API parity with Linux uinput, which needs to
+    /// pre-declare device capabilities). Returns immediately — there's
+    /// no async device-node provisioning to wait for.
+    pub fn keyboard(_keys: &[u16]) -> anyhow::Result<Self> {
+        Ok(VirtualInput)
+    }
+
+    /// Construct a virtual mouse. Same semantics as `keyboard` —
+    /// `_buttons` is ignored; SendInput doesn't require pre-declared
+    /// capabilities.
+    pub fn mouse(_buttons: &[u16]) -> anyhow::Result<Self> {
+        Ok(VirtualInput)
+    }
+
+    /// Linux returns the uinput `/dev/input/eventN` node here. On
+    /// Windows there is no equivalent — the daemon's hotkey
+    /// registration is global via `RegisterHotKey`, not bound to a
+    /// device path. Tests must skip the `keyboard_device_path` /
+    /// `mouse_device_path` config fields on Windows.
+    #[allow(dead_code)]
+    pub fn devnode(&self) -> Option<&PathBuf> {
+        None
+    }
+
+    /// Press + release a Win32 VIRTUAL_KEY (e.g. `0x7F` for VK_F16,
+    /// `0x70` for VK_F1). Inserted into the system input queue via
+    /// `SendInput`; the daemon's `RegisterHotKey`-registered thread
+    /// receives a `WM_HOTKEY` for any matching combination.
+    pub fn tap(&mut self, vk: u16) -> anyhow::Result<()> {
+        send_keys(&[(vk, true), (vk, false)])
+    }
+
+    /// Hold a modifier (e.g. `0x10` for VK_SHIFT), tap a key,
+    /// release the modifier. Order matches what a human types so
+    /// `RegisterHotKey`'s modifier mask sees the modifier as held
+    /// during the key event.
+    pub fn tap_with_modifier(&mut self, modifier_vk: u16, vk: u16) -> anyhow::Result<()> {
+        send_keys(&[
+            (modifier_vk, true),
+            (vk, true),
+            (vk, false),
+            (modifier_vk, false),
+        ])
+    }
+
+    /// Press + release a mouse X-button. Argument is the X-button
+    /// number: 1 = back (XBUTTON1), 2 = forward (XBUTTON2). The
+    /// daemon's low-level mouse hook reads the same encoding from
+    /// `MSLLHOOKSTRUCT::mouseData`.
+    pub fn tap_xbutton(&mut self, xbutton: u16) -> anyhow::Result<()> {
+        send_mouse_xbutton(xbutton)
+    }
+}
+
+/// Build a sequence of `INPUT_KEYBOARD` events and ship them in a
+/// single `SendInput` call. Atomic dispatch matters for modifier
+/// combos: the OS shouldn't see the key event without the modifier
+/// already-down.
+fn send_keys(events: &[(u16, bool)]) -> anyhow::Result<()> {
+    let inputs: Vec<INPUT> = events
+        .iter()
+        .map(|(vk, down)| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(*vk),
+                    wScan: 0,
+                    dwFlags: if *down {
+                        KEYBD_EVENT_FLAGS(0)
+                    } else {
+                        KEYEVENTF_KEYUP
+                    },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        })
+        .collect();
+    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if n as usize != events.len() {
+        anyhow::bail!(
+            "SendInput accepted {n} of {} events; UIPI may be blocking input",
+            events.len()
+        );
+    }
+    Ok(())
+}
+
+fn send_mouse_xbutton(xbutton: u16) -> anyhow::Result<()> {
+    let inputs = [
+        INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: xbutton as u32,
+                    dwFlags: MOUSEEVENTF_XDOWN,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: xbutton as u32,
+                    dwFlags: MOUSEEVENTF_XUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+    ];
+    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if n != 2 {
+        anyhow::bail!("SendInput accepted {n} of 2 mouse events");
+    }
+    Ok(())
 }
