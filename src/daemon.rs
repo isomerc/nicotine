@@ -164,6 +164,13 @@ impl Daemon {
         }
         #[cfg(windows)]
         let mut last_hotkey_sig = hotkey_sig(&self.config);
+        // Track enable_mouse_buttons separately so hot-reload can log
+        // when it flips. The atomic-store path that actually applies
+        // the change is cheap and unconditional; the log gate is only
+        // about observability (tests + users debugging "did my edit
+        // take effect").
+        #[cfg(windows)]
+        let mut last_mouse_enabled = self.config.enable_mouse_buttons;
 
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -203,6 +210,7 @@ impl Daemon {
                     {
                         let mut guard = mouse_config_clone.lock().unwrap();
                         if *guard != new_mouse {
+                            println!("Hot-reload: mouse config updated");
                             *guard = new_mouse;
                         }
                     }
@@ -210,6 +218,7 @@ impl Daemon {
                     {
                         let mut guard = keyboard_config_clone.lock().unwrap();
                         if *guard != new_keyboard {
+                            println!("Hot-reload: keyboard config updated");
                             *guard = new_keyboard;
                         }
                     }
@@ -221,14 +230,19 @@ impl Daemon {
                 {
                     let new_sig = hotkey_sig(&fresh_config);
                     if new_sig != last_hotkey_sig {
+                        println!("Hot-reload: hotkey config updated");
                         crate::windows_input::resume_hotkeys();
                         last_hotkey_sig = new_sig;
                     }
-                    // Mouse-cycle toggle hot-reload. Atomic store is
-                    // cheap; no need to gate on a change check.
-                    crate::windows_input::set_mouse_cycle_enabled(
-                        fresh_config.enable_mouse_buttons,
-                    );
+                    // Mouse-cycle toggle. The atomic store is cheap,
+                    // so apply unconditionally; the change-gated log
+                    // is just for observability.
+                    let new_mouse_enabled = fresh_config.enable_mouse_buttons;
+                    if new_mouse_enabled != last_mouse_enabled {
+                        println!("Hot-reload: mouse config updated");
+                        last_mouse_enabled = new_mouse_enabled;
+                    }
+                    crate::windows_input::set_mouse_cycle_enabled(new_mouse_enabled);
                 }
             }
         });

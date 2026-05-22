@@ -83,6 +83,10 @@ unsafe extern "system" fn enum_collect_eve(hwnd: HWND, lparam: LPARAM) -> BOOL {
 fn force_activate(target: HWND) {
     unsafe {
         let foreground = GetForegroundWindow();
+        debug_input(format_args!(
+            "force_activate: target={:?} foreground={:?}",
+            target.0, foreground.0
+        ));
         if foreground == target {
             // Already focused — skip everything. Common case for repeated
             // hotkey presses against the active window.
@@ -96,14 +100,27 @@ fn force_activate(target: HWND) {
         }
 
         // Fast path: try direct SetForegroundWindow first.
-        if SetForegroundWindow(target).as_bool() {
+        let fast_ok = SetForegroundWindow(target).as_bool();
+        debug_input(format_args!(
+            "force_activate: fast SetForegroundWindow={fast_ok}"
+        ));
+        if fast_ok {
             return;
         }
 
-        // Fallback path: Windows refused the foreground change. Briefly
-        // attach our thread's input queue to the target and current
-        // foreground's queues so we look like the same input session.
-        let target_thread = GetWindowThreadProcessId(target, None);
+        // Fallback path: Windows refused the foreground change.
+        // Standard MS workaround — attach our thread's input queue to
+        // the CURRENT FOREGROUND THREAD only. That thread is the
+        // "input owner" Windows uses to decide who can call
+        // SetForegroundWindow; once we share its queue, our call is
+        // treated as if it came from the foreground process itself.
+        //
+        // Earlier versions also attached to the target thread; that
+        // turns out to be both unnecessary AND actively harmful —
+        // AttachThreadInput limits each thread to at most one
+        // attachment, so attaching to the target first prevents the
+        // subsequent attach to the foreground thread, which is the
+        // one that actually grants foreground-stealing rights.
         let current_thread = GetCurrentThreadId();
         let foreground_thread = if foreground.0.is_null() {
             0
@@ -111,26 +128,34 @@ fn force_activate(target: HWND) {
             GetWindowThreadProcessId(foreground, None)
         };
 
-        // Gate the AttachThreadInput calls on the pure attach-eligibility
-        // rule (nonzero, not self, not already attached). See
-        // `windows_helpers::should_attach_thread_input` for the rule and
-        // its tests.
-        let attached_target = should_attach_thread_input(target_thread, current_thread, &[])
-            && AttachThreadInput(current_thread, target_thread, true).as_bool();
-        let attached_foreground =
-            should_attach_thread_input(foreground_thread, current_thread, &[target_thread])
-                && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
+        let attached = should_attach_thread_input(foreground_thread, current_thread, &[])
+            && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
+        debug_input(format_args!(
+            "force_activate: attached_foreground={attached} \
+             foreground_thread={foreground_thread} current_thread={current_thread}"
+        ));
 
-        let _ = SetForegroundWindow(target);
+        let sfw = SetForegroundWindow(target).as_bool();
         let _ = BringWindowToTop(target);
         let _ = SetFocus(Some(target));
+        let final_foreground = GetForegroundWindow();
+        debug_input(format_args!(
+            "force_activate: fallback SetForegroundWindow={sfw} final_foreground={:?}",
+            final_foreground.0
+        ));
 
-        if attached_target {
-            let _ = AttachThreadInput(current_thread, target_thread, false);
-        }
-        if attached_foreground {
+        if attached {
             let _ = AttachThreadInput(current_thread, foreground_thread, false);
         }
+    }
+}
+
+/// Diagnostic helper gated by `NICOTINE_DEBUG_INPUT`. Used by
+/// integration tests to instrument the activate path. Production
+/// users only see these lines if they explicitly set the env var.
+fn debug_input(args: std::fmt::Arguments) {
+    if std::env::var_os("NICOTINE_DEBUG_INPUT").is_some() {
+        eprintln!("{}", args);
     }
 }
 

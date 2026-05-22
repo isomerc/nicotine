@@ -226,7 +226,22 @@ fn default_display_mode() -> DisplayMode {
 }
 
 impl Config {
+    /// Resolve the directory holding `config.toml`. Production callers
+    /// get the platform-standard config dir (XDG on Linux, Roaming
+    /// APPDATA on Windows) under a `nicotine` subdir.
+    ///
+    /// Integration tests set `NICOTINE_CONFIG_DIR` to a private temp
+    /// directory so the test daemon reads/writes a config isolated
+    /// from the user's real one. Necessary because on Windows
+    /// `dirs::config_dir()` uses `SHGetKnownFolderPath`, which
+    /// returns the canonical user folder regardless of the `APPDATA`
+    /// env var — so env-overriding APPDATA alone doesn't isolate.
+    /// The override IS the full directory (no implicit `nicotine`
+    /// subdir suffix), matching the value the test fixture provides.
     fn config_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("NICOTINE_CONFIG_DIR") {
+            return PathBuf::from(dir);
+        }
         let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         path.push("nicotine");
         path

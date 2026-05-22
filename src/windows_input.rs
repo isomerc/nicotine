@@ -112,10 +112,17 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         // High word of mouseData identifies the X button: 1 = XBUTTON1 (back),
         // 2 = XBUTTON2 (forward).
         let xbutton = ((info.mouseData >> 16) & 0xFFFF) as u16;
+        debug_input(format_args!(
+            "mouse_hook_proc: WM_XBUTTONDOWN raw={:#010x} xbutton={} flags={:#x}",
+            info.mouseData, xbutton, info.flags
+        ));
 
         // Pass-through when cycling is disabled (user set
         // enable_mouse_buttons = false in config).
         if !MOUSE_CYCLE_ENABLED.load(Ordering::Acquire) {
+            debug_input(format_args!(
+                "mouse_hook_proc: MOUSE_CYCLE_ENABLED=false, pass-through"
+            ));
             return CallNextHookEx(None, code, wparam, lparam);
         }
 
@@ -127,15 +134,39 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         CycleDirection::Backward => WM_USER_BACKWARD,
                     }
                 });
+            debug_input(format_args!(
+                "mouse_hook_proc: classify xbutton={} fwd={} back={} -> post={:?}",
+                xbutton, ctx.forward_button, ctx.backward_button, post
+            ));
 
             if let Some(msg) = post {
-                // PostThreadMessageW returns false if the thread queue is
+                // PostThreadMessageW returns Err if the thread queue is
                 // unavailable (e.g. listener has exited). Best-effort.
-                let _ = PostThreadMessageW(ctx.listener_thread_id, msg, WPARAM(0), LPARAM(0));
+                let result = PostThreadMessageW(ctx.listener_thread_id, msg, WPARAM(0), LPARAM(0));
+                debug_input(format_args!(
+                    "mouse_hook_proc: PostThreadMessageW tid={} msg={:#x} result={:?}",
+                    ctx.listener_thread_id, msg, result
+                ));
             }
+        } else {
+            debug_input(format_args!("mouse_hook_proc: HOOK_CTX unset"));
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
+}
+
+/// Diagnostic logging gated by `NICOTINE_DEBUG_INPUT`. Used by
+/// integration tests to instrument the mouse-hook -> listener ->
+/// cycle pipeline so a failing test can pinpoint which step dropped
+/// the event. Production users never see these lines unless they
+/// explicitly set the env var. eprintln from a low-level hook is
+/// safe (the hook proc runs on the installing thread, which is also
+/// the message-pump thread, but nothing in stdio takes locks that
+/// would re-enter the hook).
+fn debug_input(args: std::fmt::Arguments) {
+    if std::env::var_os("NICOTINE_DEBUG_INPUT").is_some() {
+        eprintln!("{}", args);
+    }
 }
 
 /// Translate a planner-output ModifierKind into the Win32
@@ -253,9 +284,11 @@ fn run_listener(
             _ => None,
         };
         if let Some(direction) = cycle {
+            debug_input(format_args!("listener: cycle direction={:?}", direction));
             let minimize_inactive = minimize_inactive_lookup();
-            if let Err(e) = perform_cycle(&wm, &state, direction, minimize_inactive) {
-                eprintln!("Cycle action failed: {}", e);
+            match perform_cycle(&wm, &state, direction, minimize_inactive) {
+                Ok(()) => debug_input(format_args!("listener: perform_cycle OK")),
+                Err(e) => eprintln!("Cycle action failed: {}", e),
             }
             continue;
         }
