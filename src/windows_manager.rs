@@ -1,13 +1,11 @@
 use crate::config::Config;
+use crate::eve_match::pid_is_eve_client;
 use crate::window_manager::{EveWindow, WindowManager};
+use crate::windows_helpers::should_attach_thread_input;
 use anyhow::{Context, Result};
 use std::ffi::c_void;
-use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, TRUE, WPARAM};
-use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
-    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE, WPARAM};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
@@ -44,36 +42,6 @@ fn read_window_title(hwnd: HWND) -> String {
         return String::new();
     }
     String::from_utf16_lossy(&buf[..copied as usize])
-}
-
-/// Process-name filter for EVE clients. The title-only check
-/// `starts_with("EVE - ")` is satisfied by browser tabs, Discord
-/// channels, and other apps that happen to use that prefix in their
-/// window title. The reliable signal is that the owning process's
-/// image is `exefile.exe` — the actual EVE client binary.
-fn pid_is_eve_client(pid: u32) -> bool {
-    unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
-            return false;
-        };
-        let mut buf = [0u16; 1024];
-        let mut size = buf.len() as u32;
-        let result = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_FORMAT(0),
-            PWSTR(buf.as_mut_ptr()),
-            &mut size,
-        );
-        let _ = CloseHandle(handle);
-        if result.is_err() {
-            return false;
-        }
-        let path = String::from_utf16_lossy(&buf[..size as usize]);
-        path.rsplit('\\')
-            .next()
-            .map(|name| name.eq_ignore_ascii_case("exefile.exe"))
-            .unwrap_or(false)
-    }
 }
 
 unsafe extern "system" fn enum_collect_eve(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -143,13 +111,15 @@ fn force_activate(target: HWND) {
             GetWindowThreadProcessId(foreground, None)
         };
 
-        let attached_target = target_thread != 0
-            && target_thread != current_thread
+        // Gate the AttachThreadInput calls on the pure attach-eligibility
+        // rule (nonzero, not self, not already attached). See
+        // `windows_helpers::should_attach_thread_input` for the rule and
+        // its tests.
+        let attached_target = should_attach_thread_input(target_thread, current_thread, &[])
             && AttachThreadInput(current_thread, target_thread, true).as_bool();
-        let attached_foreground = foreground_thread != 0
-            && foreground_thread != current_thread
-            && foreground_thread != target_thread
-            && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
+        let attached_foreground =
+            should_attach_thread_input(foreground_thread, current_thread, &[target_thread])
+                && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
 
         let _ = SetForegroundWindow(target);
         let _ = BringWindowToTop(target);
