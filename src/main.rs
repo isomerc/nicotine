@@ -324,6 +324,35 @@ fn main() -> Result<()> {
             daemon.run()?;
         }
 
+        "list" | "windows" => {
+            // Diagnostic: print the EVE clients Nicotine currently
+            // detects, one per line as `<id>\t<title>`. Useful when a
+            // user reports "my client isn't showing up" — they can
+            // compare this list against what they expect to see. Also
+            // the entry point fake-EVE integration tests use to verify
+            // the enumeration + filter pipeline end-to-end without
+            // booting the real game.
+            let windows = wm.get_eve_windows()?;
+            for w in &windows {
+                println!("{}\t{}", w.id, w.title);
+            }
+        }
+
+        "active" => {
+            // Diagnostic: print the currently-focused EVE client as
+            // `<id>\t<title>`, or nothing (empty output, exit 0) if
+            // the focused window isn't an EVE client. Integration
+            // tests rely on this to assert that cycle / switch
+            // operations changed focus to the expected client.
+            let active = wm.get_active_window().unwrap_or(0);
+            if active != 0 {
+                let windows = wm.get_eve_windows()?;
+                if let Some(w) = windows.iter().find(|w| w.id == active) {
+                    println!("{}\t{}", w.id, w.title);
+                }
+            }
+        }
+
         "stack" => {
             println!("Stacking EVE windows...");
             let windows = wm.get_eve_windows()?;
@@ -407,6 +436,10 @@ fn main() -> Result<()> {
                 println!();
                 println!("Advanced:");
                 println!("  nicotine daemon        - Start daemon only (headless)");
+                println!("  nicotine list          - Print detected EVE clients (diagnostic)");
+                println!(
+                    "  nicotine active        - Print currently-focused EVE client (diagnostic)"
+                );
                 println!();
                 println!("Quick start:");
                 println!("  nicotine start         # Starts in background automatically");

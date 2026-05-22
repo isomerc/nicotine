@@ -6,20 +6,29 @@ use interprocess::local_socket::{
 use std::io::Write;
 
 #[cfg(unix)]
-const SOCKET_PRINTNAME: &str = "/tmp/nicotine.sock";
+const DEFAULT_SOCKET_PRINTNAME: &str = "/tmp/nicotine.sock";
 #[cfg(windows)]
-const SOCKET_PRINTNAME: &str = "nicotine.sock";
+const DEFAULT_SOCKET_PRINTNAME: &str = "nicotine.sock";
+
+/// Resolve the socket / named-pipe path. Honors `NICOTINE_SOCKET_PATH`
+/// when set so integration tests can run an isolated daemon without
+/// clashing with a user's real daemon on the default path. Production
+/// callers leave the env var unset and get the original behavior.
+fn socket_printname() -> String {
+    std::env::var("NICOTINE_SOCKET_PATH").unwrap_or_else(|_| DEFAULT_SOCKET_PRINTNAME.to_string())
+}
 
 fn socket_name() -> Result<interprocess::local_socket::Name<'static>> {
+    let printname = socket_printname();
     #[cfg(unix)]
     {
-        SOCKET_PRINTNAME
+        printname
             .to_fs_name::<GenericFilePath>()
             .context("Failed to construct socket name")
     }
     #[cfg(windows)]
     {
-        SOCKET_PRINTNAME
+        printname
             .to_ns_name::<GenericNamespaced>()
             .context("Failed to construct named pipe name")
     }
@@ -28,7 +37,7 @@ fn socket_name() -> Result<interprocess::local_socket::Name<'static>> {
 pub fn bind_listener() -> Result<interprocess::local_socket::Listener> {
     // Remove stale Unix socket file from a previous run (no-op on Windows named pipes).
     #[cfg(unix)]
-    let _ = std::fs::remove_file(SOCKET_PRINTNAME);
+    let _ = std::fs::remove_file(socket_printname());
 
     let name = socket_name()?;
     ListenerOptions::new()

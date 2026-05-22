@@ -273,18 +273,29 @@ impl WindowManager for KWinManager {
     }
 
     fn get_active_window(&self) -> Result<u32> {
-        // Use xdotool to get active window (works through XWayland)
-        let output = Command::new("xdotool")
-            .arg("getactivewindow")
-            .output()
-            .context("Failed to get active window")?;
-
-        let window_id = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u32>()
-            .context("Failed to parse active window ID")?;
-
-        Ok(window_id)
+        // Read _NET_ACTIVE_WINDOW directly via x11rb under XWayland.
+        // Previously shelled out to `xdotool getactivewindow`, which
+        // added a runtime dep and silently no-op'd the daemon's
+        // sync_with_active path on systems without xdotool installed —
+        // the cycle would drift when the user clicked an EVE client
+        // directly. The x11rb path matches what X11Manager already
+        // does and reuses the connection + atom we cache in new().
+        let root = self.conn.setup().roots[self.screen_num].root;
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                root,
+                self.net_active_window_atom,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )
+            .context("get_property _NET_ACTIVE_WINDOW")?
+            .reply()
+            .context("get_property reply")?;
+        let active = reply.value32().and_then(|mut v| v.next()).unwrap_or(0);
+        Ok(active)
     }
 
     fn minimize_window(&self, window_id: u32) -> Result<()> {

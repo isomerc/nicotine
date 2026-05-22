@@ -65,7 +65,7 @@ eframe = { version = "0.29", default-features = false, features = [
 # regardless of feature unification.
 winit = "0.30"
 daemonize = "0.5"
-nix = { version = "0.29", features = ["fs", "poll"] }
+nix = { version = "0.29", features = ["fs", "poll", "process", "signal"] }
 evdev = "0.12"
 # Narrow Wayland-client dep for xdg-activation tokens only. The protocol
 # is how a non-Wayland client (we're X11-through-XWayland) hands the
