@@ -103,3 +103,22 @@ jobs:
           # background processes after the test step.
           kill $OPENBOX_PID $XVFB_PID 2>/dev/null || true
           exit $STATUS
+
+  integration-windows:
+    name: Integration tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # GitHub's windows-latest runners have a graphical session
+      # available by default; no Xvfb-equivalent setup needed. The
+      # fake-EVE harness creates real top-level windows via
+      # CreateWindowExW; the test daemon talks to them over the same
+      # Win32 enumeration path Nicotine itself uses.
+      - name: Run integration tests
+        shell: bash
+        run: cargo test --test fake_eve -- --ignored --test-threads=1 --nocapture

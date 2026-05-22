@@ -14,8 +14,11 @@
 //! an isolated socket + runtime dir + config dir, so multiple tests
 //! can run in parallel and the user's real running daemon is never
 //! disturbed.
-
-#![cfg(unix)]
+//!
+//! Cross-platform: the harness module (`common`) re-exports
+//! `FakeEveHarness` from its `unix` or `windows` submodule depending
+//! on the target. Test bodies assert via `nicotine list` /
+//! `nicotine active` stdout, which is identical across platforms.
 
 mod common;
 
@@ -45,6 +48,22 @@ fn names_from_list_output(stdout: &str) -> HashSet<String> {
         .lines()
         .filter_map(|line| line.split('\t').nth(1))
         .map(|s| s.to_string())
+        .collect()
+}
+
+/// Ordered list of EVE client names as `nicotine list` reports them.
+/// Same enumeration the daemon will use on its NEXT tick to drive
+/// cycle / switch. The order is platform-dependent: Linux X11
+/// `_NET_CLIENT_LIST` is map-time-stable (doesn't shift when a
+/// window gets focus); Windows `EnumWindows` returns top-of-Z-order
+/// first, so activating a window moves it to the front of the list.
+/// Tests that anchor + cycle must re-read the order AFTER any
+/// activation so assertions match what the daemon actually sees.
+fn daemon_list_order(daemon: &TestDaemon) -> Vec<String> {
+    daemon
+        .nicotine_stdout(&["list"])
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1).map(String::from))
         .collect()
 }
 
@@ -106,42 +125,40 @@ fn cycle_forward_advances_focus_to_next_eve_client() {
         return;
     }
 
-    // The order the daemon iterates is whatever _NET_CLIENT_LIST
-    // returns — typically map-time order on most WMs, but we don't
-    // depend on a specific value. Instead, we anchor on one client
-    // as the starting focus, capture the daemon's view of the order,
-    // and assert the post-cycle active client is the NEXT entry in
-    // that captured order.
     let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("set up harness");
     let daemon = TestDaemon::spawn().expect("spawn test daemon");
 
-    // The order nicotine sees is what governs cycle direction.
-    let order_stdout = daemon.nicotine_stdout(&["list"]);
-    let ordered_names: Vec<String> = order_stdout
-        .lines()
-        .filter_map(|line| line.split('\t').nth(1).map(String::from))
-        .collect();
+    let initial_order = daemon_list_order(&daemon);
     assert_eq!(
-        ordered_names.len(),
+        initial_order.len(),
         3,
-        "daemon should see all 3 fake EVE clients, saw {ordered_names:?}"
+        "daemon should see all 3 fake EVE clients, saw {initial_order:?}"
     );
 
     // Anchor focus on the MIDDLE client (index 1) so the test
-    // exercises sync_with_active — the daemon has to read the current
-    // active window via get_active_window() before advancing.
-    // Anchoring on index 0 wouldn't distinguish "sync works" from
-    // "sync broken but internal index happened to start at 0" because
-    // both paths would still land on index 1 after forward.
-    let anchor_name = &ordered_names[1];
+    // exercises sync_with_active — the daemon has to read the
+    // current active window via get_active_window() before advancing.
+    let anchor_name = initial_order[1].clone();
     let anchor_id = harness
         .clients
         .iter()
-        .find(|c| c.name == *anchor_name)
+        .find(|c| c.name == anchor_name)
         .map(|c| c.window)
         .expect("harness contains the anchor client");
     activate_window_directly(anchor_id).expect("set initial focus");
     daemon.wait_for_enum_tick();
+
+    // Re-read order AFTER activation. The daemon iterates on its
+    // next tick using the platform-native enumeration order; on
+    // Windows that's Z-ordered, so the activated anchor is now at
+    // the front of the list. The forward step lands on whatever's
+    // next in that post-activation order.
+    let post_order = daemon_list_order(&daemon);
+    let anchor_pos = post_order
+        .iter()
+        .position(|n| n == &anchor_name)
+        .unwrap_or_else(|| panic!("anchor {anchor_name:?} missing from post-order {post_order:?}"));
+    let expected_next = post_order[(anchor_pos + 1) % post_order.len()].clone();
 
     daemon.send("forward").expect("send forward command");
     // The cycle is synchronous on the daemon side once the
@@ -151,9 +168,8 @@ fn cycle_forward_advances_focus_to_next_eve_client() {
 
     let active = daemon.active_client_name().unwrap_or_default();
     assert_eq!(
-        active, ordered_names[2],
-        "expected forward from {} (index 1) to advance to {} (index 2), got {:?}",
-        ordered_names[1], ordered_names[2], active
+        active, expected_next,
+        "forward from {anchor_name:?} should advance to next in post-activation order {post_order:?}; got {active:?}"
     );
 }
 
@@ -167,31 +183,34 @@ fn cycle_backward_advances_focus_to_previous_eve_client() {
     let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("set up harness");
     let daemon = TestDaemon::spawn().expect("spawn test daemon");
 
-    let order_stdout = daemon.nicotine_stdout(&["list"]);
-    let ordered_names: Vec<String> = order_stdout
-        .lines()
-        .filter_map(|line| line.split('\t').nth(1).map(String::from))
-        .collect();
-    assert_eq!(ordered_names.len(), 3);
+    let initial_order = daemon_list_order(&daemon);
+    assert_eq!(initial_order.len(), 3);
 
-    let middle_name = &ordered_names[1];
-    let middle_id = harness
+    let anchor_name = initial_order[1].clone();
+    let anchor_id = harness
         .clients
         .iter()
-        .find(|c| c.name == *middle_name)
+        .find(|c| c.name == anchor_name)
         .map(|c| c.window)
         .expect("harness contains the middle client");
-    activate_window_directly(middle_id).expect("set initial focus");
+    activate_window_directly(anchor_id).expect("set initial focus");
     daemon.wait_for_enum_tick();
+
+    let post_order = daemon_list_order(&daemon);
+    let anchor_pos = post_order
+        .iter()
+        .position(|n| n == &anchor_name)
+        .unwrap_or_else(|| panic!("anchor {anchor_name:?} missing from post-order {post_order:?}"));
+    let len = post_order.len();
+    let expected_prev = post_order[(anchor_pos + len - 1) % len].clone();
 
     daemon.send("backward").expect("send backward command");
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     let active = daemon.active_client_name().unwrap_or_default();
     assert_eq!(
-        active, ordered_names[0],
-        "expected backward from {} to land on {}, got {:?}",
-        ordered_names[1], ordered_names[0], active
+        active, expected_prev,
+        "backward from {anchor_name:?} should land on prev in post-activation order {post_order:?}; got {active:?}"
     );
 }
 
@@ -205,34 +224,36 @@ fn switch_to_n_focuses_the_nth_client() {
     let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("set up harness");
     let daemon = TestDaemon::spawn().expect("spawn test daemon");
 
-    let order_stdout = daemon.nicotine_stdout(&["list"]);
-    let ordered_names: Vec<String> = order_stdout
-        .lines()
-        .filter_map(|line| line.split('\t').nth(1).map(String::from))
-        .collect();
-    assert_eq!(ordered_names.len(), 3);
+    let initial_order = daemon_list_order(&daemon);
+    assert_eq!(initial_order.len(), 3);
 
-    // Anchor: focus the first listed client. switch:N is 1-indexed
-    // on the wire (the CLI shorthand `nicotine 2` maps to index 2);
-    // assert it lands on the 1-indexed target regardless of where we
-    // started.
+    // Anchor: focus the first listed client. The activation also
+    // serves as a "bootstrap" — without ever activating something
+    // from this test process, Windows refuses to let the daemon
+    // change foreground later (no input-chain ownership). Linux is
+    // tolerant either way; doing it on both keeps the test symmetric.
+    let first_name = initial_order[0].clone();
     let first_id = harness
         .clients
         .iter()
-        .find(|c| c.name == ordered_names[0])
+        .find(|c| c.name == first_name)
         .map(|c| c.window)
         .unwrap();
     activate_window_directly(first_id).unwrap();
     daemon.wait_for_enum_tick();
+
+    // Re-read after the activation; switch:N walks the daemon's
+    // current enumeration order, which on Windows shifts after focus.
+    let post_order = daemon_list_order(&daemon);
+    let expected = post_order[1].clone();
 
     daemon.send("switch:2").expect("send switch:2");
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     let active = daemon.active_client_name().unwrap_or_default();
     assert_eq!(
-        active, ordered_names[1],
-        "switch:2 (1-indexed) should land on the 2nd listed client ({}), got {:?}",
-        ordered_names[1], active
+        active, expected,
+        "switch:2 (1-indexed) should land on the 2nd in post-activation order {post_order:?}; got {active:?}"
     );
 }
 
@@ -378,37 +399,41 @@ fn cycle_forward_wraps_around_from_last_to_first() {
         return;
     }
 
-    // Anchoring on the LAST listed client and forwarding should
-    // wrap to the FIRST. This catches off-by-one bugs in the cycle
-    // index arithmetic — easy to introduce when refactoring
-    // CycleState::cycle_forward.
+    // Anchor on the LAST listed client. After activation the daemon
+    // sees that anchor at the front of its order on platforms with
+    // Z-order-based enumeration (Windows); the forward step lands on
+    // whatever's next in that post-activation order. The "wrap"
+    // framing matches Linux behavior where the order is stable.
     let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("set up harness");
     let daemon = TestDaemon::spawn().expect("spawn test daemon");
 
-    let order_stdout = daemon.nicotine_stdout(&["list"]);
-    let ordered_names: Vec<String> = order_stdout
-        .lines()
-        .filter_map(|line| line.split('\t').nth(1).map(String::from))
-        .collect();
-    assert_eq!(ordered_names.len(), 3);
+    let initial_order = daemon_list_order(&daemon);
+    assert_eq!(initial_order.len(), 3);
 
-    let last_id = harness
+    let anchor_name = initial_order.last().unwrap().clone();
+    let anchor_id = harness
         .clients
         .iter()
-        .find(|c| c.name == *ordered_names.last().unwrap())
+        .find(|c| c.name == anchor_name)
         .map(|c| c.window)
         .unwrap();
-    activate_window_directly(last_id).unwrap();
+    activate_window_directly(anchor_id).unwrap();
     daemon.wait_for_enum_tick();
+
+    let post_order = daemon_list_order(&daemon);
+    let anchor_pos = post_order
+        .iter()
+        .position(|n| n == &anchor_name)
+        .unwrap_or_else(|| panic!("anchor {anchor_name:?} missing from {post_order:?}"));
+    let expected_next = post_order[(anchor_pos + 1) % post_order.len()].clone();
 
     daemon.send("forward").expect("send forward");
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     let active = daemon.active_client_name().unwrap_or_default();
     assert_eq!(
-        active, ordered_names[0],
-        "forward from last should wrap to first; got {:?}, expected {}",
-        active, ordered_names[0]
+        active, expected_next,
+        "forward from {anchor_name:?} should advance in post-activation order {post_order:?}; got {active:?}"
     );
 }
 
@@ -422,31 +447,34 @@ fn cycle_backward_wraps_around_from_first_to_last() {
     let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("set up harness");
     let daemon = TestDaemon::spawn().expect("spawn test daemon");
 
-    let order_stdout = daemon.nicotine_stdout(&["list"]);
-    let ordered_names: Vec<String> = order_stdout
-        .lines()
-        .filter_map(|line| line.split('\t').nth(1).map(String::from))
-        .collect();
-    assert_eq!(ordered_names.len(), 3);
+    let initial_order = daemon_list_order(&daemon);
+    assert_eq!(initial_order.len(), 3);
 
-    let first_id = harness
+    let anchor_name = initial_order[0].clone();
+    let anchor_id = harness
         .clients
         .iter()
-        .find(|c| c.name == ordered_names[0])
+        .find(|c| c.name == anchor_name)
         .map(|c| c.window)
         .unwrap();
-    activate_window_directly(first_id).unwrap();
+    activate_window_directly(anchor_id).unwrap();
     daemon.wait_for_enum_tick();
+
+    let post_order = daemon_list_order(&daemon);
+    let anchor_pos = post_order
+        .iter()
+        .position(|n| n == &anchor_name)
+        .unwrap_or_else(|| panic!("anchor {anchor_name:?} missing from {post_order:?}"));
+    let len = post_order.len();
+    let expected_prev = post_order[(anchor_pos + len - 1) % len].clone();
 
     daemon.send("backward").expect("send backward");
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     let active = daemon.active_client_name().unwrap_or_default();
     assert_eq!(
-        active,
-        *ordered_names.last().unwrap(),
-        "backward from first should wrap to last; got {:?}",
-        active
+        active, expected_prev,
+        "backward from {anchor_name:?} should wrap in post-activation order {post_order:?}; got {active:?}"
     );
 }
 
@@ -517,8 +545,18 @@ fn switch_uses_character_order_from_config_after_hot_reload() {
     // the new order, switch:1 should land on Gamma, not Alpha —
     // proving (a) hot-reload of `characters` works and (b) switch_to
     // uses the configured order, not the WM enumeration order.
-    let _harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
     let daemon = TestDaemon::spawn().expect("daemon");
+
+    // Bootstrap the input chain by activating any fake first. Without
+    // this, on Windows the daemon's later SetForegroundWindow call
+    // (inside switch_to → activate_window) is silently denied because
+    // the test process never relinquished foreground to a window the
+    // daemon knows about. Linux doesn't need the bootstrap but it's
+    // harmless there.
+    let bootstrap_id = harness.clients[0].window;
+    activate_window_directly(bootstrap_id).expect("bootstrap activate");
+    daemon.wait_for_enum_tick();
 
     let custom = "\
 display_width = 1920

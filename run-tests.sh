@@ -41,11 +41,19 @@ run_unit() {
 
 run_integration() {
     echo
-    echo "=== Integration tests (X11 fake-EVE) ==="
-    if [ -z "${DISPLAY:-}" ]; then
-        echo "WARN: \$DISPLAY is not set; integration tests will skip themselves."
-        echo "      Run from a desktop terminal (KDE / GNOME / Sway / etc.)."
-    fi
+    echo "=== Integration tests (fake-EVE harness) ==="
+    # The harness creates real OS windows + spawns the daemon; on
+    # Linux it needs $DISPLAY pointing at an X server (the daemon's
+    # KWinManager / X11Manager require it). On Windows the runner
+    # has a graphical session by default.
+    case "$(uname -s)" in
+        Linux|*BSD)
+            if [ -z "${DISPLAY:-}" ]; then
+                echo "WARN: \$DISPLAY is not set; integration tests will skip themselves."
+                echo "      Run from a desktop terminal (KDE / GNOME / Sway / etc.)."
+            fi
+            ;;
+    esac
     cargo test --test fake_eve -- --ignored --test-threads=1 --nocapture
 }
 

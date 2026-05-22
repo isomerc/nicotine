@@ -1,279 +1,82 @@
-//! Test fixture: spin up "fake EVE" — real X11 windows with the
-//! title shape Nicotine looks for, backed by real processes whose
-//! `/proc/<pid>/comm` reads as `exefile.exe`. This is enough state to
-//! exercise the full enumeration + filtering path (`get_eve_windows`,
-//! `pid_is_eve_client`) without launching the actual game.
+//! Cross-platform test fixtures + the daemon-driver type.
 //!
-//! The child processes are created via `fork()` + `prctl(PR_SET_NAME)`
-//! rather than by spawning an external binary — that sidesteps the
-//! coreutils-sleep multi-call problem (it overwrites its own comm
-//! based on argv[0] after the kernel sets the initial value).
-//!
-//! Cleanup runs on `Drop`: child processes are killed and reaped;
-//! X11 windows go away with the connection. The fixture is
-//! Linux-only (X11 + /proc + Linux-specific prctl).
+//! Platform-specific fake-EVE harnesses live in `unix.rs` and
+//! `windows.rs`; this module re-exports them so tests can use
+//! `FakeEveHarness` / `activate_window_directly` / `window_root_geometry`
+//! without knowing which platform they're on. `TestDaemon` is itself
+//! cross-platform (uses the `interprocess` crate's local-socket API)
+//! and lives here.
 
-#![cfg(unix)]
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub use unix::*;
 
-use nix::libc;
-use nix::sys::prctl;
-use nix::sys::signal::{kill, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag};
-use nix::unistd::{fork, ForkResult, Pid};
-use std::ffi::CStr;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::*;
+
 use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::*;
-use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as _;
 
-const FAKE_COMM: &CStr = c"exefile.exe";
+#[cfg(unix)]
+use interprocess::local_socket::GenericFilePath;
+#[cfg(windows)]
+use interprocess::local_socket::GenericNamespaced;
+use interprocess::local_socket::{prelude::*, Stream};
 
-/// One fake EVE client: a forked child whose comm is `exefile.exe`,
-/// paired with a real X11 window whose title is `EVE - <name>` and
-/// whose `_NET_WM_PID` points at that child. Fields are public so
-/// future tests can match on pid/window IDs; the existing two only
-/// read `name` indirectly via the harness so the unused-field warning
-/// would fire without this allow.
-#[allow(dead_code)]
-pub struct FakeEveClient {
-    pub name: String,
-    pub pid: u32,
-    pub window: u32,
-}
-
-/// Owns the fixture. Holding this alive holds the windows + processes
-/// alive; dropping it tears both down.
-pub struct FakeEveHarness {
-    pub clients: Vec<FakeEveClient>,
-    conn: RustConnection,
-}
-
-impl FakeEveHarness {
-    /// Build a harness with one fake client per name. The names are
-    /// what should appear after "EVE - " in window titles.
-    pub fn new(names: &[&str]) -> anyhow::Result<Self> {
-        let (conn, screen_num) = RustConnection::connect(None)?;
-        let screen = &conn.setup().roots[screen_num];
-        let root = screen.root;
-
-        let net_wm_name = conn.intern_atom(false, b"_NET_WM_NAME")?.reply()?.atom;
-        let utf8_string = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
-        let net_wm_pid = conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
-
-        let mut clients = Vec::with_capacity(names.len());
-        for (idx, name) in names.iter().enumerate() {
-            let pid = spawn_fake_eve_process()?;
-
-            let window = conn.generate_id()?;
-            // Bigger than 1x1 with a non-zero background — KWin under
-            // Wayland XWayland refuses to focus windows that don't
-            // have a real surface to back them. A 1x1 window with no
-            // background_pixel got created, mapped, but never gave
-            // KWin a Wayland surface to assign focus to, which broke
-            // the cycle / switch tests with no active client visible
-            // post-activation. 320x200 + a solid background_pixel is
-            // enough for KWin to spin up a surface; size is still
-            // small enough not to be visually intrusive during tests.
-            // Offset each window so they don't all overlap (helps
-            // the WM treat them as independent toplevels).
-            let aux = CreateWindowAux::new().background_pixel(screen.black_pixel);
-            conn.create_window(
-                x11rb::COPY_DEPTH_FROM_PARENT,
-                window,
-                root,
-                (idx as i16) * 20,
-                0,
-                320,
-                200,
-                0,
-                WindowClass::INPUT_OUTPUT,
-                0,
-                &aux,
-            )?;
-
-            let title = format!("EVE - {}", name);
-            conn.change_property(
-                PropMode::REPLACE,
-                window,
-                net_wm_name,
-                utf8_string,
-                8,
-                title.len() as u32,
-                title.as_bytes(),
-            )?;
-            conn.change_property32(
-                PropMode::REPLACE,
-                window,
-                net_wm_pid,
-                AtomEnum::CARDINAL,
-                &[pid],
-            )?;
-            conn.map_window(window)?;
-
-            clients.push(FakeEveClient {
-                name: name.to_string(),
-                pid,
-                window,
-            });
-        }
-
-        conn.flush()?;
-
-        // Window managers update _NET_CLIENT_LIST asynchronously in
-        // response to MapNotify. 250ms is well over the typical
-        // KWin/Mutter/Sway update latency on a desktop; on an
-        // unloaded box it's usually <20ms.
-        std::thread::sleep(std::time::Duration::from_millis(250));
-
-        Ok(Self { clients, conn })
-    }
-
-    /// Spawn an extra "lookalike" client whose title starts with
-    /// `EVE - ` but whose backing process is NOT named `exefile.exe`.
-    /// Used to verify the process-name filter rejects non-EVE windows
-    /// that happen to share the title prefix (browser tab, Discord
-    /// channel, etc. — the real-world reason `pid_is_eve_client`
-    /// exists). Returns the created window id.
-    pub fn add_lookalike(&mut self, title_suffix: &str) -> anyhow::Result<u32> {
-        // Same fork pattern but DON'T set comm — the child inherits
-        // the parent's comm ("fake_eve-…test runner") which definitely
-        // isn't "exefile.exe".
-        let pid = match unsafe { fork() }? {
-            ForkResult::Parent { child } => child.as_raw() as u32,
-            ForkResult::Child => {
-                // SAFETY: only async-signal-safe calls below — pause + _exit.
-                // _exit returns ! so the match arm has type !, coercing to
-                // u32 for the parent's value.
-                unsafe {
-                    libc::pause();
-                    libc::_exit(0)
-                }
-            }
-        };
-
-        let screen = &self.conn.setup().roots[0];
-        let root = screen.root;
-
-        let net_wm_name = self.conn.intern_atom(false, b"_NET_WM_NAME")?.reply()?.atom;
-        let utf8_string = self.conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
-        let net_wm_pid = self.conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
-
-        let window = self.conn.generate_id()?;
-        let aux = CreateWindowAux::new().background_pixel(screen.black_pixel);
-        self.conn.create_window(
-            x11rb::COPY_DEPTH_FROM_PARENT,
-            window,
-            root,
-            0,
-            0,
-            320,
-            200,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            0,
-            &aux,
-        )?;
-        let title = format!("EVE - {}", title_suffix);
-        self.conn.change_property(
-            PropMode::REPLACE,
-            window,
-            net_wm_name,
-            utf8_string,
-            8,
-            title.len() as u32,
-            title.as_bytes(),
-        )?;
-        self.conn.change_property32(
-            PropMode::REPLACE,
-            window,
-            net_wm_pid,
-            AtomEnum::CARDINAL,
-            &[pid],
-        )?;
-        self.conn.map_window(window)?;
-        self.conn.flush()?;
-
-        self.clients.push(FakeEveClient {
-            name: format!("LOOKALIKE:{}", title_suffix),
-            pid,
-            window,
-        });
-
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        Ok(window)
-    }
-}
-
-impl Drop for FakeEveHarness {
-    fn drop(&mut self) {
-        for c in &self.clients {
-            let pid = Pid::from_raw(c.pid as i32);
-            let _ = kill(pid, Signal::SIGTERM);
-            // Reap with WNOHANG first; if the child hasn't exited
-            // yet, SIGKILL it and reap again. Without the reap step
-            // the child becomes a zombie and lingers until the test
-            // binary exits, polluting later runs that look at
-            // /proc/<pid>/comm.
-            let _ = waitpid(pid, Some(WaitPidFlag::WNOHANG));
-            let _ = kill(pid, Signal::SIGKILL);
-            let _ = waitpid(pid, None);
-        }
-        // X windows die with the connection automatically.
-    }
-}
-
-/// Fork a child whose `/proc/<pid>/comm` reads as `exefile.exe`, and
-/// which blocks forever (pause(2)) until killed by the test
-/// teardown. Returns the child's PID. The child runs only
-/// async-signal-safe calls so this is safe even from the
-/// multi-threaded Cargo test harness.
-fn spawn_fake_eve_process() -> anyhow::Result<u32> {
-    match unsafe { fork() }? {
-        ForkResult::Parent { child } => Ok(child.as_raw() as u32),
-        ForkResult::Child => {
-            // SAFETY: every call here is documented async-signal-safe.
-            // prctl is on the safe list (signal-safety(7)); pause and
-            // _exit are too. We intentionally do NOT call exit() or
-            // any Drop machinery — that would run the parent's
-            // destructors against shared state (libc allocator,
-            // x11rb buffers) and could deadlock.
-            let _ = prctl::set_name(FAKE_COMM);
-            unsafe {
-                libc::pause();
-                libc::_exit(0)
-            }
-        }
-    }
-}
-
-/// Path to the built nicotine binary corresponding to this test run.
-/// Cargo puts the bin next to the test binaries (sometimes one level
-/// up in `deps/`); this resolves either layout.
+/// Path to the built `Nicotine` binary corresponding to this test
+/// run. Cargo puts the bin next to the test binaries (sometimes one
+/// level up in `deps/`); this resolves either layout. On Windows the
+/// executable has a `.exe` suffix; Cargo + std `Command` handle the
+/// extension transparently when invoking, but we need the exact path
+/// for the `bin/` resolution.
 pub fn nicotine_binary() -> PathBuf {
+    locate_bin("Nicotine")
+}
+
+/// Path to the built `fake-eve-stub` test helper binary. Only used by
+/// the Windows fake-EVE harness, but the locator is cross-platform
+/// because Cargo builds the bin on every host (the stub itself is a
+/// no-op on non-Windows).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn fake_eve_stub_binary() -> PathBuf {
+    locate_bin("fake-eve-stub")
+}
+
+fn locate_bin(name: &str) -> PathBuf {
     let mut path = std::env::current_exe().expect("current_exe");
     path.pop(); // strip the test binary name
     if path.ends_with("deps") {
         path.pop();
     }
-    // Binary name is capitalized "Nicotine" per Cargo.toml [[bin]].
-    path.join("Nicotine")
+    let mut bin = path.join(name);
+    // Windows binaries have a `.exe` extension; std::process::Command
+    // resolves with or without it but Path::is_file does not.
+    if cfg!(windows) && !bin.exists() {
+        bin.set_extension("exe");
+    }
+    bin
 }
 
 /// Skip-with-message helper. Returns true if the test should be
-/// skipped because X11 isn't available (e.g. running headless).
+/// skipped because the platform's display server isn't available.
+/// On Linux that's `$DISPLAY` (X11 / XWayland). On Windows the
+/// CI runner's session is always present, so we don't gate.
 pub fn skip_if_no_display() -> bool {
-    if std::env::var("DISPLAY").is_err() {
-        eprintln!(
-            "SKIP: DISPLAY not set. Run this test from an X11 / XWayland \
-             session (e.g. `cargo test --ignored fake_eve` from your \
-             desktop terminal)."
-        );
-        return true;
+    #[cfg(unix)]
+    {
+        if std::env::var("DISPLAY").is_err() {
+            eprintln!(
+                "SKIP: DISPLAY not set. Run this test from an X11 / XWayland \
+                 session (e.g. `cargo test --ignored fake_eve` from your \
+                 desktop terminal)."
+            );
+            return true;
+        }
     }
     false
 }
@@ -283,8 +86,8 @@ pub fn skip_if_no_display() -> bool {
 /// disables mouse/keyboard input listening because the test drives
 /// the daemon over IPC, not via real input events. The dimension
 /// fields are required by the Config schema (no `serde(default)`);
-/// the values themselves don't matter to these tests because nothing
-/// asserts on stacked geometry.
+/// the values themselves don't matter to these tests beyond what the
+/// stack test checks.
 const TEST_CONFIG: &str = "\
 display_width = 1920
 display_height = 1080
@@ -297,24 +100,28 @@ enable_keyboard_buttons = false
 ";
 
 /// Owns an isolated daemon subprocess and the temp directories that
-/// hold its socket, runtime files (lock + index), and config. Each
-/// test gets a private daemon so multiple test runs in parallel (and
-/// any real daemon the user is running) don't fight over the default
-/// `/tmp/nicotine.sock` path.
+/// hold its socket / pipe, runtime files (lock + index), and config.
+/// Each test gets a private daemon so multiple test runs in parallel
+/// (and any real daemon the user is running) don't fight over the
+/// default socket name.
 ///
-/// On drop the daemon is sent `quit`, then SIGKILL'd if it doesn't
-/// exit promptly, and the temp directories are removed.
+/// On drop the daemon is sent `quit`, then killed if it doesn't exit
+/// promptly, and the temp directories are removed.
 pub struct TestDaemon {
     child: Child,
-    socket_path: PathBuf,
+    /// Socket/pipe printname — `interprocess::local_socket` uses this
+    /// to construct the platform-appropriate name (fs path on Linux,
+    /// namespaced pipe on Windows).
+    socket_printname: String,
     base_dir: PathBuf,
     /// Path of the config.toml the daemon reads. Exposed so tests can
     /// rewrite it mid-run to exercise hot-reload behavior.
     pub config_path: PathBuf,
     /// Snapshot of the env vars we pass to every subprocess invocation
     /// against this daemon — same NICOTINE_SOCKET_PATH /
-    /// NICOTINE_RUNTIME_DIR / XDG_CONFIG_HOME so `nicotine list` and
-    /// `nicotine active` hit the same isolated state.
+    /// NICOTINE_RUNTIME_DIR / XDG_CONFIG_HOME (or APPDATA on Windows)
+    /// so `nicotine list` and `nicotine active` hit the same isolated
+    /// state.
     pub env: Vec<(String, String)>,
 }
 
@@ -328,27 +135,40 @@ impl TestDaemon {
             uuid::Uuid::new_v4().simple()
         ));
         let runtime_dir = base_dir.join("runtime");
-        let config_dir_root = base_dir.join("config");
-        let config_dir = config_dir_root.join("nicotine");
+        // Config isolation: write config.toml into a per-test temp
+        // dir and tell the daemon to look there via NICOTINE_CONFIG_DIR.
+        // We can't rely on XDG_CONFIG_HOME / APPDATA alone — on
+        // Windows `dirs::config_dir()` uses SHGetKnownFolderPath which
+        // ignores APPDATA env-var overrides, so the daemon would read
+        // the user's real config dir instead of ours. The explicit
+        // env override is parallel to NICOTINE_SOCKET_PATH /
+        // NICOTINE_RUNTIME_DIR.
+        let config_dir = base_dir.join("nicotine");
         std::fs::create_dir_all(&runtime_dir)?;
         std::fs::create_dir_all(&config_dir)?;
         let config_path = config_dir.join("config.toml");
         std::fs::write(&config_path, TEST_CONFIG)?;
 
-        let socket_path = base_dir.join("daemon.sock");
+        // Unique socket / pipe name per test. On Linux this becomes a
+        // filesystem path; on Windows it's a `\\.\pipe\<name>` mapped
+        // by the interprocess crate. Either way the env var honored
+        // by `ipc::socket_printname()` selects this isolated name
+        // instead of the default `/tmp/nicotine.sock` / `nicotine.sock`.
+        let socket_printname = if cfg!(windows) {
+            format!("nicotine-test-{}.sock", uuid::Uuid::new_v4().simple())
+        } else {
+            base_dir.join("daemon.sock").to_string_lossy().into_owned()
+        };
 
         let env = vec![
-            (
-                "NICOTINE_SOCKET_PATH".to_string(),
-                socket_path.to_string_lossy().into_owned(),
-            ),
+            ("NICOTINE_SOCKET_PATH".to_string(), socket_printname.clone()),
             (
                 "NICOTINE_RUNTIME_DIR".to_string(),
                 runtime_dir.to_string_lossy().into_owned(),
             ),
             (
-                "XDG_CONFIG_HOME".to_string(),
-                config_dir_root.to_string_lossy().into_owned(),
+                "NICOTINE_CONFIG_DIR".to_string(),
+                config_dir.to_string_lossy().into_owned(),
             ),
         ];
 
@@ -357,45 +177,76 @@ impl TestDaemon {
         for (k, v) in &env {
             cmd.env(k, v);
         }
-        // Daemon prints "listening for IPC commands" once bound. We
-        // don't read its output but Stdio::null avoids pipe-fill
-        // hangs across longer test runs.
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
+        // Capture both stdout and stderr to log files. Stdout carries
+        // the daemon's confirmation messages — including the
+        // "Reloaded N character(s) from config.toml" line that
+        // `rewrite_config` polls on to know its config write was
+        // actually picked up (instead of guessing with a sleep).
+        // Stderr is dumped on send-failure for diagnostics.
+        let stdout_log = base_dir.join("daemon.stdout.log");
+        let stderr_log = base_dir.join("daemon.stderr.log");
+        let stdout_file = std::fs::File::create(&stdout_log)?;
+        let stderr_file = std::fs::File::create(&stderr_log)?;
+        cmd.stdout(stdout_file);
+        cmd.stderr(stderr_file);
         let child = cmd.spawn()?;
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if socket_path.exists() {
-                // Socket file exists ≠ accepting yet on some IPC
-                // backends; do a connect probe.
-                if UnixStream::connect(&socket_path).is_ok() {
-                    // Daemon's enumeration loop ticks every 500ms;
-                    // give it one tick to discover the harness's
-                    // fake windows before the test sends commands.
-                    std::thread::sleep(Duration::from_millis(600));
-                    return Ok(Self {
-                        child,
-                        socket_path,
-                        base_dir,
-                        config_path,
-                        env,
-                    });
-                }
+        // Don't probe with a Stream::connect — on Windows named pipes
+        // each accept consumes the current pipe instance and creates
+        // the next, so probe-connect-and-drop can race with the
+        // daemon's accept loop. Use a fixed warmup sleep instead;
+        // 1.2s comfortably covers daemon init + first window-enum
+        // tick on a cold Windows runner, and is brief enough on Linux
+        // that the existing tests' 21s budget barely moves.
+        std::thread::sleep(Duration::from_millis(1200));
+        Ok(Self {
+            child,
+            socket_printname,
+            base_dir,
+            config_path,
+            env,
+        })
+    }
+
+    /// Dump the daemon's stderr log to the test's stderr. Used by
+    /// failure paths to surface why a send / spawn went wrong.
+    fn dump_stderr(&self) {
+        let log = self.base_dir.join("daemon.stderr.log");
+        if let Ok(content) = std::fs::read_to_string(&log) {
+            if !content.is_empty() {
+                eprint!("[daemon stderr]\n{}", content);
             }
-            std::thread::sleep(Duration::from_millis(40));
         }
-        anyhow::bail!("test daemon never bound its IPC socket");
     }
 
     /// Send a single line command (e.g. "forward", "switch:2") to
     /// the daemon's IPC socket. Returns when the line has been
     /// written + flushed; the daemon's reply (if any) is ignored.
+    ///
+    /// Retries briefly on ENOENT-style errors so a transient gap in
+    /// the listener (e.g. mid-accept on Windows named pipes) doesn't
+    /// fail the test. Dumps daemon stderr on final failure so the
+    /// underlying reason is visible in CI logs.
     pub fn send(&self, command: &str) -> anyhow::Result<()> {
-        let mut stream = UnixStream::connect(&self.socket_path)?;
-        writeln!(stream, "{}", command)?;
-        stream.flush()?;
-        Ok(())
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let mut last_err: Option<anyhow::Error> = None;
+        while Instant::now() < deadline {
+            match try_connect(&self.socket_printname) {
+                Ok(mut stream) => {
+                    writeln!(stream, "{}", command)?;
+                    stream.flush()?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        self.dump_stderr();
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("send {command:?} timed out with no error captured")
+        }))
     }
 
     /// Run `Nicotine <args>` against this daemon (env vars pinned to
@@ -427,13 +278,10 @@ impl TestDaemon {
     }
 
     /// Return the daemon's view of the focused EVE client, or None
-    /// if no EVE window is focused right now. The daemon polls
-    /// `_NET_ACTIVE_WINDOW` and matches against its enumerated
-    /// EVE list — so this is the same observation the cycle /
-    /// switch code uses to decide what to advance from. The nicotine
-    /// binary prefixes informational lines like "Detected Wayland
-    /// display server..." to stdout, so we filter for the
-    /// tab-delimited data lines instead of taking the first line.
+    /// if no EVE window is focused right now. The nicotine binary
+    /// prefixes informational lines like "Detected Wayland display
+    /// server..." to stdout, so we filter for the tab-delimited data
+    /// lines instead of taking the first line.
     pub fn active_client_name(&self) -> Option<String> {
         let out = self.nicotine_stdout(&["active"]);
         out.lines()
@@ -452,26 +300,77 @@ impl TestDaemon {
     }
 
     /// Replace the daemon's config.toml with the given content and
-    /// wait one hot-reload tick (~600ms) for the daemon to pick it
-    /// up. The daemon re-reads config on every enumeration tick;
-    /// changes to `characters`, `minimize_inactive`, etc. take effect
-    /// without restart. Use this to test hot-reload behavior or to
-    /// stage a non-default config for a single test.
+    /// block until the daemon has actually picked it up. The write
+    /// is staged through a sibling temp file + rename so the daemon
+    /// never reads a half-written file (Windows `std::fs::write`
+    /// truncates before writing, which the daemon's hot-reload could
+    /// race with and parse-fail silently). The completion handshake
+    /// polls the daemon's stdout log for "Reloaded N character(s)"
+    /// — the daemon emits this line on every successful reload that
+    /// changes the character list. Falls back to a plain sleep after
+    /// a generous deadline so a non-character-changing config write
+    /// doesn't hang the test.
     pub fn rewrite_config(&self, toml: &str) -> anyhow::Result<()> {
-        std::fs::write(&self.config_path, toml)?;
-        self.wait_for_enum_tick();
-        Ok(())
+        let baseline = self.stdout_log_contents();
+
+        // Atomic replace: write to <path>.tmp, then rename onto path.
+        // `std::fs::rename` on Windows uses MoveFileExW with
+        // MOVEFILE_REPLACE_EXISTING so the swap is observable as a
+        // single transition. On Linux rename(2) is atomic too.
+        let tmp = self.config_path.with_extension("toml.tmp");
+        std::fs::write(&tmp, toml)?;
+        std::fs::rename(&tmp, &self.config_path)?;
+
+        let deadline = Instant::now() + Duration::from_millis(5000);
+        while Instant::now() < deadline {
+            let now = self.stdout_log_contents();
+            if let Some(diff) = now.strip_prefix(&baseline) {
+                if diff.contains("Reloaded ") || diff.contains("Character list cleared") {
+                    // Give the daemon one more tick to also apply
+                    // any side effects (hotkey rebind on Windows,
+                    // listener mutex updates on Linux). 100ms is
+                    // plenty; the work itself is sub-ms.
+                    std::thread::sleep(Duration::from_millis(100));
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // No marker observed within the deadline. Surface both daemon
+        // log streams so CI shows exactly what (if anything) the
+        // daemon thought about the new config — was the file read?
+        // did parse fail? Bail explicitly rather than fall through
+        // and let the downstream assertion fail mysteriously.
+        let stdout = self.stdout_log_contents();
+        let stderr = self.stderr_log_contents();
+        anyhow::bail!(
+            "rewrite_config: daemon never logged a config reload within 5s.\n\
+             --- config written ({} bytes) ---\n{}\n\
+             --- daemon stdout ---\n{}\n\
+             --- daemon stderr ---\n{}",
+            toml.len(),
+            toml,
+            stdout,
+            stderr
+        );
+    }
+
+    fn stdout_log_contents(&self) -> String {
+        std::fs::read_to_string(self.base_dir.join("daemon.stdout.log")).unwrap_or_default()
+    }
+
+    fn stderr_log_contents(&self) -> String {
+        std::fs::read_to_string(self.base_dir.join("daemon.stderr.log")).unwrap_or_default()
     }
 }
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         // Try a clean shutdown first via the daemon's own quit
-        // command, so it tears down its X11 connection + hot-reload
-        // thread gracefully. Failure (already dead, socket gone)
-        // is fine — the SIGKILL below covers it.
+        // command so it tears down its display-server connections +
+        // hot-reload thread gracefully. Failure (already dead, socket
+        // gone) is fine — the kill below covers it.
         let _ = self.send("quit");
-        // Wait briefly for the process to exit on its own.
         let deadline = Instant::now() + Duration::from_millis(200);
         while Instant::now() < deadline {
             if let Ok(Some(_)) = self.child.try_wait() {
@@ -485,122 +384,19 @@ impl Drop for TestDaemon {
     }
 }
 
-/// Cross-test helper: read stdout from `nicotine list` (no daemon)
-/// using the same env-var isolation we'd use against a daemon. Useful
-/// for the no-daemon variants of enumeration tests so the user's
-/// real daemon (if running) doesn't perturb them.
-#[allow(dead_code)]
-pub fn nicotine_list_isolated() -> String {
-    let base_dir = std::env::temp_dir().join(format!(
-        "nicotine-list-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&base_dir).expect("mk base_dir");
-    let _guard = TempDirGuard(base_dir.clone());
-
-    let mut cmd = Command::new(nicotine_binary());
-    cmd.arg("list");
-    cmd.env("NICOTINE_SOCKET_PATH", base_dir.join("no.sock"));
-    cmd.env("NICOTINE_RUNTIME_DIR", &base_dir);
-    cmd.env("XDG_CONFIG_HOME", &base_dir);
-    let out = cmd.output().expect("spawn nicotine list");
-    assert!(out.status.success(), "nicotine list exit {}", out.status);
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-/// Best-effort cleanup of a temp directory when the wrapping scope
-/// exits — used by `nicotine_list_isolated` so we don't leak fixtures
-/// into /tmp on every test run.
-struct TempDirGuard(PathBuf);
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+/// Probe-connect to the local-socket name. Returns Ok(stream) when
+/// the daemon is accepting connections, Err otherwise. Used both as
+/// the wait-for-bind handshake and as the underlying transport for
+/// `send`.
+fn try_connect(printname: &str) -> anyhow::Result<Stream> {
+    #[cfg(unix)]
+    {
+        let name = printname.to_fs_name::<GenericFilePath>()?;
+        Ok(Stream::connect(name)?)
     }
-}
-
-/// Activate one of the harness's fake EVE windows directly via X11,
-/// bypassing nicotine. Used as the "set known starting point" step
-/// before testing what `nicotine forward` does to focus. Returns
-/// only after the WM has actually applied the change (polled with a
-/// short timeout) so subsequent cycle commands see a deterministic
-/// initial state.
-pub fn activate_window_directly(window: u32) -> anyhow::Result<()> {
-    let (conn, screen_num) = RustConnection::connect(None)?;
-    let root = conn.setup().roots[screen_num].root;
-    let net_active = conn
-        .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
-        .reply()?
-        .atom;
-    // Send the same EWMH ClientMessage nicotine sends. source = 2
-    // (pager) tells the WM this is an explicit user request and
-    // should bypass focus-stealing prevention.
-    let event = ClientMessageEvent {
-        response_type: CLIENT_MESSAGE_EVENT,
-        format: 32,
-        sequence: 0,
-        window,
-        type_: net_active,
-        data: ClientMessageData::from([2u32, x11rb::CURRENT_TIME, 0, 0, 0]),
-    };
-    conn.send_event(
-        false,
-        root,
-        EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
-        event,
-    )?;
-    conn.flush()?;
-    // Poll _NET_ACTIVE_WINDOW for up to 500ms until it reflects our
-    // requested window. Some WMs (KWin under load) take a few frames
-    // to update the property.
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < deadline {
-        let reply = conn
-            .get_property(false, root, net_active, AtomEnum::WINDOW, 0, 1)?
-            .reply()?;
-        let active = reply.value32().and_then(|mut v| v.next()).unwrap_or(0);
-        if active == window {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    #[cfg(windows)]
+    {
+        let name = printname.to_ns_name::<GenericNamespaced>()?;
+        Ok(Stream::connect(name)?)
     }
-    // Didn't observe the activation — return Ok so the caller still
-    // runs the rest of the test; assertions later will surface the
-    // misbehavior if it matters.
-    Ok(())
-}
-
-/// Read root-relative geometry of a window — its position + size as
-/// the WM has placed it. Used by the stack test to assert that
-/// `nicotine stack` moves every fake EVE window to the same x/y/w/h.
-///
-/// `get_geometry` returns coordinates relative to the window's
-/// parent (typically the WM's frame window), so we additionally call
-/// `translate_coordinates` to convert into root-relative coords.
-/// This makes assertions stable across WMs that wrap client windows
-/// in decoration frames of varying sizes.
-pub fn window_root_geometry(window: u32) -> anyhow::Result<(i32, i32, u32, u32)> {
-    let (conn, screen_num) = RustConnection::connect(None)?;
-    let root = conn.setup().roots[screen_num].root;
-    let geom = conn.get_geometry(window)?.reply()?;
-    let translated = conn.translate_coordinates(window, root, 0, 0)?.reply()?;
-    Ok((
-        translated.dst_x as i32,
-        translated.dst_y as i32,
-        geom.width as u32,
-        geom.height as u32,
-    ))
-}
-
-/// Resolve the directory that the test fixtures should write to and
-/// the daemon should read from. Exposed so future tests that need a
-/// PathBuf can call this without re-implementing the layout.
-#[allow(dead_code)]
-pub fn temp_base(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "nicotine-{}-{}-{}",
-        label,
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ))
 }

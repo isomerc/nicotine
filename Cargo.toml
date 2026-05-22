@@ -14,6 +14,15 @@ repository = "https://github.com/isomerc/nicotine"
 name = "Nicotine"
 path = "src/main.rs"
 
+# Test-only helper used by the Windows fake-EVE harness. Builds on
+# every cargo build but isn't bundled in releases — release.yml
+# copies the `Nicotine` binary specifically. On non-Windows it's a
+# no-op stub that just exits, so cross-compile and Linux CI don't
+# break from its presence.
+[[bin]]
+name = "fake-eve-stub"
+path = "tests/bin/fake_eve_stub.rs"
+
 [build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 ico = "0.3"
