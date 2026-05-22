@@ -308,6 +308,9 @@ pub struct TestDaemon {
     child: Child,
     socket_path: PathBuf,
     base_dir: PathBuf,
+    /// Path of the config.toml the daemon reads. Exposed so tests can
+    /// rewrite it mid-run to exercise hot-reload behavior.
+    pub config_path: PathBuf,
     /// Snapshot of the env vars we pass to every subprocess invocation
     /// against this daemon — same NICOTINE_SOCKET_PATH /
     /// NICOTINE_RUNTIME_DIR / XDG_CONFIG_HOME so `nicotine list` and
@@ -329,7 +332,8 @@ impl TestDaemon {
         let config_dir = config_dir_root.join("nicotine");
         std::fs::create_dir_all(&runtime_dir)?;
         std::fs::create_dir_all(&config_dir)?;
-        std::fs::write(config_dir.join("config.toml"), TEST_CONFIG)?;
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, TEST_CONFIG)?;
 
         let socket_path = base_dir.join("daemon.sock");
 
@@ -374,6 +378,7 @@ impl TestDaemon {
                         child,
                         socket_path,
                         base_dir,
+                        config_path,
                         env,
                     });
                 }
@@ -444,6 +449,18 @@ impl TestDaemon {
     /// guarantees the new state is visible.
     pub fn wait_for_enum_tick(&self) {
         std::thread::sleep(Duration::from_millis(700));
+    }
+
+    /// Replace the daemon's config.toml with the given content and
+    /// wait one hot-reload tick (~600ms) for the daemon to pick it
+    /// up. The daemon re-reads config on every enumeration tick;
+    /// changes to `characters`, `minimize_inactive`, etc. take effect
+    /// without restart. Use this to test hot-reload behavior or to
+    /// stage a non-default config for a single test.
+    pub fn rewrite_config(&self, toml: &str) -> anyhow::Result<()> {
+        std::fs::write(&self.config_path, toml)?;
+        self.wait_for_enum_tick();
+        Ok(())
     }
 }
 
@@ -551,6 +568,28 @@ pub fn activate_window_directly(window: u32) -> anyhow::Result<()> {
     // runs the rest of the test; assertions later will surface the
     // misbehavior if it matters.
     Ok(())
+}
+
+/// Read root-relative geometry of a window — its position + size as
+/// the WM has placed it. Used by the stack test to assert that
+/// `nicotine stack` moves every fake EVE window to the same x/y/w/h.
+///
+/// `get_geometry` returns coordinates relative to the window's
+/// parent (typically the WM's frame window), so we additionally call
+/// `translate_coordinates` to convert into root-relative coords.
+/// This makes assertions stable across WMs that wrap client windows
+/// in decoration frames of varying sizes.
+pub fn window_root_geometry(window: u32) -> anyhow::Result<(i32, i32, u32, u32)> {
+    let (conn, screen_num) = RustConnection::connect(None)?;
+    let root = conn.setup().roots[screen_num].root;
+    let geom = conn.get_geometry(window)?.reply()?;
+    let translated = conn.translate_coordinates(window, root, 0, 0)?.reply()?;
+    Ok((
+        translated.dst_x as i32,
+        translated.dst_y as i32,
+        geom.width as u32,
+        geom.height as u32,
+    ))
 }
 
 /// Resolve the directory that the test fixtures should write to and

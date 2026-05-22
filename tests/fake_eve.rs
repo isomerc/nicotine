@@ -20,7 +20,8 @@
 mod common;
 
 use common::{
-    activate_window_directly, nicotine_binary, skip_if_no_display, FakeEveHarness, TestDaemon,
+    activate_window_directly, nicotine_binary, skip_if_no_display, window_root_geometry,
+    FakeEveHarness, TestDaemon,
 };
 use std::collections::HashSet;
 use std::process::Command;
@@ -322,4 +323,263 @@ fn list_handles_title_edge_cases() {
             "{expected:?} (or trimmed: {trimmed:?}) missing from list output:\n{stdout}"
         );
     }
+}
+
+#[test]
+#[ignore = "requires DISPLAY + a cooperative WM"]
+fn stack_command_centers_all_eve_windows_at_same_geometry() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    // `nicotine stack` should move every EVE client to the same x/y
+    // and resize them to a uniform width/height (configured via
+    // display_width / eve_width / panel_height). Tests that the
+    // stack_windows trait impl actually issues move/resize for each
+    // window and that they all land on the same root-relative spot.
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("set up harness");
+    let daemon = TestDaemon::spawn().expect("spawn test daemon");
+
+    daemon.send("stack").expect("send stack command");
+    // wmctrl-based stack does N synchronous shell-outs; give the WM
+    // a moment to settle the resulting ConfigureNotifies.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mut geoms = Vec::new();
+    for client in &harness.clients {
+        let g = window_root_geometry(client.window)
+            .unwrap_or_else(|e| panic!("read geometry for {}: {e}", client.name));
+        geoms.push((client.name.clone(), g));
+    }
+
+    // All three should share the same (x, y, w, h) — within a small
+    // tolerance because some WMs adjust for frame extents during
+    // resize. 5px slack is more than enough to absorb that without
+    // accepting a totally broken stack.
+    let (_, (ref_x, ref_y, ref_w, ref_h)) = geoms[0].clone();
+    for (name, (x, y, w, h)) in &geoms[1..] {
+        let dx = (x - ref_x).abs();
+        let dy = (y - ref_y).abs();
+        let dw = (*w as i32 - ref_w as i32).abs();
+        let dh = (*h as i32 - ref_h as i32).abs();
+        assert!(
+            dx <= 5 && dy <= 5 && dw <= 5 && dh <= 5,
+            "stack should land all windows at the same geometry; \
+             {name} at ({x},{y},{w},{h}) vs {} at ({ref_x},{ref_y},{ref_w},{ref_h})",
+            geoms[0].0
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires DISPLAY + a cooperative WM"]
+fn cycle_forward_wraps_around_from_last_to_first() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    // Anchoring on the LAST listed client and forwarding should
+    // wrap to the FIRST. This catches off-by-one bugs in the cycle
+    // index arithmetic — easy to introduce when refactoring
+    // CycleState::cycle_forward.
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("set up harness");
+    let daemon = TestDaemon::spawn().expect("spawn test daemon");
+
+    let order_stdout = daemon.nicotine_stdout(&["list"]);
+    let ordered_names: Vec<String> = order_stdout
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1).map(String::from))
+        .collect();
+    assert_eq!(ordered_names.len(), 3);
+
+    let last_id = harness
+        .clients
+        .iter()
+        .find(|c| c.name == *ordered_names.last().unwrap())
+        .map(|c| c.window)
+        .unwrap();
+    activate_window_directly(last_id).unwrap();
+    daemon.wait_for_enum_tick();
+
+    daemon.send("forward").expect("send forward");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let active = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        active, ordered_names[0],
+        "forward from last should wrap to first; got {:?}, expected {}",
+        active, ordered_names[0]
+    );
+}
+
+#[test]
+#[ignore = "requires DISPLAY + a cooperative WM"]
+fn cycle_backward_wraps_around_from_first_to_last() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("set up harness");
+    let daemon = TestDaemon::spawn().expect("spawn test daemon");
+
+    let order_stdout = daemon.nicotine_stdout(&["list"]);
+    let ordered_names: Vec<String> = order_stdout
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1).map(String::from))
+        .collect();
+    assert_eq!(ordered_names.len(), 3);
+
+    let first_id = harness
+        .clients
+        .iter()
+        .find(|c| c.name == ordered_names[0])
+        .map(|c| c.window)
+        .unwrap();
+    activate_window_directly(first_id).unwrap();
+    daemon.wait_for_enum_tick();
+
+    daemon.send("backward").expect("send backward");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let active = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        active,
+        *ordered_names.last().unwrap(),
+        "backward from first should wrap to last; got {:?}",
+        active
+    );
+}
+
+#[test]
+#[ignore = "requires DISPLAY + a cooperative WM"]
+fn switch_n_out_of_range_is_a_no_op_not_a_crash() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    // switch:99 against a 3-client setup should NOT panic the daemon
+    // and should NOT change focus. The same goes for switch:0
+    // (switch is 1-indexed on the wire; zero is invalid). The test
+    // is mostly about daemon survival — if it crashed, the next IPC
+    // command would fail to connect.
+    let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    let order_stdout = daemon.nicotine_stdout(&["list"]);
+    let ordered_names: Vec<String> = order_stdout
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1).map(String::from))
+        .collect();
+    let anchor_id = harness
+        .clients
+        .iter()
+        .find(|c| c.name == ordered_names[0])
+        .map(|c| c.window)
+        .unwrap();
+    activate_window_directly(anchor_id).unwrap();
+    daemon.wait_for_enum_tick();
+
+    let before_active = daemon.active_client_name();
+
+    daemon.send("switch:99").expect("send switch:99");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    daemon.send("switch:0").expect("send switch:0");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Daemon still responding (no crash).
+    let after_list = daemon.nicotine_stdout(&["list"]);
+    let after_names = names_from_list_output(&after_list);
+    assert_eq!(
+        after_names.len(),
+        3,
+        "daemon should still enumerate all 3 fakes after invalid switch commands"
+    );
+
+    // Focus unchanged.
+    let after_active = daemon.active_client_name();
+    assert_eq!(
+        before_active, after_active,
+        "out-of-range switch should leave focus alone; before={:?} after={:?}",
+        before_active, after_active
+    );
+}
+
+#[test]
+#[ignore = "requires DISPLAY + a cooperative WM"]
+fn switch_uses_character_order_from_config_after_hot_reload() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    // Pin a non-trivial character_order via config hot-reload. The
+    // order intentionally inverts the natural _NET_CLIENT_LIST order
+    // (which goes Alpha, Beta, Gamma). After the daemon picks up
+    // the new order, switch:1 should land on Gamma, not Alpha —
+    // proving (a) hot-reload of `characters` works and (b) switch_to
+    // uses the configured order, not the WM enumeration order.
+    let _harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    let custom = "\
+display_width = 1920
+display_height = 1080
+panel_height = 100
+eve_width = 1024
+eve_height = 768
+show_previews = false
+enable_mouse_buttons = false
+enable_keyboard_buttons = false
+characters = [\"Gamma\", \"Beta\", \"Alpha\"]
+";
+    daemon.rewrite_config(custom).expect("rewrite config");
+
+    daemon.send("switch:1").expect("send switch:1");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let active = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        active, "Gamma",
+        "with characters=[Gamma,Beta,Alpha] in config, switch:1 (1-indexed) should land on Gamma; got {:?}",
+        active
+    );
+}
+
+#[test]
+#[ignore = "requires DISPLAY + a cooperative WM"]
+fn single_eve_cycle_is_a_no_op() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    // With only one EVE client, both forward and backward cycle
+    // operations must NOT crash the daemon and should leave the
+    // single client focused (modulo: cycle index advances internally
+    // and wraps back to the same client). Guards against
+    // division-by-zero or modulo-by-zero in CycleState::cycle_*.
+    let harness = FakeEveHarness::new(&["Solo"]).expect("single-fake harness");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    let only_id = harness.clients[0].window;
+    activate_window_directly(only_id).unwrap();
+    daemon.wait_for_enum_tick();
+
+    daemon.send("forward").expect("forward survives");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    daemon.send("backward").expect("backward survives");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Daemon still responsive.
+    let after_list = daemon.nicotine_stdout(&["list"]);
+    let after_names = names_from_list_output(&after_list);
+    assert!(
+        after_names.contains("Solo"),
+        "daemon should still see Solo after single-EVE cycle attempts:\n{after_list}"
+    );
+
+    let active = daemon.active_client_name().unwrap_or_default();
+    assert_eq!(
+        active, "Solo",
+        "single-EVE cycle should leave Solo focused; got {:?}",
+        active
+    );
 }

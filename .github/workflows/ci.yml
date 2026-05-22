@@ -62,3 +62,44 @@ jobs:
 
       - name: Clippy on Windows target
         run: cargo xwin clippy --release --target x86_64-pc-windows-msvc -- -D warnings
+
+  integration-linux:
+    name: Integration tests (Linux X11)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Xvfb gives us a headless X server; openbox is a tiny EWMH-
+      # compliant WM that publishes _NET_CLIENT_LIST and honors
+      # _NET_ACTIVE_WINDOW ClientMessages — enough for the
+      # enumeration + cycle paths to behave like a real desktop.
+      # wmctrl is a runtime dep of nicotine's KWinManager (called
+      # via shell), and the GL stack (libgl) is needed because
+      # eframe links against it even for headless test builds.
+      - name: Install X11 + WM + GL deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb openbox wmctrl \
+            libxkbcommon-x11-0 libgl1 libwayland-client0
+
+      - name: Run integration tests under Xvfb
+        run: |
+          set -e
+          Xvfb :99 -screen 0 1280x800x24 &
+          XVFB_PID=$!
+          export DISPLAY=:99
+          # Give Xvfb a beat to bind before the WM connects.
+          sleep 1
+          openbox &
+          OPENBOX_PID=$!
+          sleep 1
+          ./run-tests.sh integration
+          STATUS=$?
+          # Best-effort cleanup so the runner doesn't hang on
+          # background processes after the test step.
+          kill $OPENBOX_PID $XVFB_PID 2>/dev/null || true
+          exit $STATUS
