@@ -418,6 +418,15 @@ const SUPPORTED_KEYS: &[egui::Key] = &[
     egui::Key::F13,
     egui::Key::F14,
     egui::Key::F15,
+    egui::Key::F16,
+    egui::Key::F17,
+    egui::Key::F18,
+    egui::Key::F19,
+    egui::Key::F20,
+    egui::Key::F21,
+    egui::Key::F22,
+    egui::Key::F23,
+    egui::Key::F24,
     egui::Key::Tab,
     egui::Key::Space,
     egui::Key::Enter,
@@ -520,6 +529,15 @@ fn egui_key_to_code(key: egui::Key) -> Option<u16> {
         Key::F13 => 0x7C,
         Key::F14 => 0x7D,
         Key::F15 => 0x7E,
+        Key::F16 => 0x7F,
+        Key::F17 => 0x80,
+        Key::F18 => 0x81,
+        Key::F19 => 0x82,
+        Key::F20 => 0x83,
+        Key::F21 => 0x84,
+        Key::F22 => 0x85,
+        Key::F23 => 0x86,
+        Key::F24 => 0x87,
         Key::Tab => 0x09,
         Key::Space => 0x20,
         Key::Enter => 0x0D,
@@ -595,7 +613,7 @@ fn egui_key_to_code(key: egui::Key) -> Option<u16> {
     use egui::Key;
     let code: u16 = match key {
         // Function keys: KEY_F1 = 59, KEY_F2 = 60, ... KEY_F10 = 68;
-        // KEY_F11 = 87, KEY_F12 = 88. F13–F15 are 183–185.
+        // KEY_F11 = 87, KEY_F12 = 88. F13–F24 are 183–194.
         Key::F1 => 59,
         Key::F2 => 60,
         Key::F3 => 61,
@@ -611,6 +629,15 @@ fn egui_key_to_code(key: egui::Key) -> Option<u16> {
         Key::F13 => 183,
         Key::F14 => 184,
         Key::F15 => 185,
+        Key::F16 => 186,
+        Key::F17 => 187,
+        Key::F18 => 188,
+        Key::F19 => 189,
+        Key::F20 => 190,
+        Key::F21 => 191,
+        Key::F22 => 192,
+        Key::F23 => 193,
+        Key::F24 => 194,
         Key::Tab => 15,
         Key::Space => 57,
         Key::Enter => 28,
@@ -696,6 +723,18 @@ fn code_to_label(vk: u16) -> String {
         0x79 => "F10".into(),
         0x7A => "F11".into(),
         0x7B => "F12".into(),
+        0x7C => "F13".into(),
+        0x7D => "F14".into(),
+        0x7E => "F15".into(),
+        0x7F => "F16".into(),
+        0x80 => "F17".into(),
+        0x81 => "F18".into(),
+        0x82 => "F19".into(),
+        0x83 => "F20".into(),
+        0x84 => "F21".into(),
+        0x85 => "F22".into(),
+        0x86 => "F23".into(),
+        0x87 => "F24".into(),
         0x09 => "Tab".into(),
         0x20 => "Space".into(),
         0x0D => "Enter".into(),
@@ -736,6 +775,15 @@ fn code_to_label(code: u16) -> String {
         183 => "F13".into(),
         184 => "F14".into(),
         185 => "F15".into(),
+        186 => "F16".into(),
+        187 => "F17".into(),
+        188 => "F18".into(),
+        189 => "F19".into(),
+        190 => "F20".into(),
+        191 => "F21".into(),
+        192 => "F22".into(),
+        193 => "F23".into(),
+        194 => "F24".into(),
         // Common control keys.
         15 => "Tab".into(),
         57 => "Space".into(),
@@ -859,4 +907,56 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> Result<(), eframe:
         options,
         Box::new(move |cc| Ok(Box::new(ConfigPanel::new(cc, config, live)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f_keys_16_to_24() -> Vec<(egui::Key, &'static str)> {
+        vec![
+            (egui::Key::F16, "F16"),
+            (egui::Key::F17, "F17"),
+            (egui::Key::F18, "F18"),
+            (egui::Key::F19, "F19"),
+            (egui::Key::F20, "F20"),
+            (egui::Key::F21, "F21"),
+            (egui::Key::F22, "F22"),
+            (egui::Key::F23, "F23"),
+            (egui::Key::F24, "F24"),
+        ]
+    }
+
+    #[test]
+    fn supported_keys_includes_f16_through_f24() {
+        for (key, name) in f_keys_16_to_24() {
+            assert!(
+                SUPPORTED_KEYS.contains(&key),
+                "{name} not in SUPPORTED_KEYS — bind UI cannot capture it"
+            );
+        }
+    }
+
+    #[test]
+    fn egui_key_to_code_maps_f16_through_f24() {
+        for (key, name) in f_keys_16_to_24() {
+            assert!(
+                egui_key_to_code(key).is_some(),
+                "{name} has no native key code mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn code_to_label_round_trips_f16_through_f24() {
+        for (key, name) in f_keys_16_to_24() {
+            let code = egui_key_to_code(key)
+                .unwrap_or_else(|| panic!("{name} unmapped, can't round-trip"));
+            assert_eq!(
+                code_to_label(code),
+                name,
+                "code {code} for {name} renders as raw fallback instead of the F-key name"
+            );
+        }
+    }
 }

@@ -21,8 +21,8 @@ mod window_manager;
 
 mod version_check;
 
-#[cfg(unix)]
 mod eve_match;
+
 #[cfg(unix)]
 mod keyboard_listener;
 #[cfg(unix)]
@@ -42,6 +42,8 @@ mod preview_windows;
 mod windows_input;
 #[cfg(windows)]
 mod windows_manager;
+
+mod windows_helpers;
 
 use anyhow::Result;
 use config::{Config, LiveSettings};

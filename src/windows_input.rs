@@ -1,6 +1,9 @@
 use crate::config::Config;
 use crate::cycle_state::CycleState;
 use crate::window_manager::WindowManager;
+use crate::windows_helpers::{
+    classify_xbutton, plan_character_hotkeys, plan_cycle_hotkeys, CycleDirection, ModifierKind,
+};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -11,8 +14,6 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
-    VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT,
-    VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, HHOOK, MSG, MSLLHOOKSTRUCT,
@@ -119,13 +120,13 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         }
 
         if let Some(ctx) = HOOK_CTX.get() {
-            let post = if xbutton == ctx.forward_button {
-                Some(WM_USER_FORWARD)
-            } else if xbutton == ctx.backward_button {
-                Some(WM_USER_BACKWARD)
-            } else {
-                None
-            };
+            let post =
+                classify_xbutton(xbutton, ctx.forward_button, ctx.backward_button).map(|dir| {
+                    match dir {
+                        CycleDirection::Forward => WM_USER_FORWARD,
+                        CycleDirection::Backward => WM_USER_BACKWARD,
+                    }
+                });
 
             if let Some(msg) = post {
                 // PostThreadMessageW returns false if the thread queue is
@@ -137,12 +138,16 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     CallNextHookEx(None, code, wparam, lparam)
 }
 
-fn vk_to_modifier(vk: u16) -> HOT_KEY_MODIFIERS {
-    match vk {
-        v if v == VK_SHIFT.0 || v == VK_LSHIFT.0 || v == VK_RSHIFT.0 => MOD_SHIFT,
-        v if v == VK_CONTROL.0 || v == VK_LCONTROL.0 || v == VK_RCONTROL.0 => MOD_CONTROL,
-        v if v == VK_MENU.0 || v == VK_LMENU.0 || v == VK_RMENU.0 => MOD_ALT,
-        _ => HOT_KEY_MODIFIERS(0),
+/// Translate a planner-output ModifierKind into the Win32
+/// HOT_KEY_MODIFIERS bitmask RegisterHotKey expects. The planner is
+/// kept platform-independent (see `windows_helpers`) so this thin
+/// adapter is the only place that knows about MOD_SHIFT/etc.
+fn modifier_to_winapi(kind: Option<ModifierKind>) -> HOT_KEY_MODIFIERS {
+    match kind {
+        Some(ModifierKind::Shift) => MOD_SHIFT,
+        Some(ModifierKind::Ctrl) => MOD_CONTROL,
+        Some(ModifierKind::Alt) => MOD_ALT,
+        None => HOT_KEY_MODIFIERS(0),
     }
 }
 
@@ -282,61 +287,44 @@ fn run_listener(
 /// per-character hotkey, all on the current thread. Silently ignores
 /// failures (another app may own the key) — the listener still runs,
 /// it just won't fire for the contested key.
+///
+/// All ID assignment and modifier-conditional logic lives in
+/// `windows_helpers::plan_cycle_hotkeys` / `plan_character_hotkeys`
+/// (with unit tests). This function only consumes the plans and makes
+/// the Win32 calls.
 unsafe fn do_register_hotkeys(config: &Config) {
-    // Cycle hotkeys — gated by enable_keyboard_buttons so users can
-    // disable cycle hotkeys while still using per-character ones.
-    if config.enable_keyboard_buttons {
+    for plan in plan_cycle_hotkeys(
+        config.enable_keyboard_buttons,
+        config.forward_key,
+        config.backward_key,
+        config.modifier_key,
+        HOTKEY_FORWARD_ID,
+        HOTKEY_BACKWARD_ID,
+    ) {
         let _ = RegisterHotKey(
             None,
-            HOTKEY_FORWARD_ID,
-            HOT_KEY_MODIFIERS(0),
-            config.forward_key as u32,
+            plan.id,
+            modifier_to_winapi(plan.modifier),
+            plan.vk as u32,
         );
-        let modifier = config.modifier_key.map(vk_to_modifier);
-        let backward_mod = if config.forward_key == config.backward_key {
-            modifier.unwrap_or(HOT_KEY_MODIFIERS(0))
-        } else {
-            HOT_KEY_MODIFIERS(0)
-        };
-        if config.forward_key != config.backward_key || backward_mod.0 != 0 {
-            let _ = RegisterHotKey(
-                None,
-                HOTKEY_BACKWARD_ID,
-                backward_mod,
-                config.backward_key as u32,
-            );
-        }
     }
 
-    // Per-character hotkeys — iterate the characters list in order so
-    // hotkey IDs are stable for the same config, and populate the
-    // ID → name lookup.
     let mut lookup = character_lookup().lock().unwrap();
     lookup.clear();
-    let mut next_id = HOTKEY_CHARACTER_BASE;
-    for name in &config.characters {
-        let Some(hk) = config.character_hotkeys.get(name) else {
-            continue;
-        };
-        // vk == 0 is a placeholder entry — the user picked a modifier
-        // but hasn't captured a key yet. Skip registration; the entry
-        // becomes active only once a real VK is bound.
-        if hk.vk == 0 {
-            continue;
-        }
-        let modifier = hk
-            .modifier
-            .map(vk_to_modifier)
-            .unwrap_or(HOT_KEY_MODIFIERS(0));
-        if RegisterHotKey(None, next_id, modifier, hk.vk as u32).is_ok() {
-            lookup.insert(next_id, name.clone());
+    for plan in plan_character_hotkeys(
+        &config.characters,
+        &config.character_hotkeys,
+        HOTKEY_CHARACTER_BASE,
+    ) {
+        let modifier = modifier_to_winapi(plan.modifier);
+        if RegisterHotKey(None, plan.id, modifier, plan.vk as u32).is_ok() {
+            lookup.insert(plan.id, plan.character_name);
         } else {
             eprintln!(
                 "Failed to register per-character hotkey for '{}' (another app may own it)",
-                name
+                plan.character_name
             );
         }
-        next_id += 1;
     }
 }
 
@@ -354,12 +342,6 @@ fn unregister_hotkeys() {
         }
         lookup.clear();
     }
-}
-
-#[derive(Copy, Clone)]
-enum CycleDirection {
-    Forward,
-    Backward,
 }
 
 fn perform_cycle(
