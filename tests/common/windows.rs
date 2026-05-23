@@ -20,7 +20,7 @@ use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    KEYEVENTF_KEYUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowRect,
@@ -159,24 +159,58 @@ impl Drop for FakeEveHarness {
 }
 
 /// Activate one of the harness's fake EVE windows directly, bypassing
-/// Nicotine. On modern Windows `SetForegroundWindow` is denied unless
-/// the caller has input-chain rights (recently received user input,
-/// is the foreground process, etc.). Our test process running under
-/// `cargo test` on a CI runner usually has NONE of those — the runner
-/// agent or some background process owns the input chain. The
-/// canonical workaround: attach our thread's input queue to whatever
-/// process is currently foreground, perform SetForegroundWindow
-/// (which now succeeds because we share the foreground thread's
-/// queue), then detach.
+/// Nicotine. Modern Windows denies `SetForegroundWindow` unless the
+/// calling process meets one of several criteria — most relevantly
+/// "received a user input event recently". Our test process running
+/// under `cargo test` on a CI runner usually has none of these
+/// rights; the runner agent or some unkillable session UI thread
+/// (`HWND 0x201f2` etc.) owns foreground and won't yield to us.
+///
+/// Two-step workaround, combined for robustness:
+///
+/// 1. **ALT-tap to register input recency.** Synthesizing a brief
+///    `VK_MENU` press + release via `SendInput` makes the OS attribute
+///    "last input event" to our process. This is the documented
+///    workaround referenced in MSDN's "Steal Focus" notes and
+///    used widely by automation tools (NirCmd, AutoHotKey, etc.).
+///    A bare ALT tap has no visible effect on windows without a
+///    menu bar — our fake-EVE stubs have none, so this is silent.
+///    The daemon's keyboard listener uses `RegisterHotKey` which
+///    fires only on registered combinations, not bare modifiers,
+///    so the synthesized ALT doesn't trigger any cycle action.
+///
+/// 2. **AttachThreadInput dance** as a fallback. If the ALT-tap
+///    alone isn't enough on this particular runner image, sharing
+///    our thread's input queue with the foreground thread's queue
+///    gives `SetForegroundWindow` an additional path to succeed.
 ///
 /// Returns `Err` if the foreground didn't actually shift to `window`
-/// within a generous timeout — tests need to fail loudly here rather
+/// within a generous timeout. Tests need to fail loudly here rather
 /// than silently proceeding with a stale foreground, because the
 /// daemon's later force_activate relies on the foreground being a
 /// known fake EVE window to attach to.
 pub fn activate_window_directly(window: u32) -> anyhow::Result<()> {
     let hwnd = HWND(window as usize as *mut std::ffi::c_void);
     unsafe {
+        // (1) ALT tap — registers our process as the input recipient
+        // so the OS accepts the upcoming SetForegroundWindow call.
+        let mk_alt = |flags: KEYBD_EVENT_FLAGS| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_MENU,
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let alt_events = [mk_alt(KEYBD_EVENT_FLAGS(0)), mk_alt(KEYEVENTF_KEYUP)];
+        let _ = SendInput(&alt_events, std::mem::size_of::<INPUT>() as i32);
+
+        // (2) AttachThreadInput dance — second path to foreground
+        // rights, in case (1) doesn't take on this runner image.
         let current_thread = GetCurrentThreadId();
         let foreground = GetForegroundWindow();
         let foreground_thread = if foreground.0.is_null() {
@@ -187,8 +221,10 @@ pub fn activate_window_directly(window: u32) -> anyhow::Result<()> {
         let attached = foreground_thread != 0
             && foreground_thread != current_thread
             && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
+
         let _ = SetForegroundWindow(hwnd);
         let _ = BringWindowToTop(hwnd);
+
         if attached {
             let _ = AttachThreadInput(current_thread, foreground_thread, false);
         }
@@ -204,9 +240,10 @@ pub fn activate_window_directly(window: u32) -> anyhow::Result<()> {
     let final_fg = unsafe { GetForegroundWindow() };
     anyhow::bail!(
         "activate_window_directly: foreground didn't become {:?} within 800ms; \
-         final foreground = {:?}. The test runner may not allow cross-process \
-         foreground changes — check that the test isn't running in a \
-         service-isolated session.",
+         final foreground = {:?}. Both ALT-tap and AttachThreadInput \
+         workarounds were tried — the test runner may have additional \
+         foreground-stealing restrictions (e.g. Session 0 isolation, \
+         elevated foreground process at higher integrity level).",
         hwnd.0,
         final_fg.0
     )

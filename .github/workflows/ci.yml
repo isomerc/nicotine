@@ -134,6 +134,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Run the bin's unit tests on Windows too — some of them are
+      # `#[cfg(windows)]` and validate Win32 behavior (e.g. that
+      # OEM VKs translate to layout characters via MapVirtualKeyW
+      # for the binding panel labels). Linux can't exercise these.
+      - name: Run unit tests
+        shell: bash
+        run: cargo test --bin Nicotine
+
       # GitHub's windows-latest runners have a graphical session
       # available by default; no Xvfb-equivalent setup needed. The
       # fake-EVE harness creates real top-level windows via

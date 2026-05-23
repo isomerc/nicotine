@@ -495,6 +495,25 @@ const SUPPORTED_KEYS: &[egui::Key] = &[
 /// happened. The code is a Win32 VK on Windows / a Linux evdev keycode
 /// on Linux — same semantics the daemon's hotkey listener expects.
 fn captured_binding(ctx: &egui::Context) -> Option<u16> {
+    // On Windows, OEM/punctuation VKs are LAYOUT-DEPENDENT. The same
+    // physical key produces different VK codes on different keyboard
+    // layouts (e.g. the `#` key on German is VK_OEM_2 / 0xBF, but
+    // egui-winit translates the underlying scancode to its
+    // US-named `Key::Backslash` which our static map turns into
+    // VK_OEM_5 / 0xDC — a value that doesn't match what
+    // RegisterHotKey sees at runtime when the user presses `#`).
+    // Query the OS for the actually-held VK in the OEM range; if
+    // one is down, use it. This gives us the VK RegisterHotKey
+    // will receive on subsequent presses, regardless of layout.
+    //
+    // Non-OEM keys (letters, digits, F-keys, modifiers, arrows)
+    // have layout-stable VKs, so the static egui-to-VK map below
+    // is fine for them.
+    #[cfg(windows)]
+    if let Some(vk) = oem_vk_currently_pressed() {
+        return Some(vk);
+    }
+
     ctx.input(|i| {
         for key in SUPPORTED_KEYS {
             if *key == egui::Key::Escape {
@@ -507,6 +526,61 @@ fn captured_binding(ctx: &egui::Context) -> Option<u16> {
         None
     })
 }
+
+/// Scan the Windows OEM/punctuation VK range via `GetAsyncKeyState`
+/// and return the first VK whose "down" bit is set. Used by
+/// `captured_binding` to bypass egui-winit's US-layout-based
+/// translation for the keys whose VK varies by keyboard layout.
+///
+/// The VK list covers the standard OEM range documented in MSDN:
+/// `VK_OEM_1` (0xBA) through `VK_OEM_3` (0xC0), `VK_OEM_4` (0xDB)
+/// through `VK_OEM_8` (0xDF), plus `VK_OEM_102` (0xE2) for the ISO
+/// `<>` key found on most non-US keyboards.
+#[cfg(windows)]
+fn oem_vk_currently_pressed() -> Option<u16> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    for &vk in OEM_VK_RANGE {
+        let state = unsafe { GetAsyncKeyState(vk as i32) };
+        // High bit = currently pressed.
+        if (state as u32 & 0x8000) != 0 {
+            return Some(vk);
+        }
+    }
+    None
+}
+
+/// Translate a Windows OEM VK to its current keyboard layout's
+/// character via `MapVirtualKeyW(MAPVK_VK_TO_CHAR)`. Returns the
+/// unshifted printable character — e.g. `VK_OEM_5` is `\` on US,
+/// `#` on German, `^` on French. Returns `None` if the VK doesn't
+/// produce a printable character on the current layout (rare; the
+/// ISO `<>` key on a US ANSI keyboard is one example).
+///
+/// Dead keys (acute accent on French/German, etc.) have the high
+/// bit set in the return value; we strip it and use the character
+/// anyway, since users see the dead-key glyph on their physical key.
+#[cfg(windows)]
+fn oem_vk_to_char(vk: u16) -> Option<String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_CHAR};
+    let result = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_CHAR) };
+    if result == 0 {
+        return None;
+    }
+    let ch = (result & 0xFFFF) as u32;
+    if ch == 0 {
+        return None;
+    }
+    char::from_u32(ch).map(|c| c.to_string())
+}
+
+/// The complete VK range whose layout-dependence we route through
+/// the OS rather than the static egui-translation table.
+#[cfg(windows)]
+const OEM_VK_RANGE: &[u16] = &[
+    0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, // OEM_1, +, ,, -, ., /, ~
+    0xDB, 0xDC, 0xDD, 0xDE, 0xDF, // OEM_4-8
+    0xE2, // OEM_102 (ISO key)
+];
 
 /// Map an egui Key to the Windows Virtual-Key code. Returns None for
 /// keys without a standard VK_ (exotic IME / media keys).
@@ -743,13 +817,19 @@ fn code_to_label(vk: u16) -> String {
         0x10 | 0xA0 | 0xA1 => "Shift".into(),
         0x11 | 0xA2 | 0xA3 => "Ctrl".into(),
         0x12 | 0xA4 | 0xA5 => "Alt".into(),
-        0xC0 => "`".into(),
         0x30..=0x39 => format!("{}", (vk - 0x30) as u8 as char),
         0x41..=0x5A => format!("{}", vk as u8 as char),
         0x26 => "Up".into(),
         0x28 => "Down".into(),
         0x25 => "Left".into(),
         0x27 => "Right".into(),
+        // OEM/punctuation VKs: ask the OS what character this VK
+        // produces on the current keyboard layout. Avoids showing
+        // opaque "VK 0xDC" to non-US users (where the same code
+        // produces different characters: \ on US, # on German, etc.).
+        0xBA..=0xC0 | 0xDB..=0xDF | 0xE2 => {
+            oem_vk_to_char(vk).unwrap_or_else(|| format!("VK 0x{:02X}", vk))
+        }
         other => format!("VK 0x{:02X}", other),
     }
 }
@@ -956,6 +1036,234 @@ mod tests {
                 code_to_label(code),
                 name,
                 "code {code} for {name} renders as raw fallback instead of the F-key name"
+            );
+        }
+    }
+
+    /// End-to-end verification of the capture path. SendInput a
+    /// keystroke by scancode (so Windows resolves the VK via the
+    /// active layout, exactly like a real hardware press), then
+    /// call `oem_vk_currently_pressed` and verify it returns the
+    /// layout-resolved VK. Catches the class of failure where
+    /// `GetAsyncKeyState` doesn't see injected input or our scan
+    /// misses a VK that should be in range.
+    ///
+    /// The test uses `MapVirtualKeyExW(MAPVK_VSC_TO_VK)` to compute
+    /// the expected VK for the chosen scancode under the current
+    /// keyboard layout — so it works on US, German, or any other
+    /// layout the runner happens to have active.
+    ///
+    #[cfg(windows)]
+    #[test]
+    fn oem_vk_currently_pressed_detects_synthesized_keystroke() {
+        use std::time::Duration;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardLayout, MapVirtualKeyExW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD,
+            KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VSC_TO_VK, VIRTUAL_KEY,
+        };
+
+        // Scancode 0x2B is the key at the top-right of the
+        // alphanumeric block — on US ANSI that's `\` / VK_OEM_5
+        // (0xDC); on German ISO that's `#` / VK_OEM_2 (0xBF); on
+        // French it's `*` / VK_OEM_2. We don't hard-code the
+        // expected VK — we ask Windows itself via MapVirtualKeyExW.
+        const TEST_SCANCODE: u16 = 0x2B;
+
+        let layout = unsafe { GetKeyboardLayout(0) };
+        let expected_vk =
+            unsafe { MapVirtualKeyExW(TEST_SCANCODE as u32, MAPVK_VSC_TO_VK, Some(layout)) } as u16;
+        if expected_vk == 0 {
+            eprintln!(
+                "Scancode 0x{:02X} doesn't map to a VK on the current layout; skipping",
+                TEST_SCANCODE
+            );
+            return;
+        }
+        // The expected VK must be one our scan range covers — if
+        // not, this is itself a regression in OEM_VK_RANGE that
+        // the previous test should have caught. Belt-and-braces
+        // assertion here keeps the failure mode obvious.
+        assert!(
+            OEM_VK_RANGE.contains(&expected_vk),
+            "Expected VK 0x{expected_vk:02X} for scancode 0x{TEST_SCANCODE:02X} \
+             is not in OEM_VK_RANGE — the scan can never detect it"
+        );
+
+        let make_input = |flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: TEST_SCANCODE,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let down = make_input(KEYEVENTF_SCANCODE);
+        let up = make_input(KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP);
+
+        let n_down = unsafe { SendInput(&[down], std::mem::size_of::<INPUT>() as i32) };
+        assert_eq!(n_down, 1, "SendInput KEYDOWN should accept the event");
+
+        // Give the OS a moment to apply the input to its async key
+        // state table. Sub-frame timing on a fast machine; 20ms is
+        // a generous ceiling that won't slow CI perceptibly.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let captured = oem_vk_currently_pressed();
+
+        // Always release before asserting so a failing test doesn't
+        // leave the key "stuck down" for sibling tests run later.
+        let n_up = unsafe { SendInput(&[up], std::mem::size_of::<INPUT>() as i32) };
+        assert_eq!(n_up, 1, "SendInput KEYUP should accept the event");
+
+        assert_eq!(
+            captured,
+            Some(expected_vk),
+            "oem_vk_currently_pressed should detect the synthesized key — \
+             expected VK 0x{expected_vk:02X} (scancode 0x{TEST_SCANCODE:02X} \
+             on the active layout), got {captured:?}"
+        );
+    }
+
+    /// Sweep our static OEM_VK_RANGE constant against the canonical
+    /// MSDN range. Catches the class of regression where a refactor
+    /// shrinks the scan range and we'd silently miss a
+    /// layout-dependent key in `captured_binding`.
+    #[cfg(windows)]
+    #[test]
+    fn oem_vk_range_covers_all_documented_oem_vks() {
+        let expected: Vec<u16> = (0xBAu16..=0xC0)
+            .chain(0xDBu16..=0xDF)
+            .chain([0xE2u16])
+            .collect();
+        assert_eq!(
+            OEM_VK_RANGE,
+            expected.as_slice(),
+            "OEM_VK_RANGE drifted from the documented MSDN OEM range — \
+             missing entries mean oem_vk_currently_pressed silently \
+             skips layout-dependent keys (e.g. the German #)"
+        );
+    }
+
+    /// The crux of the German-`#` bug. Switch the active keyboard
+    /// layout to German programmatically, ask `oem_vk_to_char` what
+    /// character `VK_OEM_2` produces there, restore the layout,
+    /// assert the answer is `#`. If `oem_vk_to_char` were
+    /// hardcoded to a US table (or our static `code_to_label`
+    /// fallback regressed), this fails.
+    ///
+    /// The Drop guard ensures the original layout is restored even
+    /// on assertion panic, so this test doesn't poison sibling
+    /// tests run by the same `cargo test` invocation.
+    ///
+    /// Skips with a message if the German layout DLL isn't
+    /// installed on the runner — uncommon on `windows-latest` but
+    /// possible on minimal Windows images.
+    #[cfg(windows)]
+    #[test]
+    fn oem_vk_to_char_respects_active_keyboard_layout() {
+        use windows::core::w;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            ActivateKeyboardLayout, GetKeyboardLayout, LoadKeyboardLayoutW,
+            ACTIVATE_KEYBOARD_LAYOUT_FLAGS, HKL, KLF_ACTIVATE,
+        };
+
+        let saved = unsafe { GetKeyboardLayout(0) };
+        let german = match unsafe {
+            LoadKeyboardLayoutW(
+                w!("00000407"),
+                ACTIVATE_KEYBOARD_LAYOUT_FLAGS(KLF_ACTIVATE.0),
+            )
+        } {
+            Ok(hkl) => hkl,
+            Err(e) => {
+                eprintln!(
+                    "German keyboard layout (0x0407) not installed on this runner ({e:?}); \
+                     skipping cross-layout test."
+                );
+                return;
+            }
+        };
+
+        struct LayoutGuard(HKL);
+        impl Drop for LayoutGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = ActivateKeyboardLayout(self.0, ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0));
+                }
+            }
+        }
+        let _guard = LayoutGuard(saved);
+
+        unsafe {
+            let _ = ActivateKeyboardLayout(german, ACTIVATE_KEYBOARD_LAYOUT_FLAGS(KLF_ACTIVATE.0));
+        }
+
+        // VK_OEM_2 (0xBF) on German layout is `#` — the exact key
+        // from the bug report. On US it would be `/`.
+        let label = oem_vk_to_char(0xBF);
+        assert_eq!(
+            label.as_deref(),
+            Some("#"),
+            "VK_OEM_2 (0xBF) on German keyboard layout should produce '#', got {label:?}"
+        );
+
+        // While we're here, sanity-check a second German-specific
+        // mapping so we catch "MapVirtualKey accidentally took the
+        // shifted character" type regressions.
+        let oem4 = oem_vk_to_char(0xDB); // VK_OEM_4 — German `ß`
+        assert_eq!(
+            oem4.as_deref(),
+            Some("ß"),
+            "VK_OEM_4 (0xDB) on German should produce 'ß' (eszett), got {oem4:?}"
+        );
+    }
+
+    /// OEM/punctuation VKs are layout-dependent on Windows — what
+    /// character a given VK produces varies (US `\\` vs German `#`
+    /// for VK_OEM_5). The label MUST query the OS for the current
+    /// layout's character rather than fall through to `VK 0x{:02X}`
+    /// which is opaque to users. This test runs on Windows only;
+    /// the underlying `MapVirtualKeyW` is a Win32 call.
+    #[cfg(windows)]
+    #[test]
+    fn oem_vk_label_shows_layout_character_not_hex_fallback() {
+        // Sweep the full OEM range. Each VK in this range must
+        // resolve to a layout character — never the "VK 0x..." hex
+        // fallback. On a US-layout runner these are typically
+        // single ASCII chars (`\`, `]`, `[`, `'`, `;`, `,`, `.`,
+        // `/`, etc.). On a German runner they'd be `#`, `+`, `Ü`,
+        // and so on.
+        const OEM_RANGE: &[u16] = &[
+            0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, // OEM_1, +, ,, -, ., /, ~
+            0xDB, 0xDC, 0xDD, 0xDE, 0xDF, // OEM_4-8
+            0xE2, // OEM_102 (ISO key)
+        ];
+        for &vk in OEM_RANGE {
+            let label = code_to_label(vk);
+            // Some VKs don't exist on US ANSI keyboards, so
+            // MapVirtualKeyW returns 0 (no character) on a US-layout
+            // runner and the label falls back to the hex form.
+            // That's fine for end users — they can't physically
+            // press these keys, so they never see the fallback —
+            // but it makes the test flaky depending on runner
+            // locale. Skip the layout-extras here:
+            //   - VK_OEM_8  (0xDF): rare miscellaneous, varies
+            //   - VK_OEM_102 (0xE2): ISO `<>` key (European boards)
+            if matches!(vk, 0xDF | 0xE2) {
+                continue;
+            }
+            assert!(
+                !label.starts_with("VK 0x"),
+                "OEM VK 0x{vk:02X} should resolve to a layout character via \
+                 MapVirtualKeyW (US: \\, German: #, etc.), got {label:?}"
+            );
+            assert!(
+                !label.is_empty(),
+                "OEM VK 0x{vk:02X} produced an empty label"
             );
         }
     }
