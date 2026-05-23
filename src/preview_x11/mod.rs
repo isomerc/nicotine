@@ -67,6 +67,16 @@ impl<T> MutexExt<T> for Mutex<T> {
 /// handle_event) so it only runs when EVE windows actually appear or
 /// disappear. Running enumeration on every tick caused ~10Hz judder.
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
+/// Backstop for window enumeration. The event-driven triggers
+/// (_NET_CLIENT_LIST + _NET_ACTIVE_WINDOW PropertyNotify) cover the
+/// common cases, but neither fires if a new EVE client maps with a
+/// generic title ("EVE Online") and the user never focuses it — they'd
+/// see the client in their cycle list (the daemon re-enumerates every
+/// 500ms separately) but no preview window. Re-scanning every 2s as a
+/// safety net catches those late title resolutions. 2s is slow enough
+/// to be invisible — the scan is ~3 sync round-trips, perceptible at
+/// 10Hz but not at 0.5Hz.
+const WINDOW_SCAN_BACKSTOP: Duration = Duration::from_secs(2);
 /// 8ms ≈ 125Hz polling, slightly above a 120Hz display's vblank rate.
 /// Composites + presents are gated on damage events, so an idle loop
 /// iteration is just one poll_for_event call — cheap. Going faster than
@@ -265,6 +275,7 @@ fn run_manager(
         current_mode: initial_mode,
         list_window: None,
         needs_window_scan: true,
+        last_window_scan: Instant::now(),
     };
     manager.run()
 }
@@ -337,6 +348,10 @@ struct PreviewManager {
     /// window enumeration. Without this we'd re-enumerate every 100ms,
     /// and the get_property round-trips cause visible ~10Hz judder.
     needs_window_scan: bool,
+    /// Wall time of the last successful enumeration. Drives the
+    /// `WINDOW_SCAN_BACKSTOP` periodic re-scan that catches EVE clients
+    /// whose title only becomes "EVE - <name>" after the user logs in.
+    last_window_scan: Instant,
 }
 
 impl PreviewManager {
@@ -470,8 +485,14 @@ impl PreviewManager {
         // Only re-enumerate EVE windows when something actually changed.
         // find_eve_windows is ~3 sync get_property round-trips on a
         // typical setup; doing it every 100ms made the preview judder
-        // at ~10Hz. Trigger is set on startup (initial scan) and by
-        // _NET_CLIENT_LIST PropertyNotify in handle_event.
+        // at ~10Hz. Triggers: startup (initial scan), _NET_CLIENT_LIST
+        // PropertyNotify, _NET_ACTIVE_WINDOW PropertyNotify, and the
+        // WINDOW_SCAN_BACKSTOP timer below (catches new clients whose
+        // title only resolves after login and that the user never
+        // explicitly focuses).
+        if self.last_window_scan.elapsed() >= WINDOW_SCAN_BACKSTOP {
+            self.needs_window_scan = true;
+        }
         if self.needs_window_scan {
             let eve_windows = self.find_eve_windows()?;
             let live: HashSet<String> = eve_windows.iter().map(|(_, t)| t.clone()).collect();
@@ -495,6 +516,7 @@ impl PreviewManager {
                 }
             }
             self.needs_window_scan = false;
+            self.last_window_scan = Instant::now();
         }
 
         // Apply panel slider changes (preview width/height). No sync
