@@ -70,9 +70,15 @@ impl KeyboardListener {
         loop {
             let snap = shared.lock().unwrap().clone();
 
-            if !snap.enable {
+            // Character hotkeys are an independent dispatch path from
+            // forward/backward cycling — keep the listener live so they
+            // fire even when the user hasn't enabled keyboard cycling.
+            if !snap.enable && snap.character_hotkeys.is_empty() {
                 if !announced_idle {
-                    println!("Keyboard listener idle (enable_keyboard_buttons = false)");
+                    println!(
+                        "Keyboard listener idle (enable_keyboard_buttons = false, \
+                         no character hotkeys bound)"
+                    );
                     announced_idle = true;
                     announced_listening = false;
                 }
@@ -195,28 +201,33 @@ impl KeyboardListener {
                 }
 
                 // Modifier+backward must be checked first so the
-                // same-key (Tab + Shift+Tab) pattern works.
-                let main_modifier_held = snap
-                    .modifier_key
-                    .map(|m| pressed_modifiers.contains(&m))
-                    .unwrap_or(false);
-                if code == snap.backward_key && main_modifier_held {
-                    if let Err(e) = Self::cycle_backward(&wm, &state, snap.minimize_inactive) {
-                        eprintln!("Failed to cycle backward: {}", e);
+                // same-key (Tab + Shift+Tab) pattern works. Skip the
+                // whole cycling block when the user has cycling
+                // disabled but kept the listener alive for character
+                // hotkeys — otherwise Tab would still cycle.
+                if snap.enable {
+                    let main_modifier_held = snap
+                        .modifier_key
+                        .map(|m| pressed_modifiers.contains(&m))
+                        .unwrap_or(false);
+                    if code == snap.backward_key && main_modifier_held {
+                        if let Err(e) = Self::cycle_backward(&wm, &state, snap.minimize_inactive) {
+                            eprintln!("Failed to cycle backward: {}", e);
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                if code == snap.forward_key {
-                    if let Err(e) = Self::cycle_forward(&wm, &state, snap.minimize_inactive) {
-                        eprintln!("Failed to cycle forward: {}", e);
+                    if code == snap.forward_key {
+                        if let Err(e) = Self::cycle_forward(&wm, &state, snap.minimize_inactive) {
+                            eprintln!("Failed to cycle forward: {}", e);
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                if code == snap.backward_key {
-                    if let Err(e) = Self::cycle_backward(&wm, &state, snap.minimize_inactive) {
-                        eprintln!("Failed to cycle backward: {}", e);
+                    if code == snap.backward_key {
+                        if let Err(e) = Self::cycle_backward(&wm, &state, snap.minimize_inactive) {
+                            eprintln!("Failed to cycle backward: {}", e);
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 let target =
