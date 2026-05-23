@@ -24,6 +24,15 @@ impl PreviewManager {
             Event::PropertyNotify(ev) if ev.atom == self.atoms.net_active_window => {
                 self.update_active()?;
                 self.restack_topmost();
+                // Focus changes are the most reliable signal that a
+                // newly-started EVE client has finished initializing
+                // (title set, PID resolvable). _NET_CLIENT_LIST fires
+                // when the window is first mapped — before the title
+                // is "EVE - <name>" — so we can miss a client whose
+                // title only resolves after login. Piggy-backing on
+                // the focus signal catches it the moment the user
+                // cycles or clicks it.
+                self.needs_window_scan = true;
             }
             // The WM updates _NET_CLIENT_LIST whenever a top-level
             // window is mapped or destroyed. Use it as the signal to
