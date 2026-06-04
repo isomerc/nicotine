@@ -896,6 +896,22 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
 
     let audio = crate::audio::spawn();
 
+    let mut window = iced::window::Settings {
+        size: iced::Size::new(720.0, 680.0),
+        min_size: Some(iced::Size::new(560.0, 420.0)),
+        resizable: true,
+        icon,
+        ..Default::default()
+    };
+    // On Linux the titlebar/taskbar icon comes from a desktop-file match, not
+    // the pixel `icon` above (Wayland has no per-window icon protocol). Setting
+    // the app_id to the `nicotine.desktop` basename lets KWin find the icon;
+    // iced feeds this to winit's `with_name` (Wayland app_id / X11 WM_CLASS).
+    #[cfg(target_os = "linux")]
+    {
+        window.platform_specific.application_id = "nicotine".to_string();
+    }
+
     iced::application(
         move || Panel::new(config.clone(), Arc::clone(&live), audio.clone()),
         update,
@@ -911,13 +927,7 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
     .default_font(iced::Font::with_name("JetBrains Mono"))
     .font(include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf").as_slice())
     .font(include_bytes!("../../assets/fonts/Marlboro.ttf").as_slice())
-    .window(iced::window::Settings {
-        size: iced::Size::new(720.0, 680.0),
-        min_size: Some(iced::Size::new(560.0, 420.0)),
-        resizable: true,
-        icon,
-        ..Default::default()
-    })
+    .window(window)
     .run()
 }
 
