@@ -9,8 +9,8 @@ use iced::{Alignment, Background, Element, Font, Length};
 use crate::config::DisplayMode;
 
 use super::{
-    code_to_label, CaptureTarget, Message, Panel, MODIFIER_CHOICES, NICOTINE_BLACK, NICOTINE_CREAM,
-    NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED,
+    code_to_label, CaptureTarget, Message, Panel, Tab, CAPTION_SIZE, LOGO_SIZE, MODIFIER_CHOICES,
+    NICOTINE_BLACK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED, SECTION_SIZE,
 };
 
 const LOGO_FONT: Font = Font::with_name("Marlboro");
@@ -23,7 +23,7 @@ pub(super) fn header() -> Element<'static, Message> {
     container(
         text("Nicotine")
             .font(LOGO_FONT)
-            .size(48)
+            .size(LOGO_SIZE)
             .color(NICOTINE_CREAM),
     )
     .center_x(Length::Fill)
@@ -71,30 +71,88 @@ pub(super) fn footer() -> Element<'static, Message> {
 
 fn link_button(label: impl Into<String>, url: impl Into<String>) -> Element<'static, Message> {
     let url = url.into();
-    button(text(label.into()).color(NICOTINE_RED).font(BOLD).size(13))
+    button(text(label.into()).color(NICOTINE_RED).font(BOLD))
         .style(button::text)
         .padding(0)
         .on_press(Message::OpenLink(url))
         .into()
 }
 
-pub(super) fn body(panel: &Panel) -> Element<'_, Message> {
-    container(
-        column![
-            display_mode_section(panel),
-            characters_section(panel),
-            hotkeys_section(panel),
-            previews_section(panel),
-        ]
-        .spacing(20),
-    )
-    .padding([12, 16])
-    .into()
+pub(super) fn tab_sidebar(panel: &Panel) -> Element<'_, Message> {
+    let col = column![
+        tab_button("Display", Tab::Display, panel.active_tab == Tab::Display),
+        tab_button(
+            "Characters",
+            Tab::Characters,
+            panel.active_tab == Tab::Characters
+        ),
+        tab_button("Hotkeys", Tab::Hotkeys, panel.active_tab == Tab::Hotkeys),
+    ]
+    .spacing(4);
+
+    container(col)
+        .padding(8)
+        .width(Length::Fixed(150.0))
+        .height(Length::Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(NICOTINE_CREAM)),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn tab_button(label: &'static str, tab: Tab, active: bool) -> Element<'static, Message> {
+    button(text(label))
+        .width(Length::Fill)
+        .padding([8, 12])
+        .on_press(Message::TabSelected(tab))
+        .style(move |_theme, status| {
+            let (bg, fg) = if active {
+                (NICOTINE_RED, NICOTINE_CREAM)
+            } else if matches!(status, button::Status::Hovered) {
+                (NICOTINE_GOLD, NICOTINE_BLACK)
+            } else {
+                (NICOTINE_CREAM, NICOTINE_BLACK)
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: fg,
+                ..button::Style::default()
+            }
+        })
+        .into()
+}
+
+pub(super) fn vdivider() -> Element<'static, Message> {
+    container(Space::new().width(Length::Fixed(1.0)).height(Length::Fill))
+        .height(Length::Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(NICOTINE_GOLD)),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+pub(super) fn tab_content(panel: &Panel) -> Element<'_, Message> {
+    let inner: Element<'_, Message> = match panel.active_tab {
+        Tab::Display => column![display_mode_section(panel), previews_section(panel)]
+            .spacing(20)
+            .into(),
+        Tab::Characters => characters_section(panel),
+        Tab::Hotkeys => hotkeys_section(panel),
+    };
+    container(inner)
+        .padding([12, 16])
+        .width(Length::Fill)
+        .into()
 }
 
 fn section_header(label: &'static str) -> Element<'static, Message> {
     column![
-        text(label).size(16).color(NICOTINE_RED).font(BOLD),
+        text(label)
+            .size(SECTION_SIZE)
+            .color(NICOTINE_RED)
+            .font(BOLD),
         divider(),
     ]
     .spacing(4)
@@ -112,7 +170,7 @@ fn divider() -> Element<'static, Message> {
 }
 
 fn caption(s: &'static str) -> Element<'static, Message> {
-    text(s).size(11).color(NICOTINE_BLACK).into()
+    text(s).size(CAPTION_SIZE).color(NICOTINE_BLACK).into()
 }
 
 fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
@@ -281,7 +339,7 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
             "Click a binding to record the next key you press. Esc cancels. Set both keys to the \
              same value with a modifier to cycle backward via modifier+key (e.g. Tab + Shift+Tab)."
         )
-        .size(10)
+        .size(CAPTION_SIZE)
         .color(NICOTINE_BLACK),
         checkbox(panel.config.enable_mouse_buttons)
             .label("Cycle on mouse side buttons (XBUTTON1/XBUTTON2)")
@@ -290,7 +348,7 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
             "Off by default. Turn on only if you don't already remap your mouse side buttons via \
              driver software (Logi Options+, Razer Synapse, etc.)."
         )
-        .size(10)
+        .size(CAPTION_SIZE)
         .color(NICOTINE_BLACK),
     ]
     .spacing(8)

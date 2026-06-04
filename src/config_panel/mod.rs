@@ -42,6 +42,14 @@ pub(super) const NICOTINE_GREEN: Color = Color {
     a: 1.0,
 };
 
+// ---- Type scale (logical px). One deliberate set of sizes. ----
+// TEXT_SIZE is the app-wide default (set in `run`); everything interactive
+// inherits it. The others are the only sanctioned overrides.
+pub(super) const TEXT_SIZE: f32 = 14.0;
+pub(super) const SECTION_SIZE: f32 = 18.0;
+pub(super) const CAPTION_SIZE: f32 = 12.0;
+pub(super) const LOGO_SIZE: f32 = 44.0;
+
 /// Which config field is currently capturing a live keypress. Only one
 /// can capture at a time; `None` means no capture. `Character` carries the
 /// character name so per-character bindings survive list reorders.
@@ -51,6 +59,14 @@ pub(super) enum CaptureTarget {
     BackwardKey,
     ModifierKey,
     Character(String),
+}
+
+/// Which settings tab is shown in the left nav rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Tab {
+    Display,
+    Characters,
+    Hotkeys,
 }
 
 /// One entry in the modifier dropdown. Codes are platform-specific:
@@ -118,6 +134,8 @@ pub(super) struct Panel {
     /// Timestamp of the last edit; the debounce subscription flushes to
     /// disk once this is older than `AUTOSAVE_DEBOUNCE`.
     pub last_change: Option<Instant>,
+    /// Active left-rail settings tab.
+    pub active_tab: Tab,
 }
 
 impl Panel {
@@ -128,6 +146,7 @@ impl Panel {
             new_character_buffer: String::new(),
             capturing: None,
             last_change: None,
+            active_tab: Tab::Display,
         }
     }
 
@@ -220,6 +239,7 @@ pub(super) enum Message {
     MouseEnabledToggled(bool),
     ClearModifier,
     StartCapture(CaptureTarget),
+    TabSelected(Tab),
     KeyEvent(iced::keyboard::Event),
     ShowPreviewsToggled(bool),
     PreviewWidthChanged(u32),
@@ -321,6 +341,9 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
                 panel.capturing = Some(target);
             }
         }
+        Message::TabSelected(tab) => {
+            panel.active_tab = tab;
+        }
         Message::KeyEvent(event) => {
             return panel.handle_capture_key(event);
         }
@@ -357,12 +380,19 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
 }
 
 fn view(panel: &Panel) -> Element<'_, Message> {
-    use iced::widget::{column, scrollable};
+    use iced::widget::{column, row, scrollable};
     use iced::Length;
 
     column![
         ui::header(),
-        scrollable(ui::body(panel)).height(Length::Fill),
+        row![
+            ui::tab_sidebar(panel),
+            ui::vdivider(),
+            scrollable(ui::tab_content(panel))
+                .width(Length::Fill)
+                .height(Length::Fill),
+        ]
+        .height(Length::Fill),
         ui::footer(),
     ]
     .width(Length::Fill)
@@ -792,14 +822,18 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
         view,
     )
     .title("Nicotine")
+    .settings(iced::Settings {
+        default_text_size: iced::Pixels(TEXT_SIZE),
+        ..Default::default()
+    })
     .theme(theme)
     .subscription(subscription)
     .default_font(iced::Font::with_name("JetBrains Mono"))
     .font(include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf").as_slice())
     .font(include_bytes!("../../assets/fonts/Marlboro.ttf").as_slice())
     .window(iced::window::Settings {
-        size: iced::Size::new(600.0, 720.0),
-        min_size: Some(iced::Size::new(480.0, 360.0)),
+        size: iced::Size::new(720.0, 680.0),
+        min_size: Some(iced::Size::new(560.0, 420.0)),
         resizable: true,
         icon,
         ..Default::default()
