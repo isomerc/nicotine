@@ -35,13 +35,20 @@ anyhow = "1.0"
 dirs = "5.0"
 interprocess = "2.2"
 fd-lock = "4.0"
-egui = "0.29"
+# iced 0.14 powers the config panel (replaces egui/eframe). Default
+# features pull in the wgpu (GPU) + tiny-skia renderers. On KWin Plasma
+# Wayland the panel runs as a NATIVE WAYLAND window and renders on the
+# GPU; it must never force the winit X11 backend, which panics
+# ("Invalid surface") under XWayland. Same toolkit on Linux and Windows.
+# `smol` enables iced::time::every (the debounce timer subscription),
+# which isn't in iced's default features. `image` enables the window-icon
+# decoder (iced::window::icon::from_file_data).
+iced = { version = "0.14", features = ["image", "smol"] }
 uuid = { version = "1", features = ["v4"] }
-# ab_glyph is already in our tree (egui pulls it in for its font system).
-# Bringing it up as a direct dep so preview_x11 can rasterize the
-# character-name title text into an A8 alpha bitmap on Linux. Glyph
-# raster lives in client memory; only the resulting pixmap goes to the
-# X server, so this is a one-shot cost at preview creation, not per-frame.
+# Direct dep so preview_x11 can rasterize the character-name title text
+# into an A8 alpha bitmap on Linux. Glyph raster lives in client memory;
+# only the resulting pixmap goes to the X server, so this is a one-shot
+# cost at preview creation, not per-frame.
 ab_glyph = "0.2"
 # Shared HTTP client used by both the version-check (Linux only) and the
 # launch telemetry ping (cross-platform). rustls-tls keeps it pure-ish
@@ -54,44 +61,19 @@ reqwest = { version = "0.12", features = [
 
 [target.'cfg(unix)'.dependencies]
 x11rb = { version = "0.13", features = ["all-extensions"] }
-# X11 only — preview manager uses XComposite + XRender, so the panel
-# needs to live on the same X server (XWayland on Wayland sessions).
-# Dropping the wayland feature means no libwayland-client dependency at
-# runtime, which removes a class of LD_LIBRARY_PATH failures and avoids
-# fragmenting focus/cursor across two windowing backends. Every Linux
-# EVE setup already has X11 (XWayland) since EVE itself needs it.
-eframe = { version = "0.29", default-features = false, features = [
-  "default_fonts",
-  "glow",
-  "x11",
-] }
-# winit (0.30, the version eframe 0.29 pulls in) is added as a direct
-# dep so we can call `EventLoopBuilderExtX11::with_x11()` on the
-# event-loop builder hook in config_panel::run. winit on Linux defaults
-# to "try Wayland first, then X11" — even with eframe's wayland feature
-# disabled, winit itself can still get the wayland feature from
-# transitive deps. with_x11() at runtime forces the right backend
-# regardless of feature unification.
-winit = "0.30"
 daemonize = "0.5"
 nix = { version = "0.29", features = ["fs", "poll", "process", "signal"] }
 evdev = "0.12"
 # Narrow Wayland-client dep for xdg-activation tokens only. The protocol
-# is how a non-Wayland client (we're X11-through-XWayland) hands the
-# Wayland compositor authority to focus another surface — needed to make
-# `nicotine cycle` actually deliver subsequent clicks to the newly-active
-# EVE client on KWin Wayland, where X11 _NET_ACTIVE_WINDOW alone doesn't
-# propagate to Wayland surface focus. Pure-Rust impl via wayland-backend,
-# no libwayland-client.so runtime dependency (which was the original
-# reason eframe's `wayland` feature was dropped).
+# is how a client hands the Wayland compositor authority to focus another
+# surface — needed to make `nicotine cycle` actually deliver subsequent
+# clicks to the newly-active EVE client on KWin Wayland, where X11
+# _NET_ACTIVE_WINDOW alone doesn't propagate to Wayland surface focus.
+# Pure-Rust impl via wayland-backend.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
 [target.'cfg(windows)'.dependencies]
-eframe = { version = "0.29", default-features = false, features = [
-  "default_fonts",
-  "glow",
-] }
 windows = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
