@@ -20,6 +20,15 @@ const BOLD: Font = Font {
     ..Font::with_name("JetBrains Mono")
 };
 
+/// A container style that's just a solid fill — the common case for the
+/// header strip, footer, sidebar, and dividers.
+fn filled(color: Color) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(color)),
+        ..container::Style::default()
+    }
+}
+
 pub(super) fn header() -> Element<'static, Message> {
     container(
         mouse_area(
@@ -32,10 +41,7 @@ pub(super) fn header() -> Element<'static, Message> {
     )
     .center_x(Length::Fill)
     .center_y(Length::Fixed(72.0))
-    .style(|_theme| container::Style {
-        background: Some(Background::Color(NICOTINE_RED)),
-        ..container::Style::default()
-    })
+    .style(|_| filled(NICOTINE_RED))
     .into()
 }
 
@@ -67,10 +73,7 @@ pub(super) fn footer() -> Element<'static, Message> {
         container(row![links, Space::new().width(Length::Fill), badge].align_y(Alignment::Center))
             .width(Length::Fill)
             .padding([10, 16])
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(NICOTINE_CREAM)),
-                ..container::Style::default()
-            });
+            .style(|_| filled(NICOTINE_CREAM));
 
     column![divider(), bar].into()
 }
@@ -105,10 +108,7 @@ pub(super) fn tab_sidebar(panel: &Panel) -> Element<'_, Message> {
         .padding(8)
         .width(Length::Fixed(150.0))
         .height(Length::Fill)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(NICOTINE_CREAM)),
-            ..container::Style::default()
-        })
+        .style(|_| filled(NICOTINE_CREAM))
         .into()
 }
 
@@ -137,10 +137,7 @@ fn tab_button(label: &'static str, tab: Tab, active: bool) -> Element<'static, M
 pub(super) fn vdivider() -> Element<'static, Message> {
     container(Space::new().width(Length::Fixed(1.0)).height(Length::Fill))
         .height(Length::Fill)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(NICOTINE_GOLD)),
-            ..container::Style::default()
-        })
+        .style(|_| filled(NICOTINE_GOLD))
         .into()
 }
 
@@ -173,10 +170,7 @@ fn section_header(label: &'static str) -> Element<'static, Message> {
 fn divider() -> Element<'static, Message> {
     container(Space::new().height(Length::Fixed(1.0)).width(Length::Fill))
         .width(Length::Fill)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(NICOTINE_GOLD)),
-            ..container::Style::default()
-        })
+        .style(|_| filled(NICOTINE_GOLD))
         .into()
 }
 
@@ -192,6 +186,42 @@ fn grip(i: usize) -> Element<'static, Message> {
     }))
     .on_press(Message::GrabRow(i))
     .into()
+}
+
+/// Container style for a cycle-list row mid-drag: the grabbed row lifts off
+/// as a white card; the row under the cursor becomes a soft gold drop slot.
+fn drag_row_style(is_dragged: bool, is_target: bool) -> container::Style {
+    let gold_border = Border {
+        color: NICOTINE_GOLD,
+        width: 1.0,
+        radius: 6.0_f32.into(),
+    };
+    if is_dragged {
+        container::Style {
+            background: Some(Background::Color(Color::WHITE)),
+            border: gold_border,
+            shadow: Shadow {
+                color: Color {
+                    a: 0.18,
+                    ..NICOTINE_BLACK
+                },
+                offset: Vector { x: 0.0, y: 2.0 },
+                blur_radius: 8.0,
+            },
+            ..container::Style::default()
+        }
+    } else if is_target {
+        container::Style {
+            background: Some(Background::Color(Color {
+                a: 0.15,
+                ..NICOTINE_GOLD
+            })),
+            border: gold_border,
+            ..container::Style::default()
+        }
+    } else {
+        container::Style::default()
+    }
 }
 
 fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
@@ -295,44 +325,7 @@ fn characters_section(panel: &Panel) -> Element<'_, Message> {
         let is_target = panel.dragging.is_some() && panel.drag_hover == Some(i) && !is_dragged;
         let block = container(column![row1, row2].spacing(2))
             .padding(6)
-            .style(move |_theme| {
-                if is_dragged {
-                    // The grabbed row lifts off as a clean white card.
-                    container::Style {
-                        background: Some(Background::Color(Color::WHITE)),
-                        border: Border {
-                            color: NICOTINE_GOLD,
-                            width: 1.0,
-                            radius: 6.0_f32.into(),
-                        },
-                        shadow: Shadow {
-                            color: Color {
-                                a: 0.18,
-                                ..NICOTINE_BLACK
-                            },
-                            offset: Vector { x: 0.0, y: 2.0 },
-                            blur_radius: 8.0,
-                        },
-                        ..container::Style::default()
-                    }
-                } else if is_target {
-                    // Drop target: a soft gold slot.
-                    container::Style {
-                        background: Some(Background::Color(Color {
-                            a: 0.15,
-                            ..NICOTINE_GOLD
-                        })),
-                        border: Border {
-                            color: NICOTINE_GOLD,
-                            width: 1.0,
-                            radius: 6.0_f32.into(),
-                        },
-                        ..container::Style::default()
-                    }
-                } else {
-                    container::Style::default()
-                }
-            });
+            .style(move |_| drag_row_style(is_dragged, is_target));
         col = col.push(
             mouse_area(block)
                 .on_enter(Message::HoverRow(i))
@@ -357,40 +350,29 @@ fn characters_section(panel: &Panel) -> Element<'_, Message> {
 }
 
 fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
-    let forward = row![
-        text("Forward:").width(Length::Fixed(90.0)),
-        bind_button(
-            panel,
-            CaptureTarget::ForwardKey,
-            code_to_label(panel.config.forward_key),
-            200.0,
-        ),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
-
-    let backward = row![
-        text("Backward:").width(Length::Fixed(90.0)),
-        bind_button(
-            panel,
-            CaptureTarget::BackwardKey,
-            code_to_label(panel.config.backward_key),
-            200.0,
-        ),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
+    let forward = bind_row(
+        panel,
+        "Forward:",
+        CaptureTarget::ForwardKey,
+        code_to_label(panel.config.forward_key),
+    );
+    let backward = bind_row(
+        panel,
+        "Backward:",
+        CaptureTarget::BackwardKey,
+        code_to_label(panel.config.backward_key),
+    );
 
     let modifier_label = match panel.config.modifier_key {
         Some(vk) => code_to_label(vk),
         None => "None".to_string(),
     };
-    let mut modifier = row![
-        text("Modifier:").width(Length::Fixed(90.0)),
-        bind_button(panel, CaptureTarget::ModifierKey, modifier_label, 200.0),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
+    let mut modifier = bind_row(
+        panel,
+        "Modifier:",
+        CaptureTarget::ModifierKey,
+        modifier_label,
+    );
     if panel.config.modifier_key.is_some() {
         modifier = modifier.push(button(text("Clear")).on_press(Message::ClearModifier));
     }
@@ -403,21 +385,17 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
         forward,
         backward,
         modifier,
-        text(
+        caption(
             "Click a binding to record the next key you press. Esc cancels. Set both keys to the \
              same value with a modifier to cycle backward via modifier+key (e.g. Tab + Shift+Tab)."
-        )
-        .size(CAPTION_SIZE)
-        .color(NICOTINE_BLACK),
+        ),
         checkbox(panel.config.enable_mouse_buttons)
             .label("Cycle on mouse side buttons (XBUTTON1/XBUTTON2)")
             .on_toggle(Message::MouseEnabledToggled),
-        text(
+        caption(
             "Off by default. Turn on only if you don't already remap your mouse side buttons via \
              driver software (Logi Options+, Razer Synapse, etc.)."
-        )
-        .size(CAPTION_SIZE)
-        .color(NICOTINE_BLACK),
+        ),
     ]
     .spacing(8)
     .into()
@@ -456,6 +434,22 @@ fn previews_section(panel: &Panel) -> Element<'_, Message> {
     ]
     .spacing(8)
     .into()
+}
+
+/// A labeled key-binding row (`<label>  [ bind chip ]`) for the
+/// Forward/Backward/Modifier entries on the Hotkeys tab.
+fn bind_row(
+    panel: &Panel,
+    label: &'static str,
+    target: CaptureTarget,
+    current: String,
+) -> iced::widget::Row<'static, Message> {
+    row![
+        text(label).width(Length::Fixed(90.0)),
+        bind_button(panel, target, current, 200.0),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
 }
 
 fn bind_button(
