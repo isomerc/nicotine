@@ -470,5 +470,37 @@ fn bind_button(
     button(text(txt))
         .width(Length::Fixed(width))
         .on_press(Message::StartCapture(target))
+        .style(move |_theme, status| {
+            if is_capturing {
+                // Armed and listening for the next key.
+                button::Style {
+                    background: Some(Background::Color(NICOTINE_GOLD)),
+                    text_color: NICOTINE_BLACK,
+                    border: Border {
+                        color: NICOTINE_RED,
+                        width: 1.5,
+                        radius: 4.0_f32.into(),
+                    },
+                    ..button::Style::default()
+                }
+            } else {
+                // Neutral outlined chip showing the current binding.
+                let background =
+                    matches!(status, button::Status::Hovered).then_some(Background::Color(Color {
+                        a: 0.18,
+                        ..NICOTINE_GOLD
+                    }));
+                button::Style {
+                    background,
+                    text_color: NICOTINE_BLACK,
+                    border: Border {
+                        color: NICOTINE_GOLD,
+                        width: 1.0,
+                        radius: 4.0_f32.into(),
+                    },
+                    ..button::Style::default()
+                }
+            }
+        })
         .into()
 }
