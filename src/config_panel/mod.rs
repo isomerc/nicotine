@@ -136,6 +136,14 @@ pub(super) struct Panel {
     pub last_change: Option<Instant>,
     /// Active left-rail settings tab.
     pub active_tab: Tab,
+    /// Index of the cycle-list row being dragged, if any.
+    pub dragging: Option<usize>,
+    /// Cycle-list row currently under the cursor during a drag (drop target).
+    pub drag_hover: Option<usize>,
+    /// Re-render ticks spent waiting for the async version check to land.
+    /// Bounds the post-launch poll so it can't spin forever if the check
+    /// never returns (e.g. offline).
+    pub version_polls: u8,
 }
 
 impl Panel {
@@ -147,6 +155,9 @@ impl Panel {
             capturing: None,
             last_change: None,
             active_tab: Tab::Display,
+            dragging: None,
+            drag_hover: None,
+            version_polls: 0,
         }
     }
 
@@ -240,12 +251,17 @@ pub(super) enum Message {
     ClearModifier,
     StartCapture(CaptureTarget),
     TabSelected(Tab),
+    GrabRow(usize),
+    HoverRow(usize),
+    UnhoverRow(usize),
+    DropRow,
     KeyEvent(iced::keyboard::Event),
     ShowPreviewsToggled(bool),
     PreviewWidthChanged(u32),
     PreviewHeightChanged(u32),
     OpenLink(String),
     FlushIfIdle,
+    VersionPoll,
 }
 
 fn update(panel: &mut Panel, message: Message) -> Task<Message> {
@@ -344,6 +360,33 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         Message::TabSelected(tab) => {
             panel.active_tab = tab;
         }
+        Message::GrabRow(i) => {
+            panel.dragging = Some(i);
+            panel.drag_hover = Some(i);
+        }
+        Message::HoverRow(i) => {
+            if panel.dragging.is_some() {
+                panel.drag_hover = Some(i);
+            }
+        }
+        Message::UnhoverRow(i) => {
+            if panel.drag_hover == Some(i) {
+                panel.drag_hover = None;
+            }
+        }
+        Message::DropRow => {
+            if let (Some(src), Some(dst)) = (panel.dragging, panel.drag_hover) {
+                let len = panel.config.characters.len();
+                if src < len && dst < len && src != dst {
+                    let item = panel.config.characters.remove(src);
+                    let dst = dst.min(panel.config.characters.len());
+                    panel.config.characters.insert(dst, item);
+                    panel.touch();
+                }
+            }
+            panel.dragging = None;
+            panel.drag_hover = None;
+        }
         Message::KeyEvent(event) => {
             return panel.handle_capture_key(event);
         }
@@ -374,6 +417,11 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
                     panel.last_change = None;
                 }
             }
+        }
+        Message::VersionPoll => {
+            // The re-render this message triggers is the point — it lets
+            // the footer pick up the version-check result once it lands.
+            panel.version_polls = panel.version_polls.saturating_add(1);
         }
     }
     Task::none()
@@ -424,6 +472,23 @@ fn subscription(panel: &Panel) -> Subscription<Message> {
     // no further input; stops once flushed.
     if panel.last_change.is_some() {
         subs.push(iced::time::every(Duration::from_millis(100)).map(|_| Message::FlushIfIdle));
+    }
+    // While a row is being dragged, watch for the mouse-button release
+    // anywhere to commit (or cancel) the reorder.
+    if panel.dragging.is_some() {
+        subs.push(iced::event::listen_with(
+            |event, _status, _window| match event {
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )) => Some(Message::DropRow),
+                _ => None,
+            },
+        ));
+    }
+    // Re-render a few times after launch so the async version-check result
+    // appears once it lands (iced only redraws on events, unlike egui).
+    if panel.version_polls < 20 && crate::version_check::get_update_status().is_none() {
+        subs.push(iced::time::every(Duration::from_millis(700)).map(|_| Message::VersionPoll));
     }
     Subscription::batch(subs)
 }

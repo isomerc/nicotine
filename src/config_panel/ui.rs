@@ -2,9 +2,10 @@
 //! the four body sections (display mode, cycle order, hotkeys, previews).
 
 use iced::widget::{
-    button, checkbox, column, container, pick_list, radio, row, slider, text, text_input, Space,
+    button, checkbox, column, container, mouse_area, pick_list, radio, row, slider, text,
+    text_input, Space,
 };
-use iced::{Alignment, Background, Element, Font, Length};
+use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, Vector};
 
 use crate::config::DisplayMode;
 
@@ -38,7 +39,7 @@ pub(super) fn header() -> Element<'static, Message> {
 pub(super) fn footer() -> Element<'static, Message> {
     let links = row![
         link_button("GITHUB", "https://github.com/isomerc"),
-        text("•").color(NICOTINE_GOLD),
+        text("•").size(CAPTION_SIZE).color(NICOTINE_GOLD),
         link_button(
             "ILLUMINATED IS RECRUITING",
             "https://www.illuminatedcorp.com"
@@ -52,30 +53,37 @@ pub(super) fn footer() -> Element<'static, Message> {
             link_button(format!("NEW VERSION AVAILABLE (v{version})"), url)
         }
         Some(crate::version_check::UpdateStatus::UpToDate) => text("LATEST VERSION")
+            .size(CAPTION_SIZE)
             .color(NICOTINE_GREEN)
             .font(BOLD)
             .into(),
         None => Space::new().into(),
     };
 
-    container(row![links, Space::new().width(Length::Fill), badge].align_y(Alignment::Center))
-        .width(Length::Fill)
-        .height(Length::Fixed(40.0))
-        .padding([8, 16])
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(NICOTINE_CREAM)),
-            ..container::Style::default()
-        })
-        .into()
+    let bar =
+        container(row![links, Space::new().width(Length::Fill), badge].align_y(Alignment::Center))
+            .width(Length::Fill)
+            .padding([10, 16])
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(NICOTINE_CREAM)),
+                ..container::Style::default()
+            });
+
+    column![divider(), bar].into()
 }
 
 fn link_button(label: impl Into<String>, url: impl Into<String>) -> Element<'static, Message> {
     let url = url.into();
-    button(text(label.into()).color(NICOTINE_RED).font(BOLD))
-        .style(button::text)
-        .padding(0)
-        .on_press(Message::OpenLink(url))
-        .into()
+    button(
+        text(label.into())
+            .size(CAPTION_SIZE)
+            .color(NICOTINE_RED)
+            .font(BOLD),
+    )
+    .style(button::text)
+    .padding(0)
+    .on_press(Message::OpenLink(url))
+    .into()
 }
 
 pub(super) fn tab_sidebar(panel: &Panel) -> Element<'_, Message> {
@@ -173,6 +181,16 @@ fn caption(s: &'static str) -> Element<'static, Message> {
     text(s).size(CAPTION_SIZE).color(NICOTINE_BLACK).into()
 }
 
+/// Drag handle for a cycle-list row — press and drag it to reorder.
+fn grip(i: usize) -> Element<'static, Message> {
+    mouse_area(text("≡").size(SECTION_SIZE).color(Color {
+        a: 0.55,
+        ..NICOTINE_BLACK
+    }))
+    .on_press(Message::GrabRow(i))
+    .into()
+}
+
 fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
     column![
         section_header("Display Mode"),
@@ -216,6 +234,7 @@ fn characters_section(panel: &Panel) -> Element<'_, Message> {
 
     for (i, name) in panel.config.characters.iter().enumerate() {
         let row1 = row![
+            grip(i),
             text(format!("{}.", i + 1)),
             text_input("character name", name)
                 .on_input(move |s| Message::CharacterNameChanged(i, s))
@@ -269,7 +288,53 @@ fn characters_section(panel: &Panel) -> Element<'_, Message> {
             row2 = row2.push(button(text("✕")).on_press(Message::ClearCharacterHotkey(n)));
         }
 
-        col = col.push(column![row1, row2].spacing(2));
+        let is_dragged = panel.dragging == Some(i);
+        let is_target = panel.dragging.is_some() && panel.drag_hover == Some(i) && !is_dragged;
+        let block = container(column![row1, row2].spacing(2))
+            .padding(6)
+            .style(move |_theme| {
+                if is_dragged {
+                    // The grabbed row lifts off as a clean white card.
+                    container::Style {
+                        background: Some(Background::Color(Color::WHITE)),
+                        border: Border {
+                            color: NICOTINE_GOLD,
+                            width: 1.0,
+                            radius: 6.0_f32.into(),
+                        },
+                        shadow: Shadow {
+                            color: Color {
+                                a: 0.18,
+                                ..NICOTINE_BLACK
+                            },
+                            offset: Vector { x: 0.0, y: 2.0 },
+                            blur_radius: 8.0,
+                        },
+                        ..container::Style::default()
+                    }
+                } else if is_target {
+                    // Drop target: a soft gold slot.
+                    container::Style {
+                        background: Some(Background::Color(Color {
+                            a: 0.15,
+                            ..NICOTINE_GOLD
+                        })),
+                        border: Border {
+                            color: NICOTINE_GOLD,
+                            width: 1.0,
+                            radius: 6.0_f32.into(),
+                        },
+                        ..container::Style::default()
+                    }
+                } else {
+                    container::Style::default()
+                }
+            });
+        col = col.push(
+            mouse_area(block)
+                .on_enter(Message::HoverRow(i))
+                .on_exit(Message::UnhoverRow(i)),
+        );
     }
 
     col = col.push(
