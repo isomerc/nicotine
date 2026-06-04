@@ -20,6 +20,7 @@
           xorg.libXcursor
           xorg.libXrandr
           xorg.libXi
+          alsa-lib
         ];
 
         runtimeTools = [ pkgs.wmctrl ];

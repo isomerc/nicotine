@@ -127,6 +127,8 @@ pub(super) struct Panel {
     pub config: Config,
     /// Shared settings watched by the preview manager for live updates.
     pub live: Arc<Mutex<LiveSettings>>,
+    /// Sends a play command to the audio worker thread (logo easter egg).
+    pub audio: std::sync::mpsc::Sender<()>,
     /// Buffer for the "add character" text input.
     pub new_character_buffer: String,
     /// When `Some(..)`, the next keypress binds to this field.
@@ -147,10 +149,15 @@ pub(super) struct Panel {
 }
 
 impl Panel {
-    fn new(config: Config, live: Arc<Mutex<LiveSettings>>) -> Self {
+    fn new(
+        config: Config,
+        live: Arc<Mutex<LiveSettings>>,
+        audio: std::sync::mpsc::Sender<()>,
+    ) -> Self {
         Self {
             config,
             live,
+            audio,
             new_character_buffer: String::new(),
             capturing: None,
             last_change: None,
@@ -238,6 +245,7 @@ pub(super) enum Message {
     DisplayModeChanged(crate::config::DisplayMode),
     LockToggled(bool),
     RestackClicked,
+    LogoClicked,
     CharacterNameChanged(usize, String),
     MoveCharacterUp(usize),
     MoveCharacterDown(usize),
@@ -278,6 +286,11 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         }
         Message::RestackClicked => {
             let _ = crate::daemon::send_command("stack");
+        }
+        Message::LogoClicked => {
+            // Easter egg: (re)start the jingle. Best-effort; if the worker
+            // is gone the send just fails silently.
+            let _ = panel.audio.send(());
         }
         Message::CharacterNameChanged(i, name) => {
             if let Some(slot) = panel.config.characters.get_mut(i) {
@@ -881,8 +894,10 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
     let icon =
         iced::window::icon::from_file_data(include_bytes!("../../assets/icon.png"), None).ok();
 
+    let audio = crate::audio::spawn();
+
     iced::application(
-        move || Panel::new(config.clone(), Arc::clone(&live)),
+        move || Panel::new(config.clone(), Arc::clone(&live), audio.clone()),
         update,
         view,
     )

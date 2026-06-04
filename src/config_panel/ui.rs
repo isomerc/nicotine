@@ -22,10 +22,13 @@ const BOLD: Font = Font {
 
 pub(super) fn header() -> Element<'static, Message> {
     container(
-        text("Nicotine")
-            .font(LOGO_FONT)
-            .size(LOGO_SIZE)
-            .color(NICOTINE_CREAM),
+        mouse_area(
+            text("Nicotine")
+                .font(LOGO_FONT)
+                .size(LOGO_SIZE)
+                .color(NICOTINE_CREAM),
+        )
+        .on_press(Message::LogoClicked),
     )
     .center_x(Length::Fill)
     .center_y(Length::Fixed(72.0))

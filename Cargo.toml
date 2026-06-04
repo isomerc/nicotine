@@ -59,6 +59,13 @@ reqwest = { version = "0.12", features = [
   "rustls-tls",
 ], default-features = false }
 
+# In-app audio for the logo easter-egg jingle. default-features off so we
+# only pull cpal playback + the mp3 decoder, not every symphonia codec.
+rodio = { version = "0.22", default-features = false, features = [
+  "playback",
+  "symphonia-mp3",
+] }
+
 [target.'cfg(unix)'.dependencies]
 x11rb = { version = "0.13", features = ["all-extensions"] }
 daemonize = "0.5"
