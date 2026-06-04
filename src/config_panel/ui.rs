@@ -118,9 +118,10 @@ fn tab_button(label: &'static str, tab: Tab, active: bool) -> Element<'static, M
         .padding([8, 12])
         .on_press(Message::TabSelected(tab))
         .style(move |_theme, status| {
+            // Press is styled like hover, so clicking a tab doesn't flash.
             let (bg, fg) = if active {
                 (NICOTINE_RED, NICOTINE_CREAM)
-            } else if matches!(status, button::Status::Hovered) {
+            } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
                 (NICOTINE_GOLD, NICOTINE_BLACK)
             } else {
                 (NICOTINE_CREAM, NICOTINE_BLACK)
