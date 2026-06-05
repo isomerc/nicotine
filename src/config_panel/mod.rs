@@ -896,6 +896,10 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
 
     let audio = crate::audio::spawn();
 
+    // `mut` is only used on Linux (the app_id assignment below); on other
+    // platforms the binding is never mutated, so allow the unused-mut lint
+    // there to keep `-D warnings` green.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut window = iced::window::Settings {
         size: iced::Size::new(720.0, 680.0),
         min_size: Some(iced::Size::new(560.0, 420.0)),
