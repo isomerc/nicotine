@@ -379,6 +379,33 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
         modifier = modifier.push(button(text("Clear")).on_press(Message::ClearModifier));
     }
 
+    let toggle_label = match panel.config.toggle_previews_key {
+        Some(vk) => code_to_label(vk),
+        None => "None".to_string(),
+    };
+    let toggle_mod_selected = MODIFIER_CHOICES
+        .iter()
+        .copied()
+        .find(|m| m.code == panel.config.toggle_previews_modifier);
+    let mut toggle_previews = bind_row(
+        panel,
+        "Toggle previews:",
+        CaptureTarget::TogglePreviews,
+        toggle_label,
+    );
+    toggle_previews = toggle_previews.push(
+        pick_list(
+            MODIFIER_CHOICES,
+            toggle_mod_selected,
+            Message::TogglePreviewsModifierChanged,
+        )
+        .width(Length::Fixed(80.0)),
+    );
+    if panel.config.toggle_previews_key.is_some() {
+        toggle_previews =
+            toggle_previews.push(button(text("Clear")).on_press(Message::ClearTogglePreviews));
+    }
+
     column![
         section_header("Keyboard Hotkeys"),
         checkbox(panel.config.enable_keyboard_buttons)
@@ -390,6 +417,11 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
         caption(
             "Click a binding to record the next key you press. Esc cancels. Set both keys to the \
              same value with a modifier to cycle backward via modifier+key (e.g. Tab + Shift+Tab)."
+        ),
+        toggle_previews,
+        caption(
+            "Toggle previews shows/hides all preview windows with one key — independent of \
+             keyboard cycling. Leave unbound if you don't want it."
         ),
         checkbox(panel.config.enable_mouse_buttons)
             .label("Cycle on mouse side buttons (XBUTTON1/XBUTTON2)")
@@ -493,7 +525,7 @@ fn bind_row(
     current: String,
 ) -> iced::widget::Row<'static, Message> {
     row![
-        text(label).width(Length::Fixed(90.0)),
+        text(label).width(Length::Fixed(120.0)),
         bind_button(panel, target, current, 200.0),
     ]
     .spacing(6)

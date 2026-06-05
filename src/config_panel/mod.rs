@@ -59,6 +59,7 @@ pub(super) enum CaptureTarget {
     ForwardKey,
     BackwardKey,
     ModifierKey,
+    TogglePreviews,
     Character(String),
 }
 
@@ -328,6 +329,7 @@ impl Panel {
                 CaptureTarget::ForwardKey => self.config.forward_key = vk,
                 CaptureTarget::BackwardKey => self.config.backward_key = vk,
                 CaptureTarget::ModifierKey => self.config.modifier_key = Some(vk),
+                CaptureTarget::TogglePreviews => self.config.toggle_previews_key = Some(vk),
                 CaptureTarget::Character(name) => {
                     let modifier = self
                         .config
@@ -378,6 +380,8 @@ pub(super) enum Message {
     KeyboardEnabledToggled(bool),
     MouseEnabledToggled(bool),
     ClearModifier,
+    ClearTogglePreviews,
+    TogglePreviewsModifierChanged(ModifierChoice),
     StartCapture(CaptureTarget),
     TabSelected(Tab),
     GrabRow(usize),
@@ -481,6 +485,15 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         }
         Message::ClearModifier => {
             panel.config.modifier_key = None;
+            panel.touch();
+        }
+        Message::ClearTogglePreviews => {
+            panel.config.toggle_previews_key = None;
+            panel.config.toggle_previews_modifier = None;
+            panel.touch();
+        }
+        Message::TogglePreviewsModifierChanged(choice) => {
+            panel.config.toggle_previews_modifier = choice.code;
             panel.touch();
         }
         Message::StartCapture(target) => {
@@ -625,6 +638,15 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             open_url(&url);
         }
         Message::FlushIfIdle => {
+            // Adopt a preview-visibility change made outside the panel
+            // (the toggle hotkey flips LiveSettings.show_previews directly)
+            // so the checkbox follows and the new state persists — exactly
+            // as if the user had clicked the checkbox.
+            let live_show = panel.live.lock().unwrap().show_previews;
+            if live_show != panel.config.show_previews {
+                panel.config.show_previews = live_show;
+                panel.touch();
+            }
             if let Some(t) = panel.last_change {
                 if t.elapsed() >= AUTOSAVE_DEBOUNCE {
                     if let Err(e) = panel.config.save() {

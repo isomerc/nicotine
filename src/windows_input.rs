@@ -1,8 +1,9 @@
-use crate::config::Config;
+use crate::config::{Config, LiveSettings};
 use crate::cycle_state::CycleState;
 use crate::window_manager::WindowManager;
 use crate::windows_helpers::{
-    classify_xbutton, plan_character_hotkeys, plan_cycle_hotkeys, CycleDirection, ModifierKind,
+    classify_xbutton, modifier_kind, plan_character_hotkeys, plan_cycle_hotkeys, CycleDirection,
+    ModifierKind,
 };
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -22,6 +23,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const HOTKEY_FORWARD_ID: i32 = 1001;
 const HOTKEY_BACKWARD_ID: i32 = 1002;
+/// Global hotkey that flips `LiveSettings.show_previews` (show/hide all
+/// preview windows). Registered only when the user has bound a key.
+const HOTKEY_TOGGLE_PREVIEWS_ID: i32 = 1003;
 /// Per-character hotkey IDs are assigned starting here, one per bound
 /// character, in the order the config lists them. Separated from the
 /// cycle IDs so the message dispatch can tell them apart by ID range.
@@ -189,9 +193,10 @@ pub fn spawn(
     config: Config,
     wm: Arc<dyn WindowManager>,
     state: Arc<Mutex<CycleState>>,
+    live: Arc<Mutex<LiveSettings>>,
 ) -> Result<JoinHandle<()>> {
     let handle = std::thread::spawn(move || {
-        if let Err(e) = run_listener(config, wm, state) {
+        if let Err(e) = run_listener(config, wm, state, live) {
             eprintln!("Windows input listener exited with error: {}", e);
         }
     });
@@ -202,6 +207,7 @@ fn run_listener(
     config: Config,
     wm: Arc<dyn WindowManager>,
     state: Arc<Mutex<CycleState>>,
+    live: Arc<Mutex<LiveSettings>>,
 ) -> Result<()> {
     let listener_thread_id = unsafe { GetCurrentThreadId() };
     LISTENER_THREAD_ID.store(listener_thread_id, Ordering::Release);
@@ -293,6 +299,23 @@ fn run_listener(
             continue;
         }
 
+        // Preview-visibility toggle hotkey? Flip the shared LiveSettings
+        // flag the preview manager watches; it shows/hides on the next
+        // reconcile tick, same as the panel checkbox.
+        if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_TOGGLE_PREVIEWS_ID {
+            let mut live_guard = live.lock().unwrap();
+            live_guard.show_previews = !live_guard.show_previews;
+            println!(
+                "Preview windows toggled {} via hotkey",
+                if live_guard.show_previews {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            continue;
+        }
+
         // Per-character jump hotkey?
         if msg.message == WM_HOTKEY {
             let id = msg.wParam.0 as i32;
@@ -342,6 +365,19 @@ unsafe fn do_register_hotkeys(config: &Config) {
         );
     }
 
+    // Preview-visibility toggle, with optional modifier. Independent of
+    // enable_keyboard_buttons — it flips show_previews regardless of
+    // whether cycling is on.
+    if let Some(vk) = config.toggle_previews_key {
+        let modifier = config.toggle_previews_modifier.and_then(modifier_kind);
+        let _ = RegisterHotKey(
+            None,
+            HOTKEY_TOGGLE_PREVIEWS_ID,
+            modifier_to_winapi(modifier),
+            vk as u32,
+        );
+    }
+
     let mut lookup = character_lookup().lock().unwrap();
     lookup.clear();
     for plan in plan_character_hotkeys(
@@ -369,6 +405,7 @@ fn unregister_hotkeys() {
     unsafe {
         let _ = UnregisterHotKey(None, HOTKEY_FORWARD_ID);
         let _ = UnregisterHotKey(None, HOTKEY_BACKWARD_ID);
+        let _ = UnregisterHotKey(None, HOTKEY_TOGGLE_PREVIEWS_ID);
         let mut lookup = character_lookup().lock().unwrap();
         for id in lookup.keys() {
             let _ = UnregisterHotKey(None, *id);

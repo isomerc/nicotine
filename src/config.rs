@@ -126,6 +126,17 @@ pub struct Config {
     /// preview managers still just read `preview_width`/`preview_height`.
     #[serde(default = "default_constrain_aspect")]
     pub constrain_aspect: bool,
+    /// Optional global hotkey (platform key code — evdev on Linux, Win32
+    /// VK on Windows) that toggles preview-window visibility, i.e. flips
+    /// `show_previews`. `None` = unbound. Bound via the panel's Hotkeys
+    /// tab just like the cycle keys.
+    #[serde(default)]
+    pub toggle_previews_key: Option<u16>,
+    /// Optional modifier (Shift/Ctrl/Alt, as a platform key code) that
+    /// must be held with `toggle_previews_key` for the toggle to fire.
+    /// `None` = no modifier (the bare key toggles).
+    #[serde(default)]
+    pub toggle_previews_modifier: Option<u16>,
     /// Ordered list of EVE character names. Forward/backward cycling
     /// traverses this order; `switch N` maps target N to entry N-1.
     /// Empty list = cycle through whatever order the window manager
@@ -363,6 +374,8 @@ impl Config {
             show_previews: default_show_previews(),
             hide_active_preview: default_hide_active_preview(),
             constrain_aspect: default_constrain_aspect(),
+            toggle_previews_key: None,
+            toggle_previews_modifier: None,
             characters: Vec::new(),
             display_mode: default_display_mode(),
             positions_locked: false,
@@ -443,6 +456,8 @@ mod tests {
             show_previews: true,
             hide_active_preview: false,
             constrain_aspect: false,
+            toggle_previews_key: None,
+            toggle_previews_modifier: None,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -478,6 +493,8 @@ mod tests {
             show_previews: true,
             hide_active_preview: false,
             constrain_aspect: false,
+            toggle_previews_key: None,
+            toggle_previews_modifier: None,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -512,6 +529,8 @@ mod tests {
             show_previews: true,
             hide_active_preview: true,
             constrain_aspect: true,
+            toggle_previews_key: Some(67),
+            toggle_previews_modifier: Some(42),
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -534,6 +553,16 @@ mod tests {
         assert!(
             deserialized.constrain_aspect,
             "constrain_aspect must survive a save/load round-trip"
+        );
+        assert_eq!(
+            deserialized.toggle_previews_key,
+            Some(67),
+            "toggle_previews_key binding must survive a save/load round-trip"
+        );
+        assert_eq!(
+            deserialized.toggle_previews_modifier,
+            Some(42),
+            "toggle_previews_modifier must survive a save/load round-trip"
         );
     }
 }
