@@ -120,6 +120,12 @@ pub struct Config {
     /// client.
     #[serde(default = "default_hide_active_preview")]
     pub hide_active_preview: bool,
+    /// When true, the config panel locks preview width and height to a
+    /// single aspect ratio and offers one "size" slider instead of
+    /// separate width/height sliders. Purely a panel-side concern — the
+    /// preview managers still just read `preview_width`/`preview_height`.
+    #[serde(default = "default_constrain_aspect")]
+    pub constrain_aspect: bool,
     /// Ordered list of EVE character names. Forward/backward cycling
     /// traverses this order; `switch N` maps target N to entry N-1.
     /// Empty list = cycle through whatever order the window manager
@@ -247,6 +253,10 @@ fn default_hide_active_preview() -> bool {
     false
 }
 
+fn default_constrain_aspect() -> bool {
+    false
+}
+
 fn default_display_mode() -> DisplayMode {
     DisplayMode::Previews
 }
@@ -352,6 +362,7 @@ impl Config {
             preview_opacity: default_preview_opacity(),
             show_previews: default_show_previews(),
             hide_active_preview: default_hide_active_preview(),
+            constrain_aspect: default_constrain_aspect(),
             characters: Vec::new(),
             display_mode: default_display_mode(),
             positions_locked: false,
@@ -431,6 +442,7 @@ mod tests {
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
+            constrain_aspect: false,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -465,6 +477,7 @@ mod tests {
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
+            constrain_aspect: false,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -498,6 +511,7 @@ mod tests {
             preview_opacity: 55,
             show_previews: true,
             hide_active_preview: true,
+            constrain_aspect: true,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -516,6 +530,10 @@ mod tests {
         assert!(
             deserialized.hide_active_preview,
             "hide_active_preview must survive a save/load round-trip"
+        );
+        assert!(
+            deserialized.constrain_aspect,
+            "constrain_aspect must survive a save/load round-trip"
         );
     }
 }

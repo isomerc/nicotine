@@ -80,12 +80,16 @@ pub(super) enum SliderField {
     PreviewWidth,
     PreviewHeight,
     PreviewOpacity,
+    /// The single "size" slider shown when aspect ratio is constrained.
+    /// Drives width; height follows from the locked ratio. Reuses the
+    /// width range so the editable readout / clamp logic is shared.
+    PreviewSize,
 }
 
 impl SliderField {
     pub(super) fn range(self) -> std::ops::RangeInclusive<u32> {
         match self {
-            SliderField::PreviewWidth => 120..=800,
+            SliderField::PreviewWidth | SliderField::PreviewSize => 120..=800,
             SliderField::PreviewHeight => 80..=600,
             SliderField::PreviewOpacity => 10..=100,
         }
@@ -98,6 +102,7 @@ impl SliderField {
             SliderField::PreviewWidth => Message::PreviewWidthChanged(value),
             SliderField::PreviewHeight => Message::PreviewHeightChanged(value),
             SliderField::PreviewOpacity => Message::PreviewOpacityChanged(value),
+            SliderField::PreviewSize => Message::PreviewSizeChanged(value),
         }
     }
 
@@ -112,7 +117,8 @@ impl SliderField {
 
     fn current_value(self, panel: &Panel) -> u32 {
         match self {
-            SliderField::PreviewWidth => panel.config.preview_width,
+            // The size slider is driven by (and reads back) the width.
+            SliderField::PreviewWidth | SliderField::PreviewSize => panel.config.preview_width,
             SliderField::PreviewHeight => panel.config.preview_height,
             SliderField::PreviewOpacity => panel.config.preview_opacity,
         }
@@ -122,6 +128,42 @@ impl SliderField {
 /// Keep only ASCII digits — constrains the editable slider readouts.
 fn digits_only(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+/// Aspect ratio (width / height) used to lock the two preview dimensions
+/// together when "Constrain aspect ratio" is on. Guards a zero/empty
+/// dimension (only reachable via a hand-edited config) by falling back to
+/// the default 16:9-ish preview shape rather than producing NaN/inf.
+fn aspect_ratio_of(width: u32, height: u32) -> f64 {
+    if width == 0 || height == 0 {
+        return 320.0 / 180.0;
+    }
+    width as f64 / height as f64
+}
+
+/// Resolve a target width and a locked aspect ratio (= width / height) to
+/// the (width, height) pair that honors the ratio with both dimensions
+/// inside their slider ranges. When the derived height would fall outside
+/// its range, height becomes the binding dimension and width is back-solved
+/// from it — so the ratio is preserved instead of being clamped on one axis
+/// only (which would visibly distort the preview at the extremes).
+fn constrain_dimensions(target_width: u32, ratio: f64) -> (u32, u32) {
+    let w_range = SliderField::PreviewWidth.range();
+    let h_range = SliderField::PreviewHeight.range();
+    let (w_min, w_max) = (*w_range.start(), *w_range.end());
+    let (h_min, h_max) = (*h_range.start(), *h_range.end());
+
+    let width = target_width.clamp(w_min, w_max);
+    let height = (width as f64 / ratio).round() as u32;
+    if height < h_min {
+        let w = (h_min as f64 * ratio).round() as u32;
+        (w.clamp(w_min, w_max), h_min)
+    } else if height > h_max {
+        let w = (h_max as f64 * ratio).round() as u32;
+        (w.clamp(w_min, w_max), h_max)
+    } else {
+        (width, height)
+    }
 }
 
 /// One entry in the modifier dropdown. Codes are platform-specific:
@@ -205,6 +247,12 @@ pub(super) struct Panel {
     /// Mirrors the value except while the user is typing, until they press
     /// Enter (commit) or drag the slider (re-sync).
     pub slider_text: HashMap<SliderField, String>,
+    /// Locked preview aspect ratio (width / height) used while
+    /// `config.constrain_aspect` is on. Captured from the current
+    /// dimensions when the box is checked (and re-derived on load), so it
+    /// isn't persisted separately — `preview_width`/`preview_height` are
+    /// always kept in this ratio.
+    pub aspect_ratio: f64,
 }
 
 impl Panel {
@@ -223,11 +271,14 @@ impl Panel {
             SliderField::PreviewOpacity,
             config.preview_opacity.to_string(),
         );
+        slider_text.insert(SliderField::PreviewSize, config.preview_width.to_string());
+        let aspect_ratio = aspect_ratio_of(config.preview_width, config.preview_height);
         Self {
             config,
             live,
             audio,
             slider_text,
+            aspect_ratio,
             new_character_buffer: String::new(),
             capturing: None,
             last_change: None,
@@ -336,8 +387,10 @@ pub(super) enum Message {
     KeyEvent(iced::keyboard::Event),
     ShowPreviewsToggled(bool),
     HideActivePreviewToggled(bool),
+    ConstrainAspectToggled(bool),
     PreviewWidthChanged(u32),
     PreviewHeightChanged(u32),
+    PreviewSizeChanged(u32),
     PreviewOpacityChanged(u32),
     SliderTextChanged(SliderField, String),
     SliderTextCommit(SliderField),
@@ -487,6 +540,20 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             panel.live.lock().unwrap().hide_active_preview = v;
             panel.touch();
         }
+        Message::ConstrainAspectToggled(v) => {
+            panel.config.constrain_aspect = v;
+            if v {
+                // Lock onto the current dimensions' ratio and seed the
+                // size readout so the slider opens at the present width.
+                panel.aspect_ratio =
+                    aspect_ratio_of(panel.config.preview_width, panel.config.preview_height);
+                panel.slider_text.insert(
+                    SliderField::PreviewSize,
+                    panel.config.preview_width.to_string(),
+                );
+            }
+            panel.touch();
+        }
         Message::PreviewWidthChanged(w) => {
             panel.config.preview_width = w;
             panel.live.lock().unwrap().preview_width = w;
@@ -501,6 +568,28 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             panel
                 .slider_text
                 .insert(SliderField::PreviewHeight, h.to_string());
+            panel.touch();
+        }
+        Message::PreviewSizeChanged(size) => {
+            let (width, height) = constrain_dimensions(size, panel.aspect_ratio);
+            panel.config.preview_width = width;
+            panel.config.preview_height = height;
+            {
+                let mut live = panel.live.lock().unwrap();
+                live.preview_width = width;
+                live.preview_height = height;
+            }
+            // Sync every readout so unchecking the constraint lands on the
+            // correct width/height values.
+            panel
+                .slider_text
+                .insert(SliderField::PreviewSize, width.to_string());
+            panel
+                .slider_text
+                .insert(SliderField::PreviewWidth, width.to_string());
+            panel
+                .slider_text
+                .insert(SliderField::PreviewHeight, height.to_string());
             panel.touch();
         }
         Message::PreviewOpacityChanged(o) => {
@@ -1108,11 +1197,60 @@ mod tests {
             SliderField::PreviewWidth,
             SliderField::PreviewHeight,
             SliderField::PreviewOpacity,
+            SliderField::PreviewSize,
         ] {
             let r = field.range();
             assert_eq!(field.parse_input("999999"), Some(*r.end()));
             assert_eq!(field.parse_input("0"), Some(*r.start()));
             assert_eq!(field.parse_input(""), None);
+        }
+    }
+
+    #[test]
+    fn aspect_ratio_of_basic_and_zero_guard() {
+        assert!((aspect_ratio_of(320, 180) - 16.0 / 9.0).abs() < 1e-9);
+        // A zero dimension (only via a hand-edited config) must not yield
+        // NaN/inf — it falls back to a sane default ratio.
+        assert!(aspect_ratio_of(320, 0).is_finite() && aspect_ratio_of(320, 0) > 0.0);
+        assert!(aspect_ratio_of(0, 180).is_finite() && aspect_ratio_of(0, 180) > 0.0);
+    }
+
+    #[test]
+    fn constrain_dimensions_preserves_ratio_in_range() {
+        let r = aspect_ratio_of(320, 180); // 16:9
+                                           // Mid-range values land exactly on the ratio.
+        assert_eq!(constrain_dimensions(320, r), (320, 180));
+        assert_eq!(constrain_dimensions(640, r), (640, 360));
+        // Top of the width range, derived height still within [80, 600].
+        assert_eq!(constrain_dimensions(800, r), (800, 450));
+    }
+
+    #[test]
+    fn constrain_dimensions_back_solves_at_height_floor() {
+        let r = aspect_ratio_of(320, 180); // ≈1.778
+                                           // width 120 → height 67.5 → below the 80 floor. Height pins to 80
+                                           // and width is back-solved (≈142) so the ratio is preserved rather
+                                           // than distorted by clamping one axis only.
+        let (w, h) = constrain_dimensions(120, r);
+        assert_eq!((w, h), (142, 80));
+        assert!(((w as f64 / h as f64) - r).abs() < 0.01);
+    }
+
+    #[test]
+    fn constrain_dimensions_back_solves_at_height_ceiling() {
+        // A portrait ratio drives height past the 600 ceiling; height pins
+        // to 600 and width back-solves to keep the ratio exact.
+        let r = aspect_ratio_of(300, 600); // 0.5
+        assert_eq!(constrain_dimensions(400, r), (300, 600));
+    }
+
+    #[test]
+    fn constrain_dimensions_keeps_both_dimensions_in_range() {
+        let r = aspect_ratio_of(320, 180);
+        for target in [0u32, 50, 120, 320, 800, 99_999] {
+            let (w, h) = constrain_dimensions(target, r);
+            assert!((120..=800).contains(&w), "width {w} out of range");
+            assert!((80..=600).contains(&h), "height {h} out of range");
         }
     }
 

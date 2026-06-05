@@ -404,7 +404,7 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
 }
 
 fn previews_section(panel: &Panel) -> Element<'_, Message> {
-    column![
+    let mut col = column![
         section_header("Preview Windows"),
         checkbox(panel.config.show_previews)
             .label("Show preview windows")
@@ -412,30 +412,47 @@ fn previews_section(panel: &Panel) -> Element<'_, Message> {
         checkbox(panel.config.hide_active_preview)
             .label("Hide the active client's preview")
             .on_toggle(Message::HideActivePreviewToggled),
-        slider_field(
+        checkbox(panel.config.constrain_aspect)
+            .label("Constrain aspect ratio")
+            .on_toggle(Message::ConstrainAspectToggled),
+    ]
+    .spacing(8);
+
+    // One "size" slider when the ratio is locked; otherwise independent
+    // width + height sliders.
+    if panel.config.constrain_aspect {
+        col = col.push(slider_field(
+            panel,
+            SliderField::PreviewSize,
+            "Size:",
+            panel.config.preview_width,
+            "px",
+        ));
+    } else {
+        col = col.push(slider_field(
             panel,
             SliderField::PreviewWidth,
             "Width:",
             panel.config.preview_width,
             "px",
-        ),
-        slider_field(
+        ));
+        col = col.push(slider_field(
             panel,
             SliderField::PreviewHeight,
             "Height:",
             panel.config.preview_height,
             "px",
-        ),
-        slider_field(
-            panel,
-            SliderField::PreviewOpacity,
-            "Opacity:",
-            panel.config.preview_opacity,
-            "%",
-        ),
-    ]
-    .spacing(8)
-    .into()
+        ));
+    }
+
+    col = col.push(slider_field(
+        panel,
+        SliderField::PreviewOpacity,
+        "Opacity:",
+        panel.config.preview_opacity,
+        "%",
+    ));
+    col.into()
 }
 
 /// A slider with a typable numeric readout: click the value, type an exact
