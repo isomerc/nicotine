@@ -48,6 +48,12 @@ pub struct LiveSettings {
     /// when false, spawn them when flipped back on) without a daemon
     /// restart.
     pub show_previews: bool,
+    /// When true, the preview of the currently-active EVE client is
+    /// hidden (you're already looking at that client full-size). On
+    /// cycle, the newly-active client's preview hides and the one cycled
+    /// away from reappears. Read live so the toggle takes effect without
+    /// a restart.
+    pub hide_active_preview: bool,
 }
 
 impl LiveSettings {
@@ -59,6 +65,7 @@ impl LiveSettings {
             display_mode: config.display_mode,
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
+            hide_active_preview: config.hide_active_preview,
         }))
     }
 }
@@ -107,6 +114,12 @@ pub struct Config {
     /// false, the daemon runs headless and you cycle via hotkeys / CLI only.
     #[serde(default = "default_show_previews")]
     pub show_previews: bool,
+    /// When true, hide the preview of whichever EVE client is currently
+    /// active — its thumbnail is redundant while you're looking at the
+    /// real window. Cycling moves the hidden preview to follow the active
+    /// client.
+    #[serde(default = "default_hide_active_preview")]
+    pub hide_active_preview: bool,
     /// Ordered list of EVE character names. Forward/backward cycling
     /// traverses this order; `switch N` maps target N to entry N-1.
     /// Empty list = cycle through whatever order the window manager
@@ -230,6 +243,10 @@ fn default_show_previews() -> bool {
     true
 }
 
+fn default_hide_active_preview() -> bool {
+    false
+}
+
 fn default_display_mode() -> DisplayMode {
     DisplayMode::Previews
 }
@@ -334,6 +351,7 @@ impl Config {
             preview_height: default_preview_height(),
             preview_opacity: default_preview_opacity(),
             show_previews: default_show_previews(),
+            hide_active_preview: default_hide_active_preview(),
             characters: Vec::new(),
             display_mode: default_display_mode(),
             positions_locked: false,
@@ -412,6 +430,7 @@ mod tests {
             preview_height: 180,
             preview_opacity: 100,
             show_previews: true,
+            hide_active_preview: false,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -445,6 +464,7 @@ mod tests {
             preview_height: 180,
             preview_opacity: 100,
             show_previews: true,
+            hide_active_preview: false,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -477,6 +497,7 @@ mod tests {
             preview_height: 180,
             preview_opacity: 55,
             show_previews: true,
+            hide_active_preview: true,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -492,5 +513,9 @@ mod tests {
         // Non-default on purpose: proves the value is actually persisted,
         // not silently masked by the serde default on load.
         assert_eq!(deserialized.preview_opacity, 55);
+        assert!(
+            deserialized.hide_active_preview,
+            "hide_active_preview must survive a save/load round-trip"
+        );
     }
 }

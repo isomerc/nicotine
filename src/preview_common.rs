@@ -109,6 +109,19 @@ pub fn snap_position(
     (x, y)
 }
 
+/// Whether a preview window should be hidden right now, given the
+/// "hide active client's preview" setting and whether this preview
+/// mirrors the currently-active EVE client.
+///
+/// The cycle behavior the user sees falls straight out of this: when
+/// they switch from client A to client B, A's `is_active` goes false
+/// (its preview reappears) and B's goes true (its preview hides). Each
+/// manager just re-evaluates this per preview whenever the active client
+/// changes — there's no separate "show the one we cycled away from" path.
+pub fn preview_should_hide(hide_active_setting: bool, is_active: bool) -> bool {
+    hide_active_setting && is_active
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +363,34 @@ mod tests {
         let others = [neighbor(210, 100)];
         let (x, y) = snap_position(100, 100, DRAG_W, DRAG_H, &others, 0);
         assert_eq!((x, y), (100, 100));
+    }
+
+    #[test]
+    fn preview_hidden_only_when_setting_on_and_active() {
+        // Setting off: nothing is ever hidden, active or not.
+        assert!(!preview_should_hide(false, false));
+        assert!(!preview_should_hide(false, true));
+        // Setting on: only the active client's preview hides.
+        assert!(!preview_should_hide(true, false));
+        assert!(preview_should_hide(true, true));
+    }
+
+    #[test]
+    fn cycling_hides_new_active_and_reveals_previous() {
+        // Two previews, A and B; the setting is on. Model the active
+        // client by which `is_active` flag is set, then "cycle" by moving
+        // the active flag from A to B and re-evaluating both — exactly
+        // what the managers do on a focus change.
+        let on = true;
+
+        // A is the active client: A hidden, B visible.
+        let (a_active, b_active) = (true, false);
+        assert!(preview_should_hide(on, a_active));
+        assert!(!preview_should_hide(on, b_active));
+
+        // Cycle to B: A is no longer active (reappears), B now hides.
+        let (a_active, b_active) = (false, true);
+        assert!(!preview_should_hide(on, a_active));
+        assert!(preview_should_hide(on, b_active));
     }
 }

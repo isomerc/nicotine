@@ -1,7 +1,7 @@
 use crate::config::{Config, LiveSettings};
 use crate::cycle_state::CycleState;
 use crate::preview_common::{
-    snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
+    preview_should_hide, snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
 };
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
@@ -32,12 +32,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, TranslateMessage, EVENT_SYSTEM_FOREGROUND,
-    GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST, IDC_ARROW, MSG, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST, IDC_ARROW, MSG,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WINEVENT_OUTOFCONTEXT, WM_DESTROY,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 /// Type alias for DWM thumbnail handles. windows-rs 0.59 doesn't expose a
@@ -188,6 +188,10 @@ struct OwnedPreview {
     /// can detect changes without dereferencing the GWLP_USERDATA pointer
     /// on every tick.
     is_active: bool,
+    /// True while this preview is hidden via ShowWindow(SW_HIDE) because
+    /// the "hide active client's preview" setting is on and this is the
+    /// foreground client. Tracked so we only call ShowWindow on a flip.
+    hidden: bool,
 }
 
 impl Drop for OwnedPreview {
@@ -315,6 +319,10 @@ impl PreviewManager {
         // windows resize in real time.
         self.apply_live_size();
         self.apply_live_opacity();
+        // Catches the setting being toggled and previews created since the
+        // last tick; the instant per-cycle response comes from the same
+        // call at the end of update_active.
+        self.apply_active_visibility();
 
         let windows = {
             let s = self.state.lock().unwrap();
@@ -548,6 +556,33 @@ impl PreviewManager {
         }
     }
 
+    /// Hide the active client's preview (and reveal everything else) when
+    /// the "hide active client's preview" setting is on. Calls ShowWindow
+    /// only on a state flip, so it's cheap to run every tick and on every
+    /// focus change. On a cycle, update_active flips `is_active` first, so
+    /// re-running this hides the newly-active preview and reshows the one
+    /// cycled away from.
+    fn apply_active_visibility(&mut self) {
+        let hide_active = self.live.lock().unwrap().hide_active_preview;
+        for preview in self.previews.values_mut() {
+            let want_hidden = preview_should_hide(hide_active, preview.is_active);
+            if want_hidden == preview.hidden {
+                continue;
+            }
+            preview.hidden = want_hidden;
+            // SW_SHOWNOACTIVATE re-shows without stealing focus from the
+            // EVE client the user is playing.
+            let cmd = if want_hidden {
+                SW_HIDE
+            } else {
+                SW_SHOWNOACTIVATE
+            };
+            unsafe {
+                let _ = ShowWindow(preview.hwnd, cmd);
+            }
+        }
+    }
+
     /// Snapshot of all preview window rects in screen coordinates,
     /// excluding the one identified by `exclude`. Used by the drag handler
     /// for snap-to-dock calculations.
@@ -598,6 +633,10 @@ impl PreviewManager {
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
             }
         }
+
+        // Hide the now-active preview / reveal the one cycled away from to
+        // match the focus change we just processed.
+        self.apply_active_visibility();
 
         // Repaint the list window whenever the active client changes so
         // the red + cigarette row follows the real foreground window.
@@ -702,6 +741,9 @@ impl PreviewManager {
                 hwnd,
                 source_id: window.id,
                 is_active: false,
+                // Created visible (WS_VISIBLE); the reconcile pass right
+                // after this hides it if it's the active client.
+                hidden: false,
             },
         );
         Ok(())

@@ -39,7 +39,7 @@ use x11rb::wrapper::ConnectionExt as _;
 
 use crate::config::{Config, DisplayMode, LiveSettings};
 use crate::cycle_state::CycleState;
-use crate::preview_common::{DragRect, DragState};
+use crate::preview_common::{preview_should_hide, DragRect, DragState};
 use crate::preview_positions::PreviewPositions;
 use crate::window_manager::WindowManager;
 
@@ -537,8 +537,37 @@ impl PreviewManager {
         // round-trips here, so safe on every 100ms tick.
         self.apply_live_size();
         self.apply_live_opacity();
+        // Catches the setting being toggled and previews created since
+        // the last tick; the instant per-cycle response comes from the
+        // same call at the end of update_active.
+        self.apply_active_visibility();
 
         Ok(())
+    }
+
+    /// Hide the active client's preview (and reveal everything else) when
+    /// the "hide active client's preview" setting is on. Maps/unmaps only
+    /// on a state flip so it's cheap to call every tick and on every
+    /// focus change. On a cycle, update_active flips `is_active` first,
+    /// so re-running this hides the newly-active preview and remaps the
+    /// one cycled away from.
+    fn apply_active_visibility(&mut self) {
+        let hide_active = self.live.lock_recover().hide_active_preview;
+        for preview in self.previews.values_mut() {
+            let want_hidden = preview_should_hide(hide_active, preview.is_active);
+            if want_hidden == preview.hidden {
+                continue;
+            }
+            preview.hidden = want_hidden;
+            if want_hidden {
+                let _ = self.conn.unmap_window(preview.window);
+            } else {
+                let _ = self.conn.map_window(preview.window);
+                // Backing contents are undefined after a remap; force the
+                // loop-tick repaint to re-present a complete frame.
+                preview.dirty = true;
+            }
+        }
     }
 
     /// Read LiveSettings.preview_opacity; if it changed since the last
@@ -911,6 +940,10 @@ impl PreviewManager {
                 preview.is_active = preview.source_id == new_active;
             }
         }
+        // Hide the now-active preview / reveal the one cycled away from,
+        // before the paint loop — so a revealed preview is mapped in time
+        // for the present below instead of waiting for the next tick.
+        self.apply_active_visibility();
         // Trigger a fresh present for each affected preview. Chrome is
         // repainted inside paint_preview_now using the just-updated
         // is_active flag, so we don't paint chrome separately here —

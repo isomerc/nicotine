@@ -335,6 +335,7 @@ pub(super) enum Message {
     DropRow,
     KeyEvent(iced::keyboard::Event),
     ShowPreviewsToggled(bool),
+    HideActivePreviewToggled(bool),
     PreviewWidthChanged(u32),
     PreviewHeightChanged(u32),
     PreviewOpacityChanged(u32),
@@ -479,6 +480,11 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         Message::ShowPreviewsToggled(v) => {
             panel.config.show_previews = v;
             panel.live.lock().unwrap().show_previews = v;
+            panel.touch();
+        }
+        Message::HideActivePreviewToggled(v) => {
+            panel.config.hide_active_preview = v;
+            panel.live.lock().unwrap().hide_active_preview = v;
             panel.touch();
         }
         Message::PreviewWidthChanged(w) => {

@@ -87,6 +87,11 @@ pub(super) struct OwnedPreview {
     pub(super) x: i16,
     pub(super) y: i16,
     pub(super) is_active: bool,
+    /// True while this preview is unmapped because the "hide active
+    /// client's preview" setting is on and this preview's source is the
+    /// foreground client. Tracked so the reconcile/active-change passes
+    /// only issue map/unmap when the desired state actually flips.
+    pub(super) hidden: bool,
     /// Press / motion / release bookkeeping. See `DragState` in
     /// `preview_common` for field semantics.
     pub(super) drag: DragState,
@@ -346,6 +351,9 @@ impl PreviewManager {
             x: init_x as i16,
             y: init_y as i16,
             is_active,
+            // Created mapped; the reconcile pass right after this unmaps
+            // it if the hide-active setting says it should start hidden.
+            hidden: false,
             drag: DragState::default(),
             grabbed: false,
         };

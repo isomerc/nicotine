@@ -409,6 +409,9 @@ fn previews_section(panel: &Panel) -> Element<'_, Message> {
         checkbox(panel.config.show_previews)
             .label("Show preview windows")
             .on_toggle(Message::ShowPreviewsToggled),
+        checkbox(panel.config.hide_active_preview)
+            .label("Hide the active client's preview")
+            .on_toggle(Message::HideActivePreviewToggled),
         slider_field(
             panel,
             SliderField::PreviewWidth,
