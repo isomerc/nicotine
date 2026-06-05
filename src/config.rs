@@ -37,6 +37,7 @@ pub enum DisplayMode {
 pub struct LiveSettings {
     pub preview_width: u32,
     pub preview_height: u32,
+    pub preview_opacity: u32,
     pub display_mode: DisplayMode,
     /// When true, both preview windows and the client-list window
     /// ignore mouse drags so they can't accidentally be knocked out of
@@ -54,6 +55,7 @@ impl LiveSettings {
         Arc::new(Mutex::new(Self {
             preview_width: config.preview_width,
             preview_height: config.preview_height,
+            preview_opacity: config.preview_opacity,
             display_mode: config.display_mode,
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
@@ -98,6 +100,9 @@ pub struct Config {
     /// Height of preview windows in pixels (Windows only).
     #[serde(default = "default_preview_height")]
     pub preview_height: u32,
+    /// Preview-window opacity as a percentage, 10–100 (100 = fully opaque).
+    #[serde(default = "default_preview_opacity")]
+    pub preview_opacity: u32,
     /// Whether DWM preview windows are spawned at all (Windows only). When
     /// false, the daemon runs headless and you cycle via hotkeys / CLI only.
     #[serde(default = "default_show_previews")]
@@ -217,6 +222,10 @@ fn default_preview_height() -> u32 {
     180
 }
 
+fn default_preview_opacity() -> u32 {
+    100
+}
+
 fn default_show_previews() -> bool {
     true
 }
@@ -323,6 +332,7 @@ impl Config {
             modifier_key: default_modifier_key(),
             preview_width: default_preview_width(),
             preview_height: default_preview_height(),
+            preview_opacity: default_preview_opacity(),
             show_previews: default_show_previews(),
             characters: Vec::new(),
             display_mode: default_display_mode(),
@@ -400,6 +410,7 @@ mod tests {
             modifier_key: None,
             preview_width: 320,
             preview_height: 180,
+            preview_opacity: 100,
             show_previews: true,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
@@ -432,6 +443,7 @@ mod tests {
             modifier_key: None,
             preview_width: 320,
             preview_height: 180,
+            preview_opacity: 100,
             show_previews: true,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
@@ -463,6 +475,7 @@ mod tests {
             modifier_key: None,
             preview_width: 320,
             preview_height: 180,
+            preview_opacity: 55,
             show_previews: true,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
@@ -476,5 +489,8 @@ mod tests {
         assert_eq!(deserialized.display_width, 7680);
         assert_eq!(deserialized.display_height, 2160);
         assert_eq!(deserialized.eve_width, 4147);
+        // Non-default on purpose: proves the value is actually persisted,
+        // not silently masked by the serde default on load.
+        assert_eq!(deserialized.preview_opacity, 55);
     }
 }

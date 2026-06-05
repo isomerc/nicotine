@@ -314,6 +314,7 @@ impl PreviewManager {
         // user drag the size sliders in the config panel and see preview
         // windows resize in real time.
         self.apply_live_size();
+        self.apply_live_opacity();
 
         let windows = {
             let s = self.state.lock().unwrap();
@@ -496,6 +497,7 @@ impl PreviewManager {
         self.config.preview_height = want_h;
         let w = want_w as i32;
         let h = want_h as i32;
+        let opacity = opacity_to_byte(self.config.preview_opacity);
         for preview in self.previews.values() {
             unsafe {
                 // Resize the window without touching its position or z-order.
@@ -513,10 +515,35 @@ impl PreviewManager {
                 let ptr =
                     GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
                 if !ptr.is_null() {
-                    update_thumbnail_rect((*ptr).thumbnail, w, h);
+                    update_thumbnail_rect((*ptr).thumbnail, w, h, opacity);
                 }
                 // Repaint title strip + border at the new dimensions.
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
+            }
+        }
+    }
+
+    /// Read the shared LiveSettings and, if the user has adjusted the
+    /// opacity slider, re-push the DWM thumbnail opacity for every preview.
+    /// No-op when nothing changed. The destination rect is recomputed from
+    /// the current size, which is fine — it's the same value apply_live_size
+    /// would set.
+    fn apply_live_opacity(&mut self) {
+        let want = self.live.lock().unwrap().preview_opacity;
+        if want == self.config.preview_opacity {
+            return;
+        }
+        self.config.preview_opacity = want;
+        let w = self.config.preview_width as i32;
+        let h = self.config.preview_height as i32;
+        let opacity = opacity_to_byte(want);
+        for preview in self.previews.values() {
+            unsafe {
+                let ptr =
+                    GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
+                if !ptr.is_null() {
+                    update_thumbnail_rect((*ptr).thumbnail, w, h, opacity);
+                }
             }
         }
     }
@@ -635,7 +662,12 @@ impl PreviewManager {
             DwmRegisterThumbnail(hwnd, id_to_hwnd(window.id))
                 .context("DwmRegisterThumbnail failed")?
         };
-        update_thumbnail_rect(thumbnail, width, height);
+        update_thumbnail_rect(
+            thumbnail,
+            width,
+            height,
+            opacity_to_byte(self.config.preview_opacity),
+        );
 
         let per_window = Box::new(PreviewWindowState {
             source_id: window.id,
@@ -689,7 +721,7 @@ impl PreviewManager {
 /// mirror the whole source window (including any title bar/border) — EVE's
 /// client area definition reportedly hides the actual game render surface,
 /// so SOURCECLIENTAREAONLY gives a blank preview.
-fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
+fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32, opacity: u8) {
     let border = px(BORDER_WIDTH);
     let title = px(TITLE_HEIGHT);
     let props = DWM_THUMBNAIL_PROPERTIES {
@@ -701,13 +733,19 @@ fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
             bottom: height - border,
         },
         rcSource: RECT::default(),
-        opacity: 255,
+        opacity,
         fVisible: true.into(),
         fSourceClientAreaOnly: false.into(),
     };
     unsafe {
         let _ = DwmUpdateThumbnailProperties(thumbnail, &props);
     }
+}
+
+/// Map an opacity percent (slider range 10..=100) to the 0..=255 byte the
+/// DWM thumbnail `opacity` field expects. 100% maps to fully opaque (255).
+fn opacity_to_byte(percent: u32) -> u8 {
+    (percent.min(100) * 255 / 100) as u8
 }
 
 /// Window procedure for preview windows. Pulls per-window state from

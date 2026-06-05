@@ -73,9 +73,13 @@ pub(super) enum Tab {
 /// A slider whose value can also be typed into its readout. Centralizes the
 /// per-slider range and apply-message so the view helper and `update` agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// The current sliders all control preview-window settings, so the shared
+// `Preview` prefix is meaningful rather than redundant.
+#[allow(clippy::enum_variant_names)]
 pub(super) enum SliderField {
     PreviewWidth,
     PreviewHeight,
+    PreviewOpacity,
 }
 
 impl SliderField {
@@ -83,6 +87,7 @@ impl SliderField {
         match self {
             SliderField::PreviewWidth => 120..=800,
             SliderField::PreviewHeight => 80..=600,
+            SliderField::PreviewOpacity => 10..=100,
         }
     }
 
@@ -92,6 +97,7 @@ impl SliderField {
         match self {
             SliderField::PreviewWidth => Message::PreviewWidthChanged(value),
             SliderField::PreviewHeight => Message::PreviewHeightChanged(value),
+            SliderField::PreviewOpacity => Message::PreviewOpacityChanged(value),
         }
     }
 
@@ -108,6 +114,7 @@ impl SliderField {
         match self {
             SliderField::PreviewWidth => panel.config.preview_width,
             SliderField::PreviewHeight => panel.config.preview_height,
+            SliderField::PreviewOpacity => panel.config.preview_opacity,
         }
     }
 }
@@ -211,6 +218,10 @@ impl Panel {
         slider_text.insert(
             SliderField::PreviewHeight,
             config.preview_height.to_string(),
+        );
+        slider_text.insert(
+            SliderField::PreviewOpacity,
+            config.preview_opacity.to_string(),
         );
         Self {
             config,
@@ -326,6 +337,7 @@ pub(super) enum Message {
     ShowPreviewsToggled(bool),
     PreviewWidthChanged(u32),
     PreviewHeightChanged(u32),
+    PreviewOpacityChanged(u32),
     SliderTextChanged(SliderField, String),
     SliderTextCommit(SliderField),
     OpenLink(String),
@@ -483,6 +495,14 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             panel
                 .slider_text
                 .insert(SliderField::PreviewHeight, h.to_string());
+            panel.touch();
+        }
+        Message::PreviewOpacityChanged(o) => {
+            panel.config.preview_opacity = o;
+            panel.live.lock().unwrap().preview_opacity = o;
+            panel
+                .slider_text
+                .insert(SliderField::PreviewOpacity, o.to_string());
             panel.touch();
         }
         Message::SliderTextChanged(field, s) => {
@@ -1075,7 +1095,14 @@ mod tests {
 
     #[test]
     fn slider_input_clamps_typed_value_to_range() {
-        for field in [SliderField::PreviewWidth, SliderField::PreviewHeight] {
+        // PreviewOpacity is the one slider with a non-zero floor (10),
+        // so "0" clamping up to 10 — not 0 — is the case that actually
+        // guards the "previews can't be made invisible" design choice.
+        for field in [
+            SliderField::PreviewWidth,
+            SliderField::PreviewHeight,
+            SliderField::PreviewOpacity,
+        ] {
             let r = field.range();
             assert_eq!(field.parse_input("999999"), Some(*r.end()));
             assert_eq!(field.parse_input("0"), Some(*r.start()));

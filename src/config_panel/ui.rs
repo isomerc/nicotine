@@ -413,13 +413,22 @@ fn previews_section(panel: &Panel) -> Element<'_, Message> {
             panel,
             SliderField::PreviewWidth,
             "Width:",
-            panel.config.preview_width
+            panel.config.preview_width,
+            "px",
         ),
         slider_field(
             panel,
             SliderField::PreviewHeight,
             "Height:",
             panel.config.preview_height,
+            "px",
+        ),
+        slider_field(
+            panel,
+            SliderField::PreviewOpacity,
+            "Opacity:",
+            panel.config.preview_opacity,
+            "%",
         ),
     ]
     .spacing(8)
@@ -434,6 +443,7 @@ fn slider_field<'a>(
     field: SliderField,
     label: &'static str,
     value: u32,
+    unit: &'static str,
 ) -> Element<'a, Message> {
     let buffer = panel
         .slider_text
@@ -447,7 +457,7 @@ fn slider_field<'a>(
             .on_input(move |s| Message::SliderTextChanged(field, s))
             .on_submit(Message::SliderTextCommit(field))
             .width(Length::Fixed(56.0)),
-        text("px"),
+        text(unit),
     ]
     .spacing(8)
     .align_y(Alignment::Center)

@@ -27,8 +27,8 @@ use super::render::{
     xcolor,
 };
 use super::{
-    DragState, MutexExt as _, PreviewManager, BORDER_WIDTH, CHROME_DARK, NICOTINE_CREAM,
-    NICOTINE_RED, PREVIEW_HEIGHT, PREVIEW_WIDTH, TITLE_FONT_PX, TITLE_STRIP_HEIGHT,
+    opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, BORDER_WIDTH, CHROME_DARK,
+    NICOTINE_CREAM, NICOTINE_RED, PREVIEW_HEIGHT, PREVIEW_WIDTH, TITLE_FONT_PX, TITLE_STRIP_HEIGHT,
     TITLE_TEXT_LEFT_PAD,
 };
 
@@ -180,9 +180,13 @@ impl PreviewManager {
         // Initial dimensions come from LiveSettings (so the panel
         // sliders' current value is honored on first spawn) falling
         // back to config and finally to the compile-time defaults.
-        let (init_w, init_h) = {
+        let (init_w, init_h, init_opacity) = {
             let live = self.live.lock_recover();
-            (live.preview_width as u16, live.preview_height as u16)
+            (
+                live.preview_width as u16,
+                live.preview_height as u16,
+                live.preview_opacity,
+            )
         };
         let init_w = if init_w == 0 { PREVIEW_WIDTH } else { init_w };
         let init_h = if init_h == 0 { PREVIEW_HEIGHT } else { init_h };
@@ -246,6 +250,15 @@ impl PreviewManager {
             self.atoms.net_wm_window_type,
             AtomEnum::ATOM,
             &[self.atoms.net_wm_window_type_utility],
+        )?;
+        // Honor the panel's opacity slider on first spawn; reconcile's
+        // apply_live_opacity re-pushes this when the slider moves later.
+        conn.change_property32(
+            PropMode::REPLACE,
+            our_window,
+            self.atoms.net_wm_window_opacity,
+            AtomEnum::CARDINAL,
+            &[opacity_to_cardinal(init_opacity)],
         )?;
         // Title isn't shown by override_redirect (no titlebar), but set
         // it anyway so window-list tools and our own xprop debug see it.

@@ -347,6 +347,31 @@ fn pick_argb32_format_none_on_empty_reply() {
     assert_eq!(pick_argb32_format(&reply), None);
 }
 
+// --- opacity_to_cardinal ----------------------------------------
+
+#[test]
+fn opacity_cardinal_boundaries() {
+    // 100% is the default value, so it must map to *exactly* u32::MAX.
+    // Anything short and KWin reads the window as slightly translucent —
+    // every preview would be subtly dimmed out of the box with nobody
+    // having touched the slider.
+    assert_eq!(opacity_to_cardinal(100), u32::MAX);
+    assert_eq!(opacity_to_cardinal(0), 0);
+    // The slider can't exceed 100, but the float→u32 cast must saturate
+    // rather than wrap if a bad value ever reached it.
+    assert_eq!(opacity_to_cardinal(150), u32::MAX);
+}
+
+#[test]
+fn opacity_cardinal_scales_monotonically() {
+    // Higher percent → more opaque. Pins the scaling direction and that
+    // the 10% slider floor is a small but non-zero fraction of opaque.
+    let ten = opacity_to_cardinal(10);
+    assert!(ten > 0);
+    assert!(ten < opacity_to_cardinal(50));
+    assert!(opacity_to_cardinal(50) < u32::MAX);
+}
+
 #[test]
 fn empty_direct_format_is_zero_everywhere() {
     // Sanity for the test fixture helper itself — used elsewhere
