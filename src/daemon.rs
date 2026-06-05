@@ -151,6 +151,8 @@ impl Daemon {
             u16,
             Option<u16>,
             std::collections::HashMap<String, crate::config::CharacterHotkey>,
+            Option<u16>,
+            Option<u16>,
         );
         #[cfg(windows)]
         fn hotkey_sig(c: &Config) -> HotkeySig {
@@ -160,6 +162,8 @@ impl Daemon {
                 c.backward_key,
                 c.modifier_key,
                 c.character_hotkeys.clone(),
+                c.toggle_previews_key,
+                c.toggle_previews_modifier,
             )
         }
         #[cfg(windows)]
@@ -279,22 +283,24 @@ impl Daemon {
             Arc::clone(&self.keyboard_config),
             Arc::clone(&self.wm),
             Arc::clone(&self.state),
+            Arc::clone(&self.live),
         );
         println!("Mouse + keyboard listeners spawned (live config hot-reload enabled)");
 
         // Linux preview manager — XComposite redirect + XRender server-
-        // side composite. Gated by config.show_previews to mirror the
-        // Windows daemon. Failure to start is non-fatal; cycling and the
-        // config panel keep working.
-        if self.config.show_previews {
-            let wm_clone = Arc::clone(&self.wm);
-            let state_clone = Arc::clone(&self.state);
-            let live_clone = Arc::clone(&self.live);
-            match crate::preview_x11::spawn(self.config.clone(), wm_clone, state_clone, live_clone)
-            {
-                Ok(_) => println!("Linux preview windows started (XRender path)"),
-                Err(e) => eprintln!("Warning: Could not start Linux preview manager: {}", e),
-            }
+        // side composite. Always spawned (matching the Windows daemon);
+        // the manager self-gates each reconcile on LiveSettings.show_previews,
+        // so it stays dark until previews are on and can be toggled live —
+        // including from a cold start with previews off, via the checkbox
+        // or the toggle-previews hotkey. The reconcile loop is cheap when
+        // dark (no windows, early return). Failure to start is non-fatal;
+        // cycling and the config panel keep working.
+        let wm_clone = Arc::clone(&self.wm);
+        let state_clone = Arc::clone(&self.state);
+        let live_clone = Arc::clone(&self.live);
+        match crate::preview_x11::spawn(self.config.clone(), wm_clone, state_clone, live_clone) {
+            Ok(_) => println!("Linux preview manager started (XRender path)"),
+            Err(e) => eprintln!("Warning: Could not start Linux preview manager: {}", e),
         }
     }
 
@@ -303,7 +309,8 @@ impl Daemon {
         // Hotkey + low-level mouse hook listener (always spawned).
         let wm_clone = Arc::clone(&self.wm);
         let state_clone = Arc::clone(&self.state);
-        match crate::windows_input::spawn(self.config.clone(), wm_clone, state_clone) {
+        let live_clone = Arc::clone(&self.live);
+        match crate::windows_input::spawn(self.config.clone(), wm_clone, state_clone, live_clone) {
             Ok(_) => println!("Windows input listeners started"),
             Err(e) => eprintln!("Warning: Could not start Windows input listeners: {}", e),
         }

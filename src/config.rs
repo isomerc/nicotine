@@ -37,6 +37,7 @@ pub enum DisplayMode {
 pub struct LiveSettings {
     pub preview_width: u32,
     pub preview_height: u32,
+    pub preview_opacity: u32,
     pub display_mode: DisplayMode,
     /// When true, both preview windows and the client-list window
     /// ignore mouse drags so they can't accidentally be knocked out of
@@ -47,6 +48,12 @@ pub struct LiveSettings {
     /// when false, spawn them when flipped back on) without a daemon
     /// restart.
     pub show_previews: bool,
+    /// When true, the preview of the currently-active EVE client is
+    /// hidden (you're already looking at that client full-size). On
+    /// cycle, the newly-active client's preview hides and the one cycled
+    /// away from reappears. Read live so the toggle takes effect without
+    /// a restart.
+    pub hide_active_preview: bool,
 }
 
 impl LiveSettings {
@@ -54,9 +61,11 @@ impl LiveSettings {
         Arc::new(Mutex::new(Self {
             preview_width: config.preview_width,
             preview_height: config.preview_height,
+            preview_opacity: config.preview_opacity,
             display_mode: config.display_mode,
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
+            hide_active_preview: config.hide_active_preview,
         }))
     }
 }
@@ -98,10 +107,36 @@ pub struct Config {
     /// Height of preview windows in pixels (Windows only).
     #[serde(default = "default_preview_height")]
     pub preview_height: u32,
+    /// Preview-window opacity as a percentage, 10–100 (100 = fully opaque).
+    #[serde(default = "default_preview_opacity")]
+    pub preview_opacity: u32,
     /// Whether DWM preview windows are spawned at all (Windows only). When
     /// false, the daemon runs headless and you cycle via hotkeys / CLI only.
     #[serde(default = "default_show_previews")]
     pub show_previews: bool,
+    /// When true, hide the preview of whichever EVE client is currently
+    /// active — its thumbnail is redundant while you're looking at the
+    /// real window. Cycling moves the hidden preview to follow the active
+    /// client.
+    #[serde(default = "default_hide_active_preview")]
+    pub hide_active_preview: bool,
+    /// When true, the config panel locks preview width and height to a
+    /// single aspect ratio and offers one "size" slider instead of
+    /// separate width/height sliders. Purely a panel-side concern — the
+    /// preview managers still just read `preview_width`/`preview_height`.
+    #[serde(default = "default_constrain_aspect")]
+    pub constrain_aspect: bool,
+    /// Optional global hotkey (platform key code — evdev on Linux, Win32
+    /// VK on Windows) that toggles preview-window visibility, i.e. flips
+    /// `show_previews`. `None` = unbound. Bound via the panel's Hotkeys
+    /// tab just like the cycle keys.
+    #[serde(default)]
+    pub toggle_previews_key: Option<u16>,
+    /// Optional modifier (Shift/Ctrl/Alt, as a platform key code) that
+    /// must be held with `toggle_previews_key` for the toggle to fire.
+    /// `None` = no modifier (the bare key toggles).
+    #[serde(default)]
+    pub toggle_previews_modifier: Option<u16>,
     /// Ordered list of EVE character names. Forward/backward cycling
     /// traverses this order; `switch N` maps target N to entry N-1.
     /// Empty list = cycle through whatever order the window manager
@@ -217,8 +252,20 @@ fn default_preview_height() -> u32 {
     180
 }
 
+fn default_preview_opacity() -> u32 {
+    100
+}
+
 fn default_show_previews() -> bool {
     true
+}
+
+fn default_hide_active_preview() -> bool {
+    false
+}
+
+fn default_constrain_aspect() -> bool {
+    false
 }
 
 fn default_display_mode() -> DisplayMode {
@@ -323,7 +370,12 @@ impl Config {
             modifier_key: default_modifier_key(),
             preview_width: default_preview_width(),
             preview_height: default_preview_height(),
+            preview_opacity: default_preview_opacity(),
             show_previews: default_show_previews(),
+            hide_active_preview: default_hide_active_preview(),
+            constrain_aspect: default_constrain_aspect(),
+            toggle_previews_key: None,
+            toggle_previews_modifier: None,
             characters: Vec::new(),
             display_mode: default_display_mode(),
             positions_locked: false,
@@ -400,7 +452,12 @@ mod tests {
             modifier_key: None,
             preview_width: 320,
             preview_height: 180,
+            preview_opacity: 100,
             show_previews: true,
+            hide_active_preview: false,
+            constrain_aspect: false,
+            toggle_previews_key: None,
+            toggle_previews_modifier: None,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -432,7 +489,12 @@ mod tests {
             modifier_key: None,
             preview_width: 320,
             preview_height: 180,
+            preview_opacity: 100,
             show_previews: true,
+            hide_active_preview: false,
+            constrain_aspect: false,
+            toggle_previews_key: None,
+            toggle_previews_modifier: None,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -463,7 +525,12 @@ mod tests {
             modifier_key: None,
             preview_width: 320,
             preview_height: 180,
+            preview_opacity: 55,
             show_previews: true,
+            hide_active_preview: true,
+            constrain_aspect: true,
+            toggle_previews_key: Some(67),
+            toggle_previews_modifier: Some(42),
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -476,5 +543,26 @@ mod tests {
         assert_eq!(deserialized.display_width, 7680);
         assert_eq!(deserialized.display_height, 2160);
         assert_eq!(deserialized.eve_width, 4147);
+        // Non-default on purpose: proves the value is actually persisted,
+        // not silently masked by the serde default on load.
+        assert_eq!(deserialized.preview_opacity, 55);
+        assert!(
+            deserialized.hide_active_preview,
+            "hide_active_preview must survive a save/load round-trip"
+        );
+        assert!(
+            deserialized.constrain_aspect,
+            "constrain_aspect must survive a save/load round-trip"
+        );
+        assert_eq!(
+            deserialized.toggle_previews_key,
+            Some(67),
+            "toggle_previews_key binding must survive a save/load round-trip"
+        );
+        assert_eq!(
+            deserialized.toggle_previews_modifier,
+            Some(42),
+            "toggle_previews_modifier must survive a save/load round-trip"
+        );
     }
 }

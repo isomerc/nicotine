@@ -10,8 +10,9 @@ use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, 
 use crate::config::DisplayMode;
 
 use super::{
-    code_to_label, CaptureTarget, Message, Panel, Tab, CAPTION_SIZE, LOGO_SIZE, MODIFIER_CHOICES,
-    NICOTINE_BLACK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED, SECTION_SIZE,
+    code_to_label, CaptureTarget, Message, Panel, SliderField, Tab, CAPTION_SIZE, LOGO_SIZE,
+    MODIFIER_CHOICES, NICOTINE_BLACK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED,
+    SECTION_SIZE,
 };
 
 const LOGO_FONT: Font = Font::with_name("Marlboro");
@@ -378,6 +379,33 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
         modifier = modifier.push(button(text("Clear")).on_press(Message::ClearModifier));
     }
 
+    let toggle_label = match panel.config.toggle_previews_key {
+        Some(vk) => code_to_label(vk),
+        None => "None".to_string(),
+    };
+    let toggle_mod_selected = MODIFIER_CHOICES
+        .iter()
+        .copied()
+        .find(|m| m.code == panel.config.toggle_previews_modifier);
+    let mut toggle_previews = bind_row(
+        panel,
+        "Toggle previews:",
+        CaptureTarget::TogglePreviews,
+        toggle_label,
+    );
+    toggle_previews = toggle_previews.push(
+        pick_list(
+            MODIFIER_CHOICES,
+            toggle_mod_selected,
+            Message::TogglePreviewsModifierChanged,
+        )
+        .width(Length::Fixed(80.0)),
+    );
+    if panel.config.toggle_previews_key.is_some() {
+        toggle_previews =
+            toggle_previews.push(button(text("Clear")).on_press(Message::ClearTogglePreviews));
+    }
+
     column![
         section_header("Keyboard Hotkeys"),
         checkbox(panel.config.enable_keyboard_buttons)
@@ -389,6 +417,11 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
         caption(
             "Click a binding to record the next key you press. Esc cancels. Set both keys to the \
              same value with a modifier to cycle backward via modifier+key (e.g. Tab + Shift+Tab)."
+        ),
+        toggle_previews,
+        caption(
+            "Toggle previews shows/hides all preview windows with one key — independent of \
+             keyboard cycling. Leave unbound if you don't want it."
         ),
         checkbox(panel.config.enable_mouse_buttons)
             .label("Cycle on mouse side buttons (XBUTTON1/XBUTTON2)")
@@ -403,37 +436,83 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
 }
 
 fn previews_section(panel: &Panel) -> Element<'_, Message> {
-    column![
+    let mut col = column![
         section_header("Preview Windows"),
         checkbox(panel.config.show_previews)
             .label("Show preview windows")
             .on_toggle(Message::ShowPreviewsToggled),
-        row![
-            text("Width:").width(Length::Fixed(70.0)),
-            slider(
-                120..=800u32,
-                panel.config.preview_width,
-                Message::PreviewWidthChanged
-            )
-            .step(1u32),
-            text(format!("{} px", panel.config.preview_width)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-        row![
-            text("Height:").width(Length::Fixed(70.0)),
-            slider(
-                80..=600u32,
-                panel.config.preview_height,
-                Message::PreviewHeightChanged
-            )
-            .step(1u32),
-            text(format!("{} px", panel.config.preview_height)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
+        checkbox(panel.config.hide_active_preview)
+            .label("Hide the active client's preview")
+            .on_toggle(Message::HideActivePreviewToggled),
+        checkbox(panel.config.constrain_aspect)
+            .label("Constrain aspect ratio")
+            .on_toggle(Message::ConstrainAspectToggled),
+    ]
+    .spacing(8);
+
+    // One "size" slider when the ratio is locked; otherwise independent
+    // width + height sliders.
+    if panel.config.constrain_aspect {
+        col = col.push(slider_field(
+            panel,
+            SliderField::PreviewSize,
+            "Size:",
+            panel.config.preview_width,
+            "px",
+        ));
+    } else {
+        col = col.push(slider_field(
+            panel,
+            SliderField::PreviewWidth,
+            "Width:",
+            panel.config.preview_width,
+            "px",
+        ));
+        col = col.push(slider_field(
+            panel,
+            SliderField::PreviewHeight,
+            "Height:",
+            panel.config.preview_height,
+            "px",
+        ));
+    }
+
+    col = col.push(slider_field(
+        panel,
+        SliderField::PreviewOpacity,
+        "Opacity:",
+        panel.config.preview_opacity,
+        "%",
+    ));
+    col.into()
+}
+
+/// A slider with a typable numeric readout: click the value, type an exact
+/// number, press Enter and the slider snaps to it. The text mirrors the
+/// value except while you're mid-edit. Reused for every slider.
+fn slider_field<'a>(
+    panel: &'a Panel,
+    field: SliderField,
+    label: &'static str,
+    value: u32,
+    unit: &'static str,
+) -> Element<'a, Message> {
+    let buffer = panel
+        .slider_text
+        .get(&field)
+        .map(String::as_str)
+        .unwrap_or("");
+    row![
+        text(label).width(Length::Fixed(70.0)),
+        slider(field.range(), value, move |v| field.change_message(v)).step(1u32),
+        text_input("", buffer)
+            .on_input(move |s| Message::SliderTextChanged(field, s))
+            .on_submit(Message::SliderTextCommit(field))
+            .width(Length::Fixed(56.0)),
+        text(unit),
     ]
     .spacing(8)
+    .align_y(Alignment::Center)
     .into()
 }
 
@@ -446,7 +525,7 @@ fn bind_row(
     current: String,
 ) -> iced::widget::Row<'static, Message> {
     row![
-        text(label).width(Length::Fixed(90.0)),
+        text(label).width(Length::Fixed(120.0)),
         bind_button(panel, target, current, 200.0),
     ]
     .spacing(6)

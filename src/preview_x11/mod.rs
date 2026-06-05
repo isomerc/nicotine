@@ -32,13 +32,14 @@ use x11rb::protocol::render::{ConnectionExt as _, CreatePictureAux as RenderCrea
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
-    ConnectionExt as _, EventMask, InputFocus, StackMode, SubwindowMode, Window,
+    ConnectionExt as _, EventMask, InputFocus, PropMode, StackMode, SubwindowMode, Window,
 };
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
 use crate::config::{Config, DisplayMode, LiveSettings};
 use crate::cycle_state::CycleState;
-use crate::preview_common::{DragRect, DragState};
+use crate::preview_common::{preview_should_hide, DragRect, DragState};
 use crate::preview_positions::PreviewPositions;
 use crate::window_manager::WindowManager;
 
@@ -231,6 +232,7 @@ fn run_manager(
         net_client_list: atom(&conn, b"_NET_CLIENT_LIST")?,
         net_active_window: atom(&conn, b"_NET_ACTIVE_WINDOW")?,
         net_wm_pid: atom(&conn, b"_NET_WM_PID")?,
+        net_wm_window_opacity: atom(&conn, b"_NET_WM_WINDOW_OPACITY")?,
     };
 
     // Subscribe to PropertyNotify on the root window so changes to
@@ -249,6 +251,10 @@ fn run_manager(
     // a no-op resize burst every reconcile tick. Initialized to (0, 0)
     // so the first reconcile applies whatever LiveSettings says.
     let last_applied_size = (0u16, 0u16);
+
+    // Same idea for opacity. 0 is never a valid slider value (range is
+    // 10..=100), so the first reconcile always pushes the real value.
+    let last_applied_opacity = 0u32;
 
     // Initial display mode comes from LiveSettings (the panel's last
     // saved choice). The first reconcile spawns the right kind of
@@ -272,6 +278,7 @@ fn run_manager(
         active_character: None,
         positions,
         last_applied_size,
+        last_applied_opacity,
         current_mode: initial_mode,
         list_window: None,
         needs_window_scan: true,
@@ -291,6 +298,9 @@ struct Atoms {
     net_client_list: u32,
     net_active_window: u32,
     net_wm_pid: u32,
+    /// `_NET_WM_WINDOW_OPACITY` — CARDINAL the compositor reads to blend
+    /// the whole window. Set per preview from the panel's opacity slider.
+    net_wm_window_opacity: u32,
 }
 
 struct PreviewManager {
@@ -335,6 +345,10 @@ struct PreviewManager {
     /// LiveSettings on each reconcile to skip the resize work when the
     /// user hasn't touched the sliders.
     last_applied_size: (u16, u16),
+    /// Last opacity percent we pushed to all preview windows. Diffed
+    /// against LiveSettings each reconcile so we only re-set the
+    /// `_NET_WM_WINDOW_OPACITY` property when the slider actually moved.
+    last_applied_opacity: u32,
     /// Whether the panel currently wants per-client previews or a
     /// single client-list window. Reconcile detects transitions and
     /// tears down the outgoing mode's surfaces before spawning the
@@ -522,8 +536,61 @@ impl PreviewManager {
         // Apply panel slider changes (preview width/height). No sync
         // round-trips here, so safe on every 100ms tick.
         self.apply_live_size();
+        self.apply_live_opacity();
+        // Catches the setting being toggled and previews created since
+        // the last tick; the instant per-cycle response comes from the
+        // same call at the end of update_active.
+        self.apply_active_visibility();
 
         Ok(())
+    }
+
+    /// Hide the active client's preview (and reveal everything else) when
+    /// the "hide active client's preview" setting is on. Maps/unmaps only
+    /// on a state flip so it's cheap to call every tick and on every
+    /// focus change. On a cycle, update_active flips `is_active` first,
+    /// so re-running this hides the newly-active preview and remaps the
+    /// one cycled away from.
+    fn apply_active_visibility(&mut self) {
+        let hide_active = self.live.lock_recover().hide_active_preview;
+        for preview in self.previews.values_mut() {
+            let want_hidden = preview_should_hide(hide_active, preview.is_active);
+            if want_hidden == preview.hidden {
+                continue;
+            }
+            preview.hidden = want_hidden;
+            if want_hidden {
+                let _ = self.conn.unmap_window(preview.window);
+            } else {
+                let _ = self.conn.map_window(preview.window);
+                // Backing contents are undefined after a remap; force the
+                // loop-tick repaint to re-present a complete frame.
+                preview.dirty = true;
+            }
+        }
+    }
+
+    /// Read LiveSettings.preview_opacity; if it changed since the last
+    /// reconcile, push `_NET_WM_WINDOW_OPACITY` to every preview window
+    /// so the compositor reblends them. New previews get their opacity
+    /// at creation (see create_preview), so this only handles slider
+    /// moves. change_property is async (no reply), cheap on every tick.
+    fn apply_live_opacity(&mut self) {
+        let want = self.live.lock_recover().preview_opacity;
+        if want == self.last_applied_opacity {
+            return;
+        }
+        self.last_applied_opacity = want;
+        let cardinal = opacity_to_cardinal(want);
+        for preview in self.previews.values() {
+            let _ = self.conn.change_property32(
+                PropMode::REPLACE,
+                preview.window,
+                self.atoms.net_wm_window_opacity,
+                AtomEnum::CARDINAL,
+                &[cardinal],
+            );
+        }
     }
 
     /// Read LiveSettings.preview_width / preview_height; if either has
@@ -873,6 +940,10 @@ impl PreviewManager {
                 preview.is_active = preview.source_id == new_active;
             }
         }
+        // Hide the now-active preview / reveal the one cycled away from,
+        // before the paint loop — so a revealed preview is mapped in time
+        // for the present below instead of waiting for the next tick.
+        self.apply_active_visibility();
         // Trigger a fresh present for each affected preview. Chrome is
         // repainted inside paint_preview_now using the just-updated
         // is_active flag, so we don't paint chrome separately here —
@@ -895,6 +966,14 @@ impl PreviewManager {
 
 fn atom(conn: &RustConnection, name: &[u8]) -> Result<u32> {
     Ok(conn.intern_atom(false, name)?.reply()?.atom)
+}
+
+/// Map an opacity percent (slider range 10..=100) to the CARDINAL value
+/// `_NET_WM_WINDOW_OPACITY` expects: 0 = fully transparent,
+/// 0xFFFF_FFFF = fully opaque. 100% maps exactly to u32::MAX.
+pub(super) fn opacity_to_cardinal(percent: u32) -> u32 {
+    let frac = percent.min(100) as f64 / 100.0;
+    (frac * u32::MAX as f64) as u32
 }
 
 /// Which surface a drag started on. Previews are keyed by character

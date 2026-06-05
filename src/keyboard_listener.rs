@@ -3,7 +3,7 @@
 //! same shape, same hot-reload contract, plus the character_hotkeys
 //! dispatch path that was missing from Linux entirely until now.
 
-use crate::config::{CharacterHotkey, Config};
+use crate::config::{CharacterHotkey, Config, LiveSettings};
 use crate::cycle_state::CycleState;
 use crate::window_manager::WindowManager;
 use anyhow::Result;
@@ -24,6 +24,8 @@ pub struct KeyboardConfig {
     pub keyboard_device_path: Option<String>,
     pub minimize_inactive: bool,
     pub character_hotkeys: HashMap<String, CharacterHotkey>,
+    pub toggle_previews_key: Option<u16>,
+    pub toggle_previews_modifier: Option<u16>,
 }
 
 impl KeyboardConfig {
@@ -36,7 +38,17 @@ impl KeyboardConfig {
             keyboard_device_path: c.keyboard_device_path.clone(),
             minimize_inactive: c.minimize_inactive,
             character_hotkeys: c.character_hotkeys.clone(),
+            toggle_previews_key: c.toggle_previews_key,
+            toggle_previews_modifier: c.toggle_previews_modifier,
         }
+    }
+
+    /// Whether the listener has any reason to stay attached to the input
+    /// device. It can idle (and release the device) only when cycling is
+    /// off AND no character hotkeys AND no preview-toggle key are bound —
+    /// otherwise a press it cares about would be missed.
+    fn has_work(&self) -> bool {
+        self.enable || !self.character_hotkeys.is_empty() || self.toggle_previews_key.is_some()
     }
 }
 
@@ -49,14 +61,16 @@ impl KeyboardListener {
         shared: Arc<Mutex<KeyboardConfig>>,
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
+        live: Arc<Mutex<LiveSettings>>,
     ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || Self::run_listener(shared, wm, state))
+        std::thread::spawn(move || Self::run_listener(shared, wm, state, live))
     }
 
     fn run_listener(
         shared: Arc<Mutex<KeyboardConfig>>,
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
+        live: Arc<Mutex<LiveSettings>>,
     ) {
         let mut device: Option<Device> = None;
         let mut current_dev_path: Option<String> = None;
@@ -70,14 +84,15 @@ impl KeyboardListener {
         loop {
             let snap = shared.lock().unwrap().clone();
 
-            // Character hotkeys are an independent dispatch path from
-            // forward/backward cycling — keep the listener live so they
-            // fire even when the user hasn't enabled keyboard cycling.
-            if !snap.enable && snap.character_hotkeys.is_empty() {
+            // Character hotkeys and the preview-toggle key are independent
+            // dispatch paths from forward/backward cycling — keep the
+            // listener live so they fire even when the user hasn't enabled
+            // keyboard cycling.
+            if !snap.has_work() {
                 if !announced_idle {
                     println!(
                         "Keyboard listener idle (enable_keyboard_buttons = false, \
-                         no character hotkeys bound)"
+                         no character hotkeys or preview-toggle key bound)"
                     );
                     announced_idle = true;
                     announced_listening = false;
@@ -134,6 +149,7 @@ impl KeyboardListener {
             // modifiers in the panel takes effect immediately.
             let modifier_codes: HashSet<u16> = std::iter::empty()
                 .chain(snap.modifier_key)
+                .chain(snap.toggle_previews_modifier)
                 .chain(snap.character_hotkeys.values().filter_map(|hk| hk.modifier))
                 .collect();
             // Forget pressed modifiers that are no longer modifiers in
@@ -197,6 +213,27 @@ impl KeyboardListener {
 
                 // Only act on press / repeat.
                 if event.value() == 0 {
+                    continue;
+                }
+
+                // Preview-visibility toggle. Independent of cycling enable,
+                // and acts only on the initial press (value == 1) so a held
+                // key doesn't strobe show/hide on key-repeat. Consume the
+                // key either way so it can't also trigger cycling/switching.
+                if toggle_previews_should_fire(
+                    snap.toggle_previews_key,
+                    snap.toggle_previews_modifier,
+                    code,
+                    &pressed_modifiers,
+                ) {
+                    if event.value() == 1 {
+                        let mut live = live.lock().unwrap();
+                        live.show_previews = !live.show_previews;
+                        println!(
+                            "Preview windows toggled {} via hotkey",
+                            if live.show_previews { "on" } else { "off" }
+                        );
+                    }
                     continue;
                 }
 
@@ -336,6 +373,20 @@ impl KeyboardListener {
         state.switch_to_character(name, &**wm, minimize_inactive)?;
         Ok(())
     }
+}
+
+/// Whether a key press should fire the preview-visibility toggle: the
+/// pressed `code` must match the bound key, and — if a modifier is bound —
+/// that modifier must currently be held. An unbound key (`None`) never
+/// fires; a binding with no modifier fires on the bare key regardless of
+/// which modifiers happen to be down (matching the no-modifier cycle keys).
+fn toggle_previews_should_fire(
+    toggle_key: Option<u16>,
+    toggle_modifier: Option<u16>,
+    code: u16,
+    pressed_modifiers: &HashSet<u16>,
+) -> bool {
+    toggle_key == Some(code) && toggle_modifier.is_none_or(|m| pressed_modifiers.contains(&m))
 }
 
 /// Pick the character (if any) whose hotkey matches a key press.
@@ -497,5 +548,93 @@ mod tests {
             resolve_character_hotkey(0x70, &HashSet::new(), &hotkeys),
             None
         );
+    }
+
+    fn idle_config() -> KeyboardConfig {
+        KeyboardConfig {
+            enable: false,
+            forward_key: 15,
+            backward_key: 15,
+            modifier_key: None,
+            keyboard_device_path: None,
+            minimize_inactive: false,
+            character_hotkeys: HashMap::new(),
+            toggle_previews_key: None,
+            toggle_previews_modifier: None,
+        }
+    }
+
+    #[test]
+    fn has_work_false_when_nothing_bound() {
+        assert!(!idle_config().has_work());
+    }
+
+    #[test]
+    fn has_work_true_when_only_toggle_key_bound() {
+        // Regression guard: binding just the preview-toggle key (cycling
+        // off, no character hotkeys) must keep the listener attached, or
+        // the toggle press would never be seen.
+        let mut c = idle_config();
+        c.toggle_previews_key = Some(88);
+        assert!(c.has_work());
+    }
+
+    #[test]
+    fn has_work_true_when_cycling_enabled_or_character_hotkey_bound() {
+        let mut enabled = idle_config();
+        enabled.enable = true;
+        assert!(enabled.has_work());
+
+        let mut with_char = idle_config();
+        with_char
+            .character_hotkeys
+            .insert("Alpha".to_string(), hk(0x70, None));
+        assert!(with_char.has_work());
+    }
+
+    #[test]
+    fn toggle_fires_on_bare_key_when_no_modifier_bound() {
+        let pressed = HashSet::new();
+        assert!(toggle_previews_should_fire(Some(88), None, 88, &pressed));
+        // A no-modifier binding fires even if some modifier happens to be
+        // held — same as the no-modifier cycle keys.
+        let shift_down: HashSet<u16> = [42].into_iter().collect();
+        assert!(toggle_previews_should_fire(Some(88), None, 88, &shift_down));
+    }
+
+    #[test]
+    fn toggle_requires_bound_modifier_to_be_held() {
+        // Bound as Shift(42)+88.
+        let none_held = HashSet::new();
+        assert!(!toggle_previews_should_fire(
+            Some(88),
+            Some(42),
+            88,
+            &none_held
+        ));
+        let shift_held: HashSet<u16> = [42].into_iter().collect();
+        assert!(toggle_previews_should_fire(
+            Some(88),
+            Some(42),
+            88,
+            &shift_held
+        ));
+    }
+
+    #[test]
+    fn toggle_never_fires_on_wrong_key_or_when_unbound() {
+        let shift_held: HashSet<u16> = [42].into_iter().collect();
+        assert!(!toggle_previews_should_fire(
+            Some(88),
+            Some(42),
+            99,
+            &shift_held
+        ));
+        assert!(!toggle_previews_should_fire(
+            None,
+            None,
+            88,
+            &HashSet::new()
+        ));
     }
 }

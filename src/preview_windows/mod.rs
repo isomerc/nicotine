@@ -1,7 +1,7 @@
 use crate::config::{Config, LiveSettings};
 use crate::cycle_state::CycleState;
 use crate::preview_common::{
-    snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
+    preview_should_hide, snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
 };
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
@@ -32,12 +32,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, TranslateMessage, EVENT_SYSTEM_FOREGROUND,
-    GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST, IDC_ARROW, MSG, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST, IDC_ARROW, MSG,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WINEVENT_OUTOFCONTEXT, WM_DESTROY,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 /// Type alias for DWM thumbnail handles. windows-rs 0.59 doesn't expose a
@@ -188,6 +188,10 @@ struct OwnedPreview {
     /// can detect changes without dereferencing the GWLP_USERDATA pointer
     /// on every tick.
     is_active: bool,
+    /// True while this preview is hidden via ShowWindow(SW_HIDE) because
+    /// the "hide active client's preview" setting is on and this is the
+    /// foreground client. Tracked so we only call ShowWindow on a flip.
+    hidden: bool,
 }
 
 impl Drop for OwnedPreview {
@@ -314,6 +318,11 @@ impl PreviewManager {
         // user drag the size sliders in the config panel and see preview
         // windows resize in real time.
         self.apply_live_size();
+        self.apply_live_opacity();
+        // Catches the setting being toggled and previews created since the
+        // last tick; the instant per-cycle response comes from the same
+        // call at the end of update_active.
+        self.apply_active_visibility();
 
         let windows = {
             let s = self.state.lock().unwrap();
@@ -496,6 +505,7 @@ impl PreviewManager {
         self.config.preview_height = want_h;
         let w = want_w as i32;
         let h = want_h as i32;
+        let opacity = opacity_to_byte(self.config.preview_opacity);
         for preview in self.previews.values() {
             unsafe {
                 // Resize the window without touching its position or z-order.
@@ -513,10 +523,62 @@ impl PreviewManager {
                 let ptr =
                     GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
                 if !ptr.is_null() {
-                    update_thumbnail_rect((*ptr).thumbnail, w, h);
+                    update_thumbnail_rect((*ptr).thumbnail, w, h, opacity);
                 }
                 // Repaint title strip + border at the new dimensions.
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
+            }
+        }
+    }
+
+    /// Read the shared LiveSettings and, if the user has adjusted the
+    /// opacity slider, re-push the DWM thumbnail opacity for every preview.
+    /// No-op when nothing changed. The destination rect is recomputed from
+    /// the current size, which is fine — it's the same value apply_live_size
+    /// would set.
+    fn apply_live_opacity(&mut self) {
+        let want = self.live.lock().unwrap().preview_opacity;
+        if want == self.config.preview_opacity {
+            return;
+        }
+        self.config.preview_opacity = want;
+        let w = self.config.preview_width as i32;
+        let h = self.config.preview_height as i32;
+        let opacity = opacity_to_byte(want);
+        for preview in self.previews.values() {
+            unsafe {
+                let ptr =
+                    GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
+                if !ptr.is_null() {
+                    update_thumbnail_rect((*ptr).thumbnail, w, h, opacity);
+                }
+            }
+        }
+    }
+
+    /// Hide the active client's preview (and reveal everything else) when
+    /// the "hide active client's preview" setting is on. Calls ShowWindow
+    /// only on a state flip, so it's cheap to run every tick and on every
+    /// focus change. On a cycle, update_active flips `is_active` first, so
+    /// re-running this hides the newly-active preview and reshows the one
+    /// cycled away from.
+    fn apply_active_visibility(&mut self) {
+        let hide_active = self.live.lock().unwrap().hide_active_preview;
+        for preview in self.previews.values_mut() {
+            let want_hidden = preview_should_hide(hide_active, preview.is_active);
+            if want_hidden == preview.hidden {
+                continue;
+            }
+            preview.hidden = want_hidden;
+            // SW_SHOWNOACTIVATE re-shows without stealing focus from the
+            // EVE client the user is playing.
+            let cmd = if want_hidden {
+                SW_HIDE
+            } else {
+                SW_SHOWNOACTIVATE
+            };
+            unsafe {
+                let _ = ShowWindow(preview.hwnd, cmd);
             }
         }
     }
@@ -571,6 +633,10 @@ impl PreviewManager {
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
             }
         }
+
+        // Hide the now-active preview / reveal the one cycled away from to
+        // match the focus change we just processed.
+        self.apply_active_visibility();
 
         // Repaint the list window whenever the active client changes so
         // the red + cigarette row follows the real foreground window.
@@ -635,7 +701,12 @@ impl PreviewManager {
             DwmRegisterThumbnail(hwnd, id_to_hwnd(window.id))
                 .context("DwmRegisterThumbnail failed")?
         };
-        update_thumbnail_rect(thumbnail, width, height);
+        update_thumbnail_rect(
+            thumbnail,
+            width,
+            height,
+            opacity_to_byte(self.config.preview_opacity),
+        );
 
         let per_window = Box::new(PreviewWindowState {
             source_id: window.id,
@@ -670,6 +741,9 @@ impl PreviewManager {
                 hwnd,
                 source_id: window.id,
                 is_active: false,
+                // Created visible (WS_VISIBLE); the reconcile pass right
+                // after this hides it if it's the active client.
+                hidden: false,
             },
         );
         Ok(())
@@ -689,7 +763,7 @@ impl PreviewManager {
 /// mirror the whole source window (including any title bar/border) — EVE's
 /// client area definition reportedly hides the actual game render surface,
 /// so SOURCECLIENTAREAONLY gives a blank preview.
-fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
+fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32, opacity: u8) {
     let border = px(BORDER_WIDTH);
     let title = px(TITLE_HEIGHT);
     let props = DWM_THUMBNAIL_PROPERTIES {
@@ -701,13 +775,19 @@ fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
             bottom: height - border,
         },
         rcSource: RECT::default(),
-        opacity: 255,
+        opacity,
         fVisible: true.into(),
         fSourceClientAreaOnly: false.into(),
     };
     unsafe {
         let _ = DwmUpdateThumbnailProperties(thumbnail, &props);
     }
+}
+
+/// Map an opacity percent (slider range 10..=100) to the 0..=255 byte the
+/// DWM thumbnail `opacity` field expects. 100% maps to fully opaque (255).
+fn opacity_to_byte(percent: u32) -> u8 {
+    (percent.min(100) * 255 / 100) as u8
 }
 
 /// Window procedure for preview windows. Pulls per-window state from
