@@ -19,6 +19,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # rodio/cpal link ALSA on Linux; alsa-sys needs alsa.pc at build time.
+      - name: Install ALSA dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
       - name: Run tests
         run: cargo test --verbose
 
@@ -80,11 +84,12 @@ jobs:
       # wmctrl is a runtime dep of nicotine's KWinManager (called
       # via shell), and the GL stack (libgl) is needed because
       # eframe links against it even for headless test builds.
-      - name: Install X11 + WM + GL deps
+      - name: Install X11 + WM + GL + ALSA deps
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb openbox wmctrl \
-            libxkbcommon-x11-0 libgl1 libwayland-client0
+            libxkbcommon-x11-0 libgl1 libwayland-client0 \
+            libasound2-dev pkg-config
 
       # Phase 3 input-simulation tests create uinput virtual
       # keyboards / mice through /dev/uinput. Two pieces of access
@@ -170,10 +175,10 @@ jobs:
       # Catches the class of regression we'd hit if a
       # `wayland-client` version bump or protocol-schema change
       # broke our dispatch loop / token extraction.
-      - name: Install Sway
+      - name: Install Sway + ALSA dev
         run: |
           sudo apt-get update
-          sudo apt-get install -y sway
+          sudo apt-get install -y sway libasound2-dev pkg-config
 
       - name: Start Sway (headless) and run xdg_activation test
         run: |

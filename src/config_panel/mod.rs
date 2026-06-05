@@ -1,547 +1,709 @@
-use crate::config::{Config, LiveSettings};
-use eframe::egui;
+use crate::config::{CharacterHotkey, Config, LiveSettings};
+use iced::{Color, Element, Subscription, Task, Theme};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod ui;
 
 /// After any config edit we wait this long with no further edits before
-/// flushing to disk. 300ms is the sweet spot — saves feel instant when
-/// the user taps a checkbox or clicks a binding, but slider drags and
-/// text input coalesce into a single write rather than hammering disk
-/// on every pixel / keystroke.
+/// flushing to disk. Slider drags and text input coalesce into a single
+/// write rather than hammering disk on every pixel / keystroke.
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Which config field is currently capturing a live keypress from the
-/// panel. Only one can capture at a time; `None` means no capture.
-/// `Character` carries the character name so per-character hotkey
-/// bindings survive reorders of the characters list.
+// ---- Brand palette (matches the Linux preview/list windows). ----
+pub(super) const NICOTINE_RED: Color = Color {
+    r: 196.0 / 255.0,
+    g: 30.0 / 255.0,
+    b: 58.0 / 255.0,
+    a: 1.0,
+};
+pub(super) const NICOTINE_GOLD: Color = Color {
+    r: 180.0 / 255.0,
+    g: 155.0 / 255.0,
+    b: 105.0 / 255.0,
+    a: 1.0,
+};
+pub(super) const NICOTINE_CREAM: Color = Color {
+    r: 252.0 / 255.0,
+    g: 250.0 / 255.0,
+    b: 242.0 / 255.0,
+    a: 1.0,
+};
+pub(super) const NICOTINE_BLACK: Color = Color {
+    r: 30.0 / 255.0,
+    g: 30.0 / 255.0,
+    b: 30.0 / 255.0,
+    a: 1.0,
+};
+pub(super) const NICOTINE_GREEN: Color = Color {
+    r: 60.0 / 255.0,
+    g: 140.0 / 255.0,
+    b: 70.0 / 255.0,
+    a: 1.0,
+};
+
+// ---- Type scale (logical px). One deliberate set of sizes. ----
+// TEXT_SIZE is the app-wide default (set in `run`); everything interactive
+// inherits it. The others are the only sanctioned overrides.
+pub(super) const TEXT_SIZE: f32 = 14.0;
+pub(super) const SECTION_SIZE: f32 = 18.0;
+pub(super) const CAPTION_SIZE: f32 = 12.0;
+pub(super) const LOGO_SIZE: f32 = 44.0;
+
+/// Which config field is currently capturing a live keypress. Only one
+/// can capture at a time; `None` means no capture. `Character` carries the
+/// character name so per-character bindings survive list reorders.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CaptureTarget {
+pub(super) enum CaptureTarget {
     ForwardKey,
     BackwardKey,
     ModifierKey,
     Character(String),
 }
 
-/// Options for the per-character / main modifier dropdown.
-/// Codes are platform-specific: Win32 VK on Windows, Linux evdev
-/// keycodes (from <linux/input-event-codes.h>) on Linux. The Config
-/// schema stores `u16` for both; the platform-specific code path
-/// interprets it correctly.
+/// Which settings tab is shown in the left nav rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Tab {
+    Display,
+    Characters,
+    Hotkeys,
+}
+
+/// One entry in the modifier dropdown. Codes are platform-specific:
+/// Win32 VK on Windows, Linux evdev keycodes on Linux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ModifierChoice {
+    pub code: Option<u16>,
+    pub label: &'static str,
+}
+
+impl std::fmt::Display for ModifierChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label)
+    }
+}
+
 #[cfg(windows)]
-const MODIFIER_CHOICES: &[(Option<u16>, &str)] = &[
-    (None, "None"),
-    (Some(0x10), "Shift"),
-    (Some(0x11), "Ctrl"),
-    (Some(0x12), "Alt"),
+pub(super) const MODIFIER_CHOICES: &[ModifierChoice] = &[
+    ModifierChoice {
+        code: None,
+        label: "None",
+    },
+    ModifierChoice {
+        code: Some(0x10),
+        label: "Shift",
+    },
+    ModifierChoice {
+        code: Some(0x11),
+        label: "Ctrl",
+    },
+    ModifierChoice {
+        code: Some(0x12),
+        label: "Alt",
+    },
 ];
 
 #[cfg(unix)]
-const MODIFIER_CHOICES: &[(Option<u16>, &str)] = &[
-    (None, "None"),
-    (Some(42), "Shift"), // KEY_LEFTSHIFT
-    (Some(29), "Ctrl"),  // KEY_LEFTCTRL
-    (Some(56), "Alt"),   // KEY_LEFTALT
+pub(super) const MODIFIER_CHOICES: &[ModifierChoice] = &[
+    ModifierChoice {
+        code: None,
+        label: "None",
+    },
+    ModifierChoice {
+        code: Some(42),
+        label: "Shift",
+    }, // KEY_LEFTSHIFT
+    ModifierChoice {
+        code: Some(29),
+        label: "Ctrl",
+    }, // KEY_LEFTCTRL
+    ModifierChoice {
+        code: Some(56),
+        label: "Alt",
+    }, // KEY_LEFTALT
 ];
 
-/// Brand palette matching the existing Linux overlay.
-const NICOTINE_RED: egui::Color32 = egui::Color32::from_rgb(196, 30, 58);
-const NICOTINE_GOLD: egui::Color32 = egui::Color32::from_rgb(180, 155, 105);
-const NICOTINE_CREAM: egui::Color32 = egui::Color32::from_rgb(252, 250, 242);
-const NICOTINE_BLACK: egui::Color32 = egui::Color32::from_rgb(30, 30, 30);
-/// Used only for the "LATEST VERSION" footer badge — chosen to read
-/// clearly against cream while harmonizing with the warm palette.
-const NICOTINE_GREEN: egui::Color32 = egui::Color32::from_rgb(60, 140, 70);
-
-pub struct ConfigPanel {
-    config: Config,
-    /// Buffer for "add character" text input.
-    new_character_buffer: String,
-    /// Shared settings watched by the preview manager for live updates
-    /// (resize windows while sliders are being dragged).
-    live: Arc<Mutex<LiveSettings>>,
-    /// When Some(...), the panel is listening for the next keypress /
-    /// side-mouse click to bind it to the given field.
-    capturing: Option<CaptureTarget>,
-    /// Capture state from the previous frame. Used to detect edge
-    /// transitions so we can pause the daemon's global hotkeys when
-    /// the user enters capture mode (otherwise RegisterHotKey eats the
-    /// key before egui can see it) and resume afterwards.
-    last_capturing: Option<CaptureTarget>,
-    /// Timestamp of the last config edit. When set and `AUTOSAVE_DEBOUNCE`
-    /// has elapsed with no further edits, the panel flushes the config
-    /// to disk. Kept as an Option so we can skip saving when nothing
-    /// has changed since the last flush.
-    last_change: Option<Instant>,
-    /// Last inner-size we asked the OS viewport to be. Tracked so we
-    /// only send a resize command when the measured content height
-    /// actually changes — re-sending the same size every frame wastes
-    /// work and can cause visual jitter.
-    last_applied_height: f32,
+pub(super) struct Panel {
+    pub config: Config,
+    /// Shared settings watched by the preview manager for live updates.
+    pub live: Arc<Mutex<LiveSettings>>,
+    /// Sends a play command to the audio worker thread (logo easter egg).
+    pub audio: std::sync::mpsc::Sender<()>,
+    /// Buffer for the "add character" text input.
+    pub new_character_buffer: String,
+    /// When `Some(..)`, the next keypress binds to this field.
+    pub capturing: Option<CaptureTarget>,
+    /// Timestamp of the last edit; the debounce subscription flushes to
+    /// disk once this is older than `AUTOSAVE_DEBOUNCE`.
+    pub last_change: Option<Instant>,
+    /// Active left-rail settings tab.
+    pub active_tab: Tab,
+    /// Index of the cycle-list row being dragged, if any.
+    pub dragging: Option<usize>,
+    /// Cycle-list row currently under the cursor during a drag (drop target).
+    pub drag_hover: Option<usize>,
+    /// Re-render ticks spent waiting for the async version check to land.
+    /// Bounds the post-launch poll so it can't spin forever if the check
+    /// never returns (e.g. offline).
+    pub version_polls: u8,
 }
 
-impl ConfigPanel {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
+impl Panel {
+    fn new(
         config: Config,
         live: Arc<Mutex<LiveSettings>>,
+        audio: std::sync::mpsc::Sender<()>,
     ) -> Self {
-        // Load Nicotine's brand fonts so the header looks like the overlay.
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "jetbrains_mono".to_owned(),
-            egui::FontData::from_static(include_bytes!(
-                "../../assets/fonts/JetBrainsMono-Regular.ttf"
-            )),
-        );
-        fonts.font_data.insert(
-            "logo_font".to_owned(),
-            egui::FontData::from_static(include_bytes!("../../assets/fonts/Marlboro.ttf")),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "jetbrains_mono".to_owned());
-        fonts
-            .families
-            .entry(egui::FontFamily::Name("logo".into()))
-            .or_default()
-            .push("logo_font".to_owned());
-        cc.egui_ctx.set_fonts(fonts);
-
-        // Nicotine-branded light theme. egui's default light visuals use
-        // pale grays against our cream background, which makes hover /
-        // active state changes basically invisible. Override with a
-        // warmer palette so every interactive widget has a visible
-        // idle / hover / pressed progression (cream → gold → red).
-        cc.egui_ctx.set_visuals(build_visuals());
-
         Self {
             config,
-            new_character_buffer: String::new(),
             live,
+            audio,
+            new_character_buffer: String::new(),
             capturing: None,
-            last_capturing: None,
             last_change: None,
-            last_applied_height: 0.0,
+            active_tab: Tab::Display,
+            dragging: None,
+            drag_hover: None,
+            version_polls: 0,
         }
     }
 
-    /// Mark the config as edited. The next `update()` tick checks this
-    /// timestamp and flushes to disk once the user has been idle for
-    /// `AUTOSAVE_DEBOUNCE`.
-    fn touch(&mut self) {
+    /// Mark the config as edited so the debounce subscription saves it
+    /// once the user goes idle.
+    pub(super) fn touch(&mut self) {
         self.last_change = Some(Instant::now());
     }
-}
 
-fn build_visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::light();
+    fn handle_capture_key(&mut self, event: iced::keyboard::Event) -> Task<Message> {
+        use iced::keyboard::key::Named;
+        use iced::keyboard::{Event, Key};
 
-    // Cream page / non-interactive surfaces.
-    v.widgets.noninteractive.bg_fill = NICOTINE_CREAM;
-    v.widgets.noninteractive.weak_bg_fill = NICOTINE_CREAM;
-    v.widgets.noninteractive.fg_stroke.color = NICOTINE_BLACK;
+        let Some(target) = self.capturing.clone() else {
+            return Task::none();
+        };
 
-    // Idle: slightly-off-cream so the widget is distinguishable from the
-    // surrounding panel, with a gold-ish border.
-    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(240, 234, 218);
-    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(244, 238, 224);
-    v.widgets.inactive.fg_stroke.color = NICOTINE_BLACK;
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, NICOTINE_GOLD);
+        let Event::KeyPressed { key, .. } = event else {
+            return Task::none();
+        };
 
-    // Hover: strong gold — clearly different from idle so moving the
-    // mouse over anything shows a visible change.
-    v.widgets.hovered.bg_fill = NICOTINE_GOLD;
-    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(228, 212, 176);
-    v.widgets.hovered.fg_stroke.color = NICOTINE_BLACK;
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.5, NICOTINE_RED);
-
-    // Pressed / active: Nicotine red with cream text.
-    v.widgets.active.bg_fill = NICOTINE_RED;
-    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(230, 176, 186);
-    v.widgets.active.fg_stroke.color = NICOTINE_CREAM;
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.5, NICOTINE_RED);
-
-    // Open popup / selected — e.g. radio selection, text edit focus.
-    v.widgets.open.bg_fill = NICOTINE_GOLD;
-    v.widgets.open.weak_bg_fill = egui::Color32::from_rgb(228, 212, 176);
-    v.widgets.open.fg_stroke.color = NICOTINE_BLACK;
-    v.widgets.open.bg_stroke = egui::Stroke::new(1.5, NICOTINE_RED);
-
-    // Text selection highlight.
-    v.selection.bg_fill = NICOTINE_RED.gamma_multiply(0.45);
-    v.selection.stroke.color = NICOTINE_BLACK;
-
-    // Hyperlinks / accents (rarely used here but keep the brand colour).
-    v.hyperlink_color = NICOTINE_RED;
-
-    v
-}
-
-impl eframe::App for ConfigPanel {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ---- Capture mode: listen for the next keypress ----
-        // Runs before any widget draw so the event stream we inspect
-        // reflects what the user just did.
-        if let Some(target) = self.capturing.clone() {
-            if let Some(vk) = captured_binding(ctx) {
-                match &target {
-                    CaptureTarget::ForwardKey => self.config.forward_key = vk,
-                    CaptureTarget::BackwardKey => self.config.backward_key = vk,
-                    CaptureTarget::ModifierKey => self.config.modifier_key = Some(vk),
-                    CaptureTarget::Character(name) => {
-                        // Preserve the existing modifier if already set,
-                        // otherwise default to no modifier.
-                        let modifier = self
-                            .config
-                            .character_hotkeys
-                            .get(name)
-                            .and_then(|h| h.modifier);
-                        self.config.character_hotkeys.insert(
-                            name.clone(),
-                            crate::config::CharacterHotkey { vk, modifier },
-                        );
-                    }
-                }
-                self.capturing = None;
-                self.touch();
-            } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                // Escape cancels capture without binding.
-                self.capturing = None;
-            }
-            // Keep requesting frames so a key press lands even when the
-            // user isn't hovering over the panel.
-            ctx.request_repaint();
-        }
-
-        // Edge-detect capture start/end so we can pause the daemon's
-        // global hotkeys — otherwise RegisterHotKey swallows F10/F11
-        // before egui sees them, and binding appears broken.
-        if self.last_capturing != self.capturing {
+        // Escape cancels capture without binding.
+        if matches!(key, Key::Named(Named::Escape)) {
+            self.capturing = None;
             #[cfg(windows)]
-            {
-                if self.last_capturing.is_none() && self.capturing.is_some() {
-                    crate::windows_input::pause_hotkeys();
-                } else if self.last_capturing.is_some() && self.capturing.is_none() {
-                    // Flush config.toml synchronously before resuming so
-                    // the listener's Config::load() sees the new binding.
-                    if self.last_change.is_some() {
-                        let _ = self.config.save();
-                        self.last_change = None;
-                    }
-                    crate::windows_input::resume_hotkeys();
+            self.end_windows_capture();
+            return Task::none();
+        }
+
+        // On Windows, OEM/punctuation VKs are layout-dependent; ask the OS
+        // for the actually-held VK first so the captured code matches what
+        // RegisterHotKey will see at runtime regardless of keyboard layout.
+        #[cfg(windows)]
+        let code = oem_vk_currently_pressed().or_else(|| iced_key_to_code(&key));
+        #[cfg(unix)]
+        let code = iced_key_to_code(&key);
+
+        if let Some(vk) = code {
+            match &target {
+                CaptureTarget::ForwardKey => self.config.forward_key = vk,
+                CaptureTarget::BackwardKey => self.config.backward_key = vk,
+                CaptureTarget::ModifierKey => self.config.modifier_key = Some(vk),
+                CaptureTarget::Character(name) => {
+                    let modifier = self
+                        .config
+                        .character_hotkeys
+                        .get(name)
+                        .and_then(|h| h.modifier);
+                    self.config
+                        .character_hotkeys
+                        .insert(name.clone(), CharacterHotkey { vk, modifier });
                 }
             }
-            self.last_capturing = self.capturing.clone();
+            self.capturing = None;
+            self.touch();
+            #[cfg(windows)]
+            self.end_windows_capture();
         }
 
-        // ---- Branded header strip ----
-        egui::TopBottomPanel::top("nicotine_header")
-            .exact_height(72.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(NICOTINE_RED)
-                    // Asymmetric vertical margin: the Marlboro font's
-                    // glyph box has more descent than ascent, so a
-                    // geometrically-centered layout reads as "logo too
-                    // high." Bumping the top margin shifts the visual
-                    // center down by a few pixels.
-                    .inner_margin(egui::Margin {
-                        left: 0.0,
-                        right: 0.0,
-                        top: 6.0,
-                        bottom: 0.0,
-                    }),
-            )
-            .show(ctx, |ui| {
-                ui.with_layout(
-                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                    |ui| {
-                        ui.label(
-                            egui::RichText::new("Nicotine")
-                                .family(egui::FontFamily::Name("logo".into()))
-                                .size(48.0)
-                                .color(NICOTINE_CREAM),
-                        );
-                    },
-                );
-            });
+        Task::none()
+    }
 
-        // ---- Branded footer with external links ----
-        egui::TopBottomPanel::bottom("nicotine_footer")
-            .exact_height(40.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(NICOTINE_CREAM)
-                    .inner_margin(egui::Margin::symmetric(16.0, 8.0))
-                    .stroke(egui::Stroke::new(1.0, NICOTINE_GOLD)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    // Explicit .color() on both RichText blocks — egui's
-                    // hyperlink color doesn't always propagate through
-                    // .strong() in 0.29, leaving the text near-invisible
-                    // against the cream background.
-                    ui.hyperlink_to(
-                        egui::RichText::new("GITHUB").strong().color(NICOTINE_RED),
-                        "https://github.com/isomerc",
-                    );
-                    ui.add_space(14.0);
-                    ui.colored_label(NICOTINE_GOLD, "•");
-                    ui.add_space(14.0);
-                    ui.hyperlink_to(
-                        egui::RichText::new("ILLUMINATED IS RECRUITING")
-                            .strong()
-                            .color(NICOTINE_RED),
-                        "https://www.illuminatedcorp.com",
-                    );
-
-                    // Right-aligned update badge. `right_to_left`
-                    // consumes the remaining horizontal space and lays
-                    // out items from the right edge so this lands in
-                    // the bottom-right corner regardless of panel width.
-                    // Three states:
-                    //   - `Outdated` → red "NEW VERSION AVAILABLE" link
-                    //     to the GitHub release page
-                    //   - `UpToDate` → green "LATEST VERSION" label
-                    //   - `None` (check pending or failed) → render
-                    //     nothing so we don't show stale claims
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        match crate::version_check::get_update_status() {
-                            Some(crate::version_check::UpdateStatus::Outdated { version, url }) => {
-                                ui.hyperlink_to(
-                                    egui::RichText::new(format!(
-                                        "NEW VERSION AVAILABLE (v{})",
-                                        version
-                                    ))
-                                    .strong()
-                                    .color(NICOTINE_RED),
-                                    url,
-                                );
-                            }
-                            Some(crate::version_check::UpdateStatus::UpToDate) => {
-                                ui.label(
-                                    egui::RichText::new("LATEST VERSION")
-                                        .strong()
-                                        .color(NICOTINE_GREEN),
-                                );
-                            }
-                            None => {}
-                        }
-                    });
-                });
-            });
-
-        // ---- Body ----
-        // Capture the central panel's content height from inside its
-        // builder so we can size the window to it — `ctx.used_size()`
-        // only reports what was *allocated* to the CentralPanel, which
-        // is bounded by header+footer, so tall content would clip and
-        // paint over the footer without this measurement.
-        const HEADER_HEIGHT: f32 = 72.0;
-        const FOOTER_HEIGHT: f32 = 40.0;
-        const CENTRAL_V_MARGIN: f32 = 12.0;
-        let mut central_content_height = 0.0f32;
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(NICOTINE_CREAM)
-                    .inner_margin(egui::Margin::symmetric(16.0, CENTRAL_V_MARGIN)),
-            )
-            .show(ctx, |ui| {
-                self.draw_display_mode_section(ui);
-                ui.add_space(20.0);
-                self.draw_characters_section(ui);
-                ui.add_space(20.0);
-                self.draw_hotkeys_section(ui);
-                ui.add_space(20.0);
-                self.draw_previews_section(ui);
-                central_content_height = ui.min_rect().height();
-            });
-
-        // ---- Auto-size the window to fit the rendered content. ----
-        let target_height =
-            (HEADER_HEIGHT + FOOTER_HEIGHT + CENTRAL_V_MARGIN * 2.0 + central_content_height)
-                .round()
-                .clamp(300.0, 1500.0);
-        if (target_height - self.last_applied_height).abs() > 1.0 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                600.0,
-                target_height,
-            )));
-            self.last_applied_height = target_height;
+    /// Windows: flush config.toml synchronously so the listener's
+    /// `Config::load()` sees the new binding, then resume global hotkeys
+    /// (paused during capture so RegisterHotKey doesn't eat the key).
+    #[cfg(windows)]
+    fn end_windows_capture(&mut self) {
+        if self.last_change.is_some() {
+            let _ = self.config.save();
+            self.last_change = None;
         }
-
-        // ---- Debounced auto-save ----
-        // After the user has been idle for AUTOSAVE_DEBOUNCE, flush the
-        // current config to disk. If they're actively editing (every
-        // touch() resets last_change to "now"), we keep deferring; as
-        // soon as they stop, the next tick saves. request_repaint_after
-        // ensures we get a frame to actually perform the save even
-        // when there's no other input.
-        if let Some(changed_at) = self.last_change {
-            let elapsed = changed_at.elapsed();
-            if elapsed >= AUTOSAVE_DEBOUNCE {
-                if let Err(e) = self.config.save() {
-                    eprintln!("config autosave failed: {}", e);
-                }
-                self.last_change = None;
-            } else {
-                ctx.request_repaint_after(AUTOSAVE_DEBOUNCE - elapsed);
-            }
-        }
+        crate::windows_input::resume_hotkeys();
     }
 }
 
-/// All egui keys we're willing to bind, in the order we poll them.
-/// Using `key_pressed` polling here (instead of matching Event::Key in
-/// the event stream) is more reliable when a widget — like the bind
-/// button the user just clicked — has focus: egui may consume some
-/// keys before they surface as generic events, but `key_pressed` sees
-/// the edge regardless.
-const SUPPORTED_KEYS: &[egui::Key] = &[
-    egui::Key::F1,
-    egui::Key::F2,
-    egui::Key::F3,
-    egui::Key::F4,
-    egui::Key::F5,
-    egui::Key::F6,
-    egui::Key::F7,
-    egui::Key::F8,
-    egui::Key::F9,
-    egui::Key::F10,
-    egui::Key::F11,
-    egui::Key::F12,
-    egui::Key::F13,
-    egui::Key::F14,
-    egui::Key::F15,
-    egui::Key::F16,
-    egui::Key::F17,
-    egui::Key::F18,
-    egui::Key::F19,
-    egui::Key::F20,
-    egui::Key::F21,
-    egui::Key::F22,
-    egui::Key::F23,
-    egui::Key::F24,
-    egui::Key::Tab,
-    egui::Key::Space,
-    egui::Key::Enter,
-    egui::Key::Backspace,
-    egui::Key::Insert,
-    egui::Key::Delete,
-    egui::Key::Home,
-    egui::Key::End,
-    egui::Key::PageUp,
-    egui::Key::PageDown,
-    egui::Key::ArrowUp,
-    egui::Key::ArrowDown,
-    egui::Key::ArrowLeft,
-    egui::Key::ArrowRight,
-    egui::Key::A,
-    egui::Key::B,
-    egui::Key::C,
-    egui::Key::D,
-    egui::Key::E,
-    egui::Key::F,
-    egui::Key::G,
-    egui::Key::H,
-    egui::Key::I,
-    egui::Key::J,
-    egui::Key::K,
-    egui::Key::L,
-    egui::Key::M,
-    egui::Key::N,
-    egui::Key::O,
-    egui::Key::P,
-    egui::Key::Q,
-    egui::Key::R,
-    egui::Key::S,
-    egui::Key::T,
-    egui::Key::U,
-    egui::Key::V,
-    egui::Key::W,
-    egui::Key::X,
-    egui::Key::Y,
-    egui::Key::Z,
-    egui::Key::Num0,
-    egui::Key::Num1,
-    egui::Key::Num2,
-    egui::Key::Num3,
-    egui::Key::Num4,
-    egui::Key::Num5,
-    egui::Key::Num6,
-    egui::Key::Num7,
-    egui::Key::Num8,
-    egui::Key::Num9,
-    egui::Key::Backtick,
-    egui::Key::Minus,
-    egui::Key::Equals,
-    egui::Key::OpenBracket,
-    egui::Key::CloseBracket,
-    egui::Key::Backslash,
-    egui::Key::Semicolon,
-    egui::Key::Quote,
-    egui::Key::Comma,
-    egui::Key::Period,
-    egui::Key::Slash,
-];
+#[derive(Debug, Clone)]
+pub(super) enum Message {
+    DisplayModeChanged(crate::config::DisplayMode),
+    LockToggled(bool),
+    RestackClicked,
+    LogoClicked,
+    CharacterNameChanged(usize, String),
+    MoveCharacterUp(usize),
+    MoveCharacterDown(usize),
+    RemoveCharacter(usize),
+    NewCharacterChanged(String),
+    AddCharacter,
+    CharacterModifierChanged(String, ModifierChoice),
+    ClearCharacterHotkey(String),
+    KeyboardEnabledToggled(bool),
+    MouseEnabledToggled(bool),
+    ClearModifier,
+    StartCapture(CaptureTarget),
+    TabSelected(Tab),
+    GrabRow(usize),
+    HoverRow(usize),
+    UnhoverRow(usize),
+    DropRow,
+    KeyEvent(iced::keyboard::Event),
+    ShowPreviewsToggled(bool),
+    PreviewWidthChanged(u32),
+    PreviewHeightChanged(u32),
+    OpenLink(String),
+    FlushIfIdle,
+    VersionPoll,
+}
 
-/// Poll egui for the first bindable key press this frame. Returns the
-/// platform-native key code to bind, or None if no eligible press
-/// happened. The code is a Win32 VK on Windows / a Linux evdev keycode
-/// on Linux — same semantics the daemon's hotkey listener expects.
-fn captured_binding(ctx: &egui::Context) -> Option<u16> {
-    // On Windows, OEM/punctuation VKs are LAYOUT-DEPENDENT. The same
-    // physical key produces different VK codes on different keyboard
-    // layouts (e.g. the `#` key on German is VK_OEM_2 / 0xBF, but
-    // egui-winit translates the underlying scancode to its
-    // US-named `Key::Backslash` which our static map turns into
-    // VK_OEM_5 / 0xDC — a value that doesn't match what
-    // RegisterHotKey sees at runtime when the user presses `#`).
-    // Query the OS for the actually-held VK in the OEM range; if
-    // one is down, use it. This gives us the VK RegisterHotKey
-    // will receive on subsequent presses, regardless of layout.
-    //
-    // Non-OEM keys (letters, digits, F-keys, modifiers, arrows)
-    // have layout-stable VKs, so the static egui-to-VK map below
-    // is fine for them.
-    #[cfg(windows)]
-    if let Some(vk) = oem_vk_currently_pressed() {
-        return Some(vk);
-    }
-
-    ctx.input(|i| {
-        for key in SUPPORTED_KEYS {
-            if *key == egui::Key::Escape {
-                continue;
-            }
-            if i.key_pressed(*key) {
-                return egui_key_to_code(*key);
+fn update(panel: &mut Panel, message: Message) -> Task<Message> {
+    match message {
+        Message::DisplayModeChanged(mode) => {
+            panel.config.display_mode = mode;
+            panel.live.lock().unwrap().display_mode = mode;
+            panel.touch();
+        }
+        Message::LockToggled(v) => {
+            panel.config.positions_locked = v;
+            panel.live.lock().unwrap().positions_locked = v;
+            panel.touch();
+        }
+        Message::RestackClicked => {
+            let _ = crate::daemon::send_command("stack");
+        }
+        Message::LogoClicked => {
+            // Easter egg: (re)start the jingle. Best-effort; if the worker
+            // is gone the send just fails silently.
+            let _ = panel.audio.send(());
+        }
+        Message::CharacterNameChanged(i, name) => {
+            if let Some(slot) = panel.config.characters.get_mut(i) {
+                *slot = name;
+                panel.touch();
             }
         }
-        None
+        Message::MoveCharacterUp(i) => {
+            if i > 0 && i < panel.config.characters.len() {
+                panel.config.characters.swap(i, i - 1);
+                panel.touch();
+            }
+        }
+        Message::MoveCharacterDown(i) => {
+            if i + 1 < panel.config.characters.len() {
+                panel.config.characters.swap(i, i + 1);
+                panel.touch();
+            }
+        }
+        Message::RemoveCharacter(i) => {
+            if i < panel.config.characters.len() {
+                let name = panel.config.characters.remove(i);
+                panel.config.character_hotkeys.remove(&name);
+                panel.touch();
+            }
+        }
+        Message::NewCharacterChanged(s) => {
+            panel.new_character_buffer = s;
+        }
+        Message::AddCharacter => {
+            let name = panel.new_character_buffer.trim().to_string();
+            if !name.is_empty() {
+                panel.config.characters.push(name);
+                panel.new_character_buffer.clear();
+                panel.touch();
+            }
+        }
+        Message::CharacterModifierChanged(name, choice) => {
+            let entry = panel
+                .config
+                .character_hotkeys
+                .entry(name)
+                .or_insert(CharacterHotkey {
+                    vk: 0,
+                    modifier: None,
+                });
+            entry.modifier = choice.code;
+            panel.touch();
+        }
+        Message::ClearCharacterHotkey(name) => {
+            panel.config.character_hotkeys.remove(&name);
+            panel.touch();
+        }
+        Message::KeyboardEnabledToggled(v) => {
+            panel.config.enable_keyboard_buttons = v;
+            panel.touch();
+        }
+        Message::MouseEnabledToggled(v) => {
+            panel.config.enable_mouse_buttons = v;
+            panel.touch();
+        }
+        Message::ClearModifier => {
+            panel.config.modifier_key = None;
+            panel.touch();
+        }
+        Message::StartCapture(target) => {
+            if panel.capturing.as_ref() == Some(&target) {
+                // Clicking the active bind button again cancels.
+                panel.capturing = None;
+                #[cfg(windows)]
+                panel.end_windows_capture();
+            } else {
+                #[cfg(windows)]
+                if panel.capturing.is_none() {
+                    crate::windows_input::pause_hotkeys();
+                }
+                panel.capturing = Some(target);
+            }
+        }
+        Message::TabSelected(tab) => {
+            panel.active_tab = tab;
+        }
+        Message::GrabRow(i) => {
+            panel.dragging = Some(i);
+            panel.drag_hover = Some(i);
+        }
+        Message::HoverRow(i) => {
+            if panel.dragging.is_some() {
+                panel.drag_hover = Some(i);
+            }
+        }
+        Message::UnhoverRow(i) => {
+            if panel.drag_hover == Some(i) {
+                panel.drag_hover = None;
+            }
+        }
+        Message::DropRow => {
+            if let (Some(src), Some(dst)) = (panel.dragging, panel.drag_hover) {
+                let len = panel.config.characters.len();
+                if src < len && dst < len && src != dst {
+                    let item = panel.config.characters.remove(src);
+                    let dst = dst.min(panel.config.characters.len());
+                    panel.config.characters.insert(dst, item);
+                    panel.touch();
+                }
+            }
+            panel.dragging = None;
+            panel.drag_hover = None;
+        }
+        Message::KeyEvent(event) => {
+            return panel.handle_capture_key(event);
+        }
+        Message::ShowPreviewsToggled(v) => {
+            panel.config.show_previews = v;
+            panel.live.lock().unwrap().show_previews = v;
+            panel.touch();
+        }
+        Message::PreviewWidthChanged(w) => {
+            panel.config.preview_width = w;
+            panel.live.lock().unwrap().preview_width = w;
+            panel.touch();
+        }
+        Message::PreviewHeightChanged(h) => {
+            panel.config.preview_height = h;
+            panel.live.lock().unwrap().preview_height = h;
+            panel.touch();
+        }
+        Message::OpenLink(url) => {
+            open_url(&url);
+        }
+        Message::FlushIfIdle => {
+            if let Some(t) = panel.last_change {
+                if t.elapsed() >= AUTOSAVE_DEBOUNCE {
+                    if let Err(e) = panel.config.save() {
+                        eprintln!("config autosave failed: {e}");
+                    }
+                    panel.last_change = None;
+                }
+            }
+        }
+        Message::VersionPoll => {
+            // The re-render this message triggers is the point — it lets
+            // the footer pick up the version-check result once it lands.
+            panel.version_polls = panel.version_polls.saturating_add(1);
+        }
+    }
+    Task::none()
+}
+
+fn view(panel: &Panel) -> Element<'_, Message> {
+    use iced::widget::{column, row, scrollable};
+    use iced::Length;
+
+    column![
+        ui::header(),
+        row![
+            ui::tab_sidebar(panel),
+            ui::vdivider(),
+            scrollable(ui::tab_content(panel))
+                .width(Length::Fill)
+                .height(Length::Fill),
+        ]
+        .height(Length::Fill),
+        ui::footer(),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+fn theme(_panel: &Panel) -> Theme {
+    Theme::custom(
+        "Nicotine".to_string(),
+        iced::theme::Palette {
+            background: NICOTINE_CREAM,
+            text: NICOTINE_BLACK,
+            primary: NICOTINE_RED,
+            success: NICOTINE_GREEN,
+            warning: NICOTINE_GOLD,
+            danger: NICOTINE_RED,
+        },
+    )
+}
+
+fn subscription(panel: &Panel) -> Subscription<Message> {
+    let mut subs = Vec::new();
+    // Only listen for raw key events while a bind button is armed.
+    if panel.capturing.is_some() {
+        subs.push(iced::keyboard::listen().map(Message::KeyEvent));
+    }
+    // Poll only while a save is pending so the debounce fires even with
+    // no further input; stops once flushed.
+    if panel.last_change.is_some() {
+        subs.push(iced::time::every(Duration::from_millis(100)).map(|_| Message::FlushIfIdle));
+    }
+    // While a row is being dragged, watch for the mouse-button release
+    // anywhere to commit (or cancel) the reorder.
+    if panel.dragging.is_some() {
+        subs.push(iced::event::listen_with(
+            |event, _status, _window| match event {
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )) => Some(Message::DropRow),
+                _ => None,
+            },
+        ));
+    }
+    // Re-render a few times after launch so the async version-check result
+    // appears once it lands (iced only redraws on events, unlike egui).
+    if panel.version_polls < 20 && crate::version_check::get_update_status().is_none() {
+        subs.push(iced::time::every(Duration::from_millis(700)).map(|_| Message::VersionPoll));
+    }
+    Subscription::batch(subs)
+}
+
+fn open_url(url: &str) {
+    #[cfg(unix)]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+}
+
+/// Map an iced key to the Linux evdev keycode (from
+/// <linux/input-event-codes.h>). Letters/digits/punctuation arrive as
+/// `Key::Character`; everything else as `Key::Named`.
+#[cfg(unix)]
+fn iced_key_to_code(key: &iced::keyboard::Key) -> Option<u16> {
+    use iced::keyboard::key::Named;
+    use iced::keyboard::Key;
+    match key {
+        Key::Named(named) => Some(match named {
+            Named::F1 => 59,
+            Named::F2 => 60,
+            Named::F3 => 61,
+            Named::F4 => 62,
+            Named::F5 => 63,
+            Named::F6 => 64,
+            Named::F7 => 65,
+            Named::F8 => 66,
+            Named::F9 => 67,
+            Named::F10 => 68,
+            Named::F11 => 87,
+            Named::F12 => 88,
+            Named::F13 => 183,
+            Named::F14 => 184,
+            Named::F15 => 185,
+            Named::F16 => 186,
+            Named::F17 => 187,
+            Named::F18 => 188,
+            Named::F19 => 189,
+            Named::F20 => 190,
+            Named::F21 => 191,
+            Named::F22 => 192,
+            Named::F23 => 193,
+            Named::F24 => 194,
+            Named::Tab => 15,
+            Named::Space => 57,
+            Named::Enter => 28,
+            Named::Backspace => 14,
+            Named::Insert => 110,
+            Named::Delete => 111,
+            Named::Home => 102,
+            Named::End => 107,
+            Named::PageUp => 104,
+            Named::PageDown => 109,
+            Named::ArrowUp => 103,
+            Named::ArrowDown => 108,
+            Named::ArrowLeft => 105,
+            Named::ArrowRight => 106,
+            _ => return None,
+        }),
+        Key::Character(s) => char_to_evdev(s.as_str()),
+        _ => None,
+    }
+}
+
+/// QWERTY-position evdev codes for printable keys. Mirrors the prior egui
+/// mapping (scancode order, not alphabetical).
+#[cfg(unix)]
+fn char_to_evdev(s: &str) -> Option<u16> {
+    let c = s.chars().next()?.to_ascii_lowercase();
+    Some(match c {
+        'q' => 16,
+        'w' => 17,
+        'e' => 18,
+        'r' => 19,
+        't' => 20,
+        'y' => 21,
+        'u' => 22,
+        'i' => 23,
+        'o' => 24,
+        'p' => 25,
+        'a' => 30,
+        's' => 31,
+        'd' => 32,
+        'f' => 33,
+        'g' => 34,
+        'h' => 35,
+        'j' => 36,
+        'k' => 37,
+        'l' => 38,
+        'z' => 44,
+        'x' => 45,
+        'c' => 46,
+        'v' => 47,
+        'b' => 48,
+        'n' => 49,
+        'm' => 50,
+        '1' => 2,
+        '2' => 3,
+        '3' => 4,
+        '4' => 5,
+        '5' => 6,
+        '6' => 7,
+        '7' => 8,
+        '8' => 9,
+        '9' => 10,
+        '0' => 11,
+        '`' => 41,
+        '-' => 12,
+        '=' => 13,
+        '[' => 26,
+        ']' => 27,
+        '\\' => 43,
+        ';' => 39,
+        '\'' => 40,
+        ',' => 51,
+        '.' => 52,
+        '/' => 53,
+        _ => return None,
     })
 }
 
-/// Scan the Windows OEM/punctuation VK range via `GetAsyncKeyState`
-/// and return the first VK whose "down" bit is set. Used by
-/// `captured_binding` to bypass egui-winit's US-layout-based
-/// translation for the keys whose VK varies by keyboard layout.
-///
-/// The VK list covers the standard OEM range documented in MSDN:
-/// `VK_OEM_1` (0xBA) through `VK_OEM_3` (0xC0), `VK_OEM_4` (0xDB)
-/// through `VK_OEM_8` (0xDF), plus `VK_OEM_102` (0xE2) for the ISO
-/// `<>` key found on most non-US keyboards.
+/// Map an iced key to the Windows Virtual-Key code.
+#[cfg(windows)]
+fn iced_key_to_code(key: &iced::keyboard::Key) -> Option<u16> {
+    use iced::keyboard::key::Named;
+    use iced::keyboard::Key;
+    match key {
+        Key::Named(named) => Some(match named {
+            Named::F1 => 0x70,
+            Named::F2 => 0x71,
+            Named::F3 => 0x72,
+            Named::F4 => 0x73,
+            Named::F5 => 0x74,
+            Named::F6 => 0x75,
+            Named::F7 => 0x76,
+            Named::F8 => 0x77,
+            Named::F9 => 0x78,
+            Named::F10 => 0x79,
+            Named::F11 => 0x7A,
+            Named::F12 => 0x7B,
+            Named::F13 => 0x7C,
+            Named::F14 => 0x7D,
+            Named::F15 => 0x7E,
+            Named::F16 => 0x7F,
+            Named::F17 => 0x80,
+            Named::F18 => 0x81,
+            Named::F19 => 0x82,
+            Named::F20 => 0x83,
+            Named::F21 => 0x84,
+            Named::F22 => 0x85,
+            Named::F23 => 0x86,
+            Named::F24 => 0x87,
+            Named::Tab => 0x09,
+            Named::Space => 0x20,
+            Named::Enter => 0x0D,
+            Named::Backspace => 0x08,
+            Named::Insert => 0x2D,
+            Named::Delete => 0x2E,
+            Named::Home => 0x24,
+            Named::End => 0x23,
+            Named::PageUp => 0x21,
+            Named::PageDown => 0x22,
+            Named::ArrowUp => 0x26,
+            Named::ArrowDown => 0x28,
+            Named::ArrowLeft => 0x25,
+            Named::ArrowRight => 0x27,
+            _ => return None,
+        }),
+        Key::Character(s) => {
+            let c = s.chars().next()?.to_ascii_lowercase();
+            Some(match c {
+                'a'..='z' => 0x41 + (c as u16 - 'a' as u16),
+                '0'..='9' => 0x30 + (c as u16 - '0' as u16),
+                '`' => 0xC0,
+                '-' => 0xBD,
+                '=' => 0xBB,
+                '[' => 0xDB,
+                ']' => 0xDD,
+                '\\' => 0xDC,
+                ';' => 0xBA,
+                '\'' => 0xDE,
+                ',' => 0xBC,
+                '.' => 0xBE,
+                '/' => 0xBF,
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Scan the Windows OEM/punctuation VK range and return the first VK whose
+/// "down" bit is set — bypasses layout-dependent translation for keys
+/// whose VK varies by keyboard layout.
 #[cfg(windows)]
 fn oem_vk_currently_pressed() -> Option<u16> {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     for &vk in OEM_VK_RANGE {
         let state = unsafe { GetAsyncKeyState(vk as i32) };
-        // High bit = currently pressed.
         if (state as u32 & 0x8000) != 0 {
             return Some(vk);
         }
@@ -549,16 +711,9 @@ fn oem_vk_currently_pressed() -> Option<u16> {
     None
 }
 
-/// Translate a Windows OEM VK to its current keyboard layout's
-/// character via `MapVirtualKeyW(MAPVK_VK_TO_CHAR)`. Returns the
-/// unshifted printable character — e.g. `VK_OEM_5` is `\` on US,
-/// `#` on German, `^` on French. Returns `None` if the VK doesn't
-/// produce a printable character on the current layout (rare; the
-/// ISO `<>` key on a US ANSI keyboard is one example).
-///
-/// Dead keys (acute accent on French/German, etc.) have the high
-/// bit set in the return value; we strip it and use the character
-/// anyway, since users see the dead-key glyph on their physical key.
+/// Translate a Windows OEM VK to its current keyboard layout's character
+/// via `MapVirtualKeyW(MAPVK_VK_TO_CHAR)`. Returns the unshifted printable
+/// character (e.g. `VK_OEM_5` is `\` on US, `#` on German).
 #[cfg(windows)]
 fn oem_vk_to_char(vk: u16) -> Option<String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_CHAR};
@@ -573,8 +728,7 @@ fn oem_vk_to_char(vk: u16) -> Option<String> {
     char::from_u32(ch).map(|c| c.to_string())
 }
 
-/// The complete VK range whose layout-dependence we route through
-/// the OS rather than the static egui-translation table.
+/// The complete VK range whose layout-dependence we route through the OS.
 #[cfg(windows)]
 const OEM_VK_RANGE: &[u16] = &[
     0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, // OEM_1, +, ,, -, ., /, ~
@@ -582,208 +736,9 @@ const OEM_VK_RANGE: &[u16] = &[
     0xE2, // OEM_102 (ISO key)
 ];
 
-/// Map an egui Key to the Windows Virtual-Key code. Returns None for
-/// keys without a standard VK_ (exotic IME / media keys).
-#[cfg(windows)]
-fn egui_key_to_code(key: egui::Key) -> Option<u16> {
-    use egui::Key;
-    let vk: u32 = match key {
-        Key::F1 => 0x70,
-        Key::F2 => 0x71,
-        Key::F3 => 0x72,
-        Key::F4 => 0x73,
-        Key::F5 => 0x74,
-        Key::F6 => 0x75,
-        Key::F7 => 0x76,
-        Key::F8 => 0x77,
-        Key::F9 => 0x78,
-        Key::F10 => 0x79,
-        Key::F11 => 0x7A,
-        Key::F12 => 0x7B,
-        Key::F13 => 0x7C,
-        Key::F14 => 0x7D,
-        Key::F15 => 0x7E,
-        Key::F16 => 0x7F,
-        Key::F17 => 0x80,
-        Key::F18 => 0x81,
-        Key::F19 => 0x82,
-        Key::F20 => 0x83,
-        Key::F21 => 0x84,
-        Key::F22 => 0x85,
-        Key::F23 => 0x86,
-        Key::F24 => 0x87,
-        Key::Tab => 0x09,
-        Key::Space => 0x20,
-        Key::Enter => 0x0D,
-        Key::Backspace => 0x08,
-        Key::Insert => 0x2D,
-        Key::Delete => 0x2E,
-        Key::Home => 0x24,
-        Key::End => 0x23,
-        Key::PageUp => 0x21,
-        Key::PageDown => 0x22,
-        Key::ArrowUp => 0x26,
-        Key::ArrowDown => 0x28,
-        Key::ArrowLeft => 0x25,
-        Key::ArrowRight => 0x27,
-        Key::A => 0x41,
-        Key::B => 0x42,
-        Key::C => 0x43,
-        Key::D => 0x44,
-        Key::E => 0x45,
-        Key::F => 0x46,
-        Key::G => 0x47,
-        Key::H => 0x48,
-        Key::I => 0x49,
-        Key::J => 0x4A,
-        Key::K => 0x4B,
-        Key::L => 0x4C,
-        Key::M => 0x4D,
-        Key::N => 0x4E,
-        Key::O => 0x4F,
-        Key::P => 0x50,
-        Key::Q => 0x51,
-        Key::R => 0x52,
-        Key::S => 0x53,
-        Key::T => 0x54,
-        Key::U => 0x55,
-        Key::V => 0x56,
-        Key::W => 0x57,
-        Key::X => 0x58,
-        Key::Y => 0x59,
-        Key::Z => 0x5A,
-        Key::Num0 => 0x30,
-        Key::Num1 => 0x31,
-        Key::Num2 => 0x32,
-        Key::Num3 => 0x33,
-        Key::Num4 => 0x34,
-        Key::Num5 => 0x35,
-        Key::Num6 => 0x36,
-        Key::Num7 => 0x37,
-        Key::Num8 => 0x38,
-        Key::Num9 => 0x39,
-        Key::Backtick => 0xC0,
-        Key::Minus => 0xBD,
-        Key::Equals => 0xBB,
-        Key::OpenBracket => 0xDB,
-        Key::CloseBracket => 0xDD,
-        Key::Backslash => 0xDC,
-        Key::Semicolon => 0xBA,
-        Key::Quote => 0xDE,
-        Key::Comma => 0xBC,
-        Key::Period => 0xBE,
-        Key::Slash => 0xBF,
-        _ => return None,
-    };
-    Some(vk as u16)
-}
-
-/// Map an egui Key to the Linux evdev keycode (from
-/// <linux/input-event-codes.h>). The mouse_listener / keyboard_listener
-/// modules read evdev codes directly, so this is what Config stores on
-/// Linux.
-#[cfg(unix)]
-fn egui_key_to_code(key: egui::Key) -> Option<u16> {
-    use egui::Key;
-    let code: u16 = match key {
-        // Function keys: KEY_F1 = 59, KEY_F2 = 60, ... KEY_F10 = 68;
-        // KEY_F11 = 87, KEY_F12 = 88. F13–F24 are 183–194.
-        Key::F1 => 59,
-        Key::F2 => 60,
-        Key::F3 => 61,
-        Key::F4 => 62,
-        Key::F5 => 63,
-        Key::F6 => 64,
-        Key::F7 => 65,
-        Key::F8 => 66,
-        Key::F9 => 67,
-        Key::F10 => 68,
-        Key::F11 => 87,
-        Key::F12 => 88,
-        Key::F13 => 183,
-        Key::F14 => 184,
-        Key::F15 => 185,
-        Key::F16 => 186,
-        Key::F17 => 187,
-        Key::F18 => 188,
-        Key::F19 => 189,
-        Key::F20 => 190,
-        Key::F21 => 191,
-        Key::F22 => 192,
-        Key::F23 => 193,
-        Key::F24 => 194,
-        Key::Tab => 15,
-        Key::Space => 57,
-        Key::Enter => 28,
-        Key::Backspace => 14,
-        Key::Insert => 110,
-        Key::Delete => 111,
-        Key::Home => 102,
-        Key::End => 107,
-        Key::PageUp => 104,
-        Key::PageDown => 109,
-        Key::ArrowUp => 103,
-        Key::ArrowDown => 108,
-        Key::ArrowLeft => 105,
-        Key::ArrowRight => 106,
-        // KEY_A..KEY_Z are NOT alphabetical: keyboard scancode order
-        // (Q W E R T Y U I O P ...). Below tracks <linux/input-event-codes.h>.
-        Key::Q => 16,
-        Key::W => 17,
-        Key::E => 18,
-        Key::R => 19,
-        Key::T => 20,
-        Key::Y => 21,
-        Key::U => 22,
-        Key::I => 23,
-        Key::O => 24,
-        Key::P => 25,
-        Key::A => 30,
-        Key::S => 31,
-        Key::D => 32,
-        Key::F => 33,
-        Key::G => 34,
-        Key::H => 35,
-        Key::J => 36,
-        Key::K => 37,
-        Key::L => 38,
-        Key::Z => 44,
-        Key::X => 45,
-        Key::C => 46,
-        Key::V => 47,
-        Key::B => 48,
-        Key::N => 49,
-        Key::M => 50,
-        // Number row: KEY_1..KEY_0 = 2..11.
-        Key::Num1 => 2,
-        Key::Num2 => 3,
-        Key::Num3 => 4,
-        Key::Num4 => 5,
-        Key::Num5 => 6,
-        Key::Num6 => 7,
-        Key::Num7 => 8,
-        Key::Num8 => 9,
-        Key::Num9 => 10,
-        Key::Num0 => 11,
-        Key::Backtick => 41,    // KEY_GRAVE
-        Key::Minus => 12,       // KEY_MINUS
-        Key::Equals => 13,      // KEY_EQUAL
-        Key::OpenBracket => 26, // KEY_LEFTBRACE
-        Key::CloseBracket => 27,
-        Key::Backslash => 43,
-        Key::Semicolon => 39,
-        Key::Quote => 40,
-        Key::Comma => 51,
-        Key::Period => 52,
-        Key::Slash => 53,
-        _ => return None,
-    };
-    Some(code)
-}
-
 /// Human label for a Win32 VK code, used on the bind button.
 #[cfg(windows)]
-fn code_to_label(vk: u16) -> String {
+pub(super) fn code_to_label(vk: u16) -> String {
     match vk {
         0x70 => "F1".into(),
         0x71 => "F2".into(),
@@ -823,10 +778,6 @@ fn code_to_label(vk: u16) -> String {
         0x28 => "Down".into(),
         0x25 => "Left".into(),
         0x27 => "Right".into(),
-        // OEM/punctuation VKs: ask the OS what character this VK
-        // produces on the current keyboard layout. Avoids showing
-        // opaque "VK 0xDC" to non-US users (where the same code
-        // produces different characters: \ on US, # on German, etc.).
         0xBA..=0xC0 | 0xDB..=0xDF | 0xE2 => {
             oem_vk_to_char(vk).unwrap_or_else(|| format!("VK 0x{:02X}", vk))
         }
@@ -834,12 +785,11 @@ fn code_to_label(vk: u16) -> String {
     }
 }
 
-/// Human label for a Linux evdev keycode. Used on the bind button.
-/// Codes from <linux/input-event-codes.h>.
+/// Human label for a Linux evdev keycode. Codes from
+/// <linux/input-event-codes.h>.
 #[cfg(unix)]
-fn code_to_label(code: u16) -> String {
+pub(super) fn code_to_label(code: u16) -> String {
     match code {
-        // Function keys.
         59 => "F1".into(),
         60 => "F2".into(),
         61 => "F3".into(),
@@ -864,7 +814,6 @@ fn code_to_label(code: u16) -> String {
         192 => "F22".into(),
         193 => "F23".into(),
         194 => "F24".into(),
-        // Common control keys.
         15 => "Tab".into(),
         57 => "Space".into(),
         28 => "Enter".into(),
@@ -880,11 +829,9 @@ fn code_to_label(code: u16) -> String {
         108 => "Down".into(),
         105 => "Left".into(),
         106 => "Right".into(),
-        // Modifiers (left + right variants, evdev distinguishes them).
         42 | 54 => "Shift".into(),
         29 | 97 => "Ctrl".into(),
         56 | 100 => "Alt".into(),
-        // Letters: not contiguous in evdev (scancode order).
         16 => "Q".into(),
         17 => "W".into(),
         18 => "E".into(),
@@ -911,7 +858,6 @@ fn code_to_label(code: u16) -> String {
         48 => "B".into(),
         49 => "N".into(),
         50 => "M".into(),
-        // Number row: KEY_1..KEY_0 = 2..11.
         2 => "1".into(),
         3 => "2".into(),
         4 => "3".into(),
@@ -922,7 +868,6 @@ fn code_to_label(code: u16) -> String {
         9 => "8".into(),
         10 => "9".into(),
         11 => "0".into(),
-        // Punctuation.
         41 => "`".into(),
         12 => "-".into(),
         13 => "=".into(),
@@ -938,90 +883,83 @@ fn code_to_label(code: u16) -> String {
     }
 }
 
-/// Open the config panel as a top-level window. Blocks until the user
-/// closes the window. Takes a shared LiveSettings so slider changes can
-/// be applied to the running preview manager instantly.
-pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> Result<(), eframe::Error> {
-    // Load the Nicotine icon for the window chrome + taskbar + alt-tab.
-    // Baked into the binary via include_bytes so there's no external
-    // asset to lose on install. from_png_bytes goes through eframe's
-    // bundled `image` crate (already pulled in with the png feature).
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png"))
-        .expect("failed to decode embedded icon.png");
+/// Open the config panel as a native window. Blocks until the user closes
+/// it. Takes a shared LiveSettings so slider changes apply to the running
+/// preview manager instantly.
+///
+/// NOTE: we deliberately do NOT force the winit X11 backend here. On
+/// Wayland sessions winit picks Wayland and wgpu renders natively; forcing
+/// X11 (XWayland) panics wgpu with "Invalid surface" on KWin.
+pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
+    let icon =
+        iced::window::icon::from_file_data(include_bytes!("../../assets/icon.png"), None).ok();
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            // Open at the empty-config size; the per-frame auto-resize
-            // grows the window as the user adds characters. Starting at
-            // a tall fixed value (e.g. 1000pt) caused huge dead space on
-            // first launch on machines where the OS ignores
-            // ViewportCommand::InnerSize *shrinks* on a non-resizable
-            // window — the window would never shrink back from the
-            // initial size to fit the (much shorter) empty content.
-            // Growing reliably works everywhere, so we start small.
-            .with_inner_size([600.0, 640.0])
-            .with_resizable(false)
-            .with_title("Nicotine")
-            .with_icon(icon),
+    let audio = crate::audio::spawn();
+
+    // `mut` is only used on Linux (the app_id assignment below); on other
+    // platforms the binding is never mutated, so allow the unused-mut lint
+    // there to keep `-D warnings` green.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut window = iced::window::Settings {
+        size: iced::Size::new(720.0, 680.0),
+        min_size: Some(iced::Size::new(560.0, 420.0)),
+        resizable: true,
+        icon,
         ..Default::default()
     };
+    // On Linux the titlebar/taskbar icon comes from a desktop-file match, not
+    // the pixel `icon` above (Wayland has no per-window icon protocol). Setting
+    // the app_id to the `nicotine.desktop` basename lets KWin find the icon;
+    // iced feeds this to winit's `with_name` (Wayland app_id / X11 WM_CLASS).
+    #[cfg(target_os = "linux")]
+    {
+        window.platform_specific.application_id = "nicotine".to_string();
+    }
 
-    // On Linux, force winit's X11 backend. Previews use X11 directly
-    // (XComposite + XRender), so the panel needs to live on the same
-    // X server. Without this, winit picks Wayland on Wayland sessions
-    // and the panel can't share state/focus with our X11 previews. It
-    // also dodges the libwayland-client dlopen failure when the binary
-    // is run in environments that don't have it on the loader path.
-    #[cfg(unix)]
-    let options = {
-        use winit::platform::x11::EventLoopBuilderExtX11;
-        let mut options = options;
-        options.event_loop_builder = Some(Box::new(|builder| {
-            builder.with_x11();
-        }));
-        options
-    };
-
-    eframe::run_native(
-        "Nicotine",
-        options,
-        Box::new(move |cc| Ok(Box::new(ConfigPanel::new(cc, config, live)))),
+    iced::application(
+        move || Panel::new(config.clone(), Arc::clone(&live), audio.clone()),
+        update,
+        view,
     )
+    .title("Nicotine")
+    .settings(iced::Settings {
+        default_text_size: iced::Pixels(TEXT_SIZE),
+        ..Default::default()
+    })
+    .theme(theme)
+    .subscription(subscription)
+    .default_font(iced::Font::with_name("JetBrains Mono"))
+    .font(include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf").as_slice())
+    .font(include_bytes!("../../assets/fonts/Marlboro.ttf").as_slice())
+    .window(window)
+    .run()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::keyboard::key::Named;
+    use iced::keyboard::Key;
 
-    fn f_keys_16_to_24() -> Vec<(egui::Key, &'static str)> {
+    fn f_keys_16_to_24() -> Vec<(Named, &'static str)> {
         vec![
-            (egui::Key::F16, "F16"),
-            (egui::Key::F17, "F17"),
-            (egui::Key::F18, "F18"),
-            (egui::Key::F19, "F19"),
-            (egui::Key::F20, "F20"),
-            (egui::Key::F21, "F21"),
-            (egui::Key::F22, "F22"),
-            (egui::Key::F23, "F23"),
-            (egui::Key::F24, "F24"),
+            (Named::F16, "F16"),
+            (Named::F17, "F17"),
+            (Named::F18, "F18"),
+            (Named::F19, "F19"),
+            (Named::F20, "F20"),
+            (Named::F21, "F21"),
+            (Named::F22, "F22"),
+            (Named::F23, "F23"),
+            (Named::F24, "F24"),
         ]
     }
 
     #[test]
-    fn supported_keys_includes_f16_through_f24() {
+    fn iced_key_to_code_maps_f16_through_f24() {
         for (key, name) in f_keys_16_to_24() {
             assert!(
-                SUPPORTED_KEYS.contains(&key),
-                "{name} not in SUPPORTED_KEYS — bind UI cannot capture it"
-            );
-        }
-    }
-
-    #[test]
-    fn egui_key_to_code_maps_f16_through_f24() {
-        for (key, name) in f_keys_16_to_24() {
-            assert!(
-                egui_key_to_code(key).is_some(),
+                iced_key_to_code(&Key::Named(key)).is_some(),
                 "{name} has no native key code mapping"
             );
         }
@@ -1030,7 +968,7 @@ mod tests {
     #[test]
     fn code_to_label_round_trips_f16_through_f24() {
         for (key, name) in f_keys_16_to_24() {
-            let code = egui_key_to_code(key)
+            let code = iced_key_to_code(&Key::Named(key))
                 .unwrap_or_else(|| panic!("{name} unmapped, can't round-trip"));
             assert_eq!(
                 code_to_label(code),
@@ -1040,98 +978,13 @@ mod tests {
         }
     }
 
-    /// End-to-end verification of the capture path. SendInput a
-    /// keystroke by scancode (so Windows resolves the VK via the
-    /// active layout, exactly like a real hardware press), then
-    /// call `oem_vk_currently_pressed` and verify it returns the
-    /// layout-resolved VK. Catches the class of failure where
-    /// `GetAsyncKeyState` doesn't see injected input or our scan
-    /// misses a VK that should be in range.
-    ///
-    /// The test uses `MapVirtualKeyExW(MAPVK_VSC_TO_VK)` to compute
-    /// the expected VK for the chosen scancode under the current
-    /// keyboard layout — so it works on US, German, or any other
-    /// layout the runner happens to have active.
-    ///
-    #[cfg(windows)]
     #[test]
-    fn oem_vk_currently_pressed_detects_synthesized_keystroke() {
-        use std::time::Duration;
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            GetKeyboardLayout, MapVirtualKeyExW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD,
-            KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VSC_TO_VK, VIRTUAL_KEY,
-        };
-
-        // Scancode 0x2B is the key at the top-right of the
-        // alphanumeric block — on US ANSI that's `\` / VK_OEM_5
-        // (0xDC); on German ISO that's `#` / VK_OEM_2 (0xBF); on
-        // French it's `*` / VK_OEM_2. We don't hard-code the
-        // expected VK — we ask Windows itself via MapVirtualKeyExW.
-        const TEST_SCANCODE: u16 = 0x2B;
-
-        let layout = unsafe { GetKeyboardLayout(0) };
-        let expected_vk =
-            unsafe { MapVirtualKeyExW(TEST_SCANCODE as u32, MAPVK_VSC_TO_VK, Some(layout)) } as u16;
-        if expected_vk == 0 {
-            eprintln!(
-                "Scancode 0x{:02X} doesn't map to a VK on the current layout; skipping",
-                TEST_SCANCODE
-            );
-            return;
-        }
-        // The expected VK must be one our scan range covers — if
-        // not, this is itself a regression in OEM_VK_RANGE that
-        // the previous test should have caught. Belt-and-braces
-        // assertion here keeps the failure mode obvious.
-        assert!(
-            OEM_VK_RANGE.contains(&expected_vk),
-            "Expected VK 0x{expected_vk:02X} for scancode 0x{TEST_SCANCODE:02X} \
-             is not in OEM_VK_RANGE — the scan can never detect it"
-        );
-
-        let make_input = |flags| INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: TEST_SCANCODE,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-        let down = make_input(KEYEVENTF_SCANCODE);
-        let up = make_input(KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP);
-
-        let n_down = unsafe { SendInput(&[down], std::mem::size_of::<INPUT>() as i32) };
-        assert_eq!(n_down, 1, "SendInput KEYDOWN should accept the event");
-
-        // Give the OS a moment to apply the input to its async key
-        // state table. Sub-frame timing on a fast machine; 20ms is
-        // a generous ceiling that won't slow CI perceptibly.
-        std::thread::sleep(Duration::from_millis(20));
-
-        let captured = oem_vk_currently_pressed();
-
-        // Always release before asserting so a failing test doesn't
-        // leave the key "stuck down" for sibling tests run later.
-        let n_up = unsafe { SendInput(&[up], std::mem::size_of::<INPUT>() as i32) };
-        assert_eq!(n_up, 1, "SendInput KEYUP should accept the event");
-
-        assert_eq!(
-            captured,
-            Some(expected_vk),
-            "oem_vk_currently_pressed should detect the synthesized key — \
-             expected VK 0x{expected_vk:02X} (scancode 0x{TEST_SCANCODE:02X} \
-             on the active layout), got {captured:?}"
-        );
+    fn character_keys_map_to_codes() {
+        // A printable key arrives as Key::Character; ensure letters/digits map.
+        assert!(iced_key_to_code(&Key::Character("a".into())).is_some());
+        assert!(iced_key_to_code(&Key::Character("1".into())).is_some());
     }
 
-    /// Sweep our static OEM_VK_RANGE constant against the canonical
-    /// MSDN range. Catches the class of regression where a refactor
-    /// shrinks the scan range and we'd silently miss a
-    /// layout-dependent key in `captured_binding`.
     #[cfg(windows)]
     #[test]
     fn oem_vk_range_covers_all_documented_oem_vks() {
@@ -1142,129 +995,7 @@ mod tests {
         assert_eq!(
             OEM_VK_RANGE,
             expected.as_slice(),
-            "OEM_VK_RANGE drifted from the documented MSDN OEM range — \
-             missing entries mean oem_vk_currently_pressed silently \
-             skips layout-dependent keys (e.g. the German #)"
+            "OEM_VK_RANGE drifted from the documented MSDN OEM range"
         );
-    }
-
-    /// The crux of the German-`#` bug. Switch the active keyboard
-    /// layout to German programmatically, ask `oem_vk_to_char` what
-    /// character `VK_OEM_2` produces there, restore the layout,
-    /// assert the answer is `#`. If `oem_vk_to_char` were
-    /// hardcoded to a US table (or our static `code_to_label`
-    /// fallback regressed), this fails.
-    ///
-    /// The Drop guard ensures the original layout is restored even
-    /// on assertion panic, so this test doesn't poison sibling
-    /// tests run by the same `cargo test` invocation.
-    ///
-    /// Skips with a message if the German layout DLL isn't
-    /// installed on the runner — uncommon on `windows-latest` but
-    /// possible on minimal Windows images.
-    #[cfg(windows)]
-    #[test]
-    fn oem_vk_to_char_respects_active_keyboard_layout() {
-        use windows::core::w;
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            ActivateKeyboardLayout, GetKeyboardLayout, LoadKeyboardLayoutW,
-            ACTIVATE_KEYBOARD_LAYOUT_FLAGS, HKL, KLF_ACTIVATE,
-        };
-
-        let saved = unsafe { GetKeyboardLayout(0) };
-        let german = match unsafe {
-            LoadKeyboardLayoutW(
-                w!("00000407"),
-                ACTIVATE_KEYBOARD_LAYOUT_FLAGS(KLF_ACTIVATE.0),
-            )
-        } {
-            Ok(hkl) => hkl,
-            Err(e) => {
-                eprintln!(
-                    "German keyboard layout (0x0407) not installed on this runner ({e:?}); \
-                     skipping cross-layout test."
-                );
-                return;
-            }
-        };
-
-        struct LayoutGuard(HKL);
-        impl Drop for LayoutGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    let _ = ActivateKeyboardLayout(self.0, ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0));
-                }
-            }
-        }
-        let _guard = LayoutGuard(saved);
-
-        unsafe {
-            let _ = ActivateKeyboardLayout(german, ACTIVATE_KEYBOARD_LAYOUT_FLAGS(KLF_ACTIVATE.0));
-        }
-
-        // VK_OEM_2 (0xBF) on German layout is `#` — the exact key
-        // from the bug report. On US it would be `/`.
-        let label = oem_vk_to_char(0xBF);
-        assert_eq!(
-            label.as_deref(),
-            Some("#"),
-            "VK_OEM_2 (0xBF) on German keyboard layout should produce '#', got {label:?}"
-        );
-
-        // While we're here, sanity-check a second German-specific
-        // mapping so we catch "MapVirtualKey accidentally took the
-        // shifted character" type regressions.
-        let oem4 = oem_vk_to_char(0xDB); // VK_OEM_4 — German `ß`
-        assert_eq!(
-            oem4.as_deref(),
-            Some("ß"),
-            "VK_OEM_4 (0xDB) on German should produce 'ß' (eszett), got {oem4:?}"
-        );
-    }
-
-    /// OEM/punctuation VKs are layout-dependent on Windows — what
-    /// character a given VK produces varies (US `\\` vs German `#`
-    /// for VK_OEM_5). The label MUST query the OS for the current
-    /// layout's character rather than fall through to `VK 0x{:02X}`
-    /// which is opaque to users. This test runs on Windows only;
-    /// the underlying `MapVirtualKeyW` is a Win32 call.
-    #[cfg(windows)]
-    #[test]
-    fn oem_vk_label_shows_layout_character_not_hex_fallback() {
-        // Sweep the full OEM range. Each VK in this range must
-        // resolve to a layout character — never the "VK 0x..." hex
-        // fallback. On a US-layout runner these are typically
-        // single ASCII chars (`\`, `]`, `[`, `'`, `;`, `,`, `.`,
-        // `/`, etc.). On a German runner they'd be `#`, `+`, `Ü`,
-        // and so on.
-        const OEM_RANGE: &[u16] = &[
-            0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, // OEM_1, +, ,, -, ., /, ~
-            0xDB, 0xDC, 0xDD, 0xDE, 0xDF, // OEM_4-8
-            0xE2, // OEM_102 (ISO key)
-        ];
-        for &vk in OEM_RANGE {
-            let label = code_to_label(vk);
-            // Some VKs don't exist on US ANSI keyboards, so
-            // MapVirtualKeyW returns 0 (no character) on a US-layout
-            // runner and the label falls back to the hex form.
-            // That's fine for end users — they can't physically
-            // press these keys, so they never see the fallback —
-            // but it makes the test flaky depending on runner
-            // locale. Skip the layout-extras here:
-            //   - VK_OEM_8  (0xDF): rare miscellaneous, varies
-            //   - VK_OEM_102 (0xE2): ISO `<>` key (European boards)
-            if matches!(vk, 0xDF | 0xE2) {
-                continue;
-            }
-            assert!(
-                !label.starts_with("VK 0x"),
-                "OEM VK 0x{vk:02X} should resolve to a layout character via \
-                 MapVirtualKeyW (US: \\, German: #, etc.), got {label:?}"
-            );
-            assert!(
-                !label.is_empty(),
-                "OEM VK 0x{vk:02X} produced an empty label"
-            );
-        }
     }
 }

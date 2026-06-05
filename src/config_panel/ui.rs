@@ -1,382 +1,504 @@
-//! The big `impl ConfigPanel` block that draws the panel: section
-//! headers, display-mode picker, character list, hotkey bindings, and
-//! preview-window sliders. Lives in its own file because at ~350 lines
-//! it dominates `mod.rs` if kept inline.
+//! View helpers for the iced config panel: the branded header/footer and
+//! the four body sections (display mode, cycle order, hotkeys, previews).
 
-use eframe::egui;
+use iced::widget::{
+    button, checkbox, column, container, mouse_area, pick_list, radio, row, slider, text,
+    text_input, Space,
+};
+use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, Vector};
 
 use crate::config::DisplayMode;
 
 use super::{
-    code_to_label, CaptureTarget, ConfigPanel, MODIFIER_CHOICES, NICOTINE_BLACK, NICOTINE_GOLD,
-    NICOTINE_RED,
+    code_to_label, CaptureTarget, Message, Panel, Tab, CAPTION_SIZE, LOGO_SIZE, MODIFIER_CHOICES,
+    NICOTINE_BLACK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED, SECTION_SIZE,
 };
 
-impl ConfigPanel {
-    pub(super) fn draw_section_header(ui: &mut egui::Ui, label: &str) {
-        ui.label(
-            egui::RichText::new(label)
-                .size(16.0)
-                .strong()
-                .color(NICOTINE_RED),
-        );
-        ui.separator();
+const LOGO_FONT: Font = Font::with_name("Marlboro");
+const BOLD: Font = Font {
+    weight: iced::font::Weight::Bold,
+    ..Font::with_name("JetBrains Mono")
+};
+
+/// A container style that's just a solid fill — the common case for the
+/// header strip, footer, sidebar, and dividers.
+fn filled(color: Color) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(color)),
+        ..container::Style::default()
     }
+}
 
-    pub(super) fn draw_display_mode_section(&mut self, ui: &mut egui::Ui) {
-        Self::draw_section_header(ui, "Display Mode");
-        ui.label(
-            egui::RichText::new(
-                "How Nicotine shows your running clients on screen. \
-                 Preview windows mirror each client live; the list view is \
-                 a compact always-on-top window of names.",
-            )
-            .size(11.0)
-            .color(NICOTINE_BLACK),
-        );
-        ui.add_space(4.0);
+pub(super) fn header() -> Element<'static, Message> {
+    container(
+        mouse_area(
+            text("Nicotine")
+                .font(LOGO_FONT)
+                .size(LOGO_SIZE)
+                .color(NICOTINE_CREAM),
+        )
+        .on_press(Message::LogoClicked),
+    )
+    .center_x(Length::Fill)
+    .center_y(Length::Fixed(72.0))
+    .style(|_| filled(NICOTINE_RED))
+    .into()
+}
 
-        let prev = self.config.display_mode;
-        ui.horizontal(|ui| {
-            ui.radio_value(
-                &mut self.config.display_mode,
-                DisplayMode::Previews,
-                "Preview windows",
-            );
-            ui.add_space(12.0);
-            ui.radio_value(
-                &mut self.config.display_mode,
-                DisplayMode::List,
-                "Client list",
-            );
-        });
-        if self.config.display_mode != prev {
-            self.touch();
-            // Push immediately to the shared LiveSettings so the preview
-            // manager swaps modes within its next reconcile tick.
-            self.live.lock().unwrap().display_mode = self.config.display_mode;
+pub(super) fn footer() -> Element<'static, Message> {
+    let links = row![
+        link_button("GITHUB", "https://github.com/isomerc"),
+        text("•").size(CAPTION_SIZE).color(NICOTINE_GOLD),
+        link_button(
+            "ILLUMINATED IS RECRUITING",
+            "https://www.illuminatedcorp.com"
+        ),
+    ]
+    .spacing(14)
+    .align_y(Alignment::Center);
+
+    let badge: Element<'static, Message> = match crate::version_check::get_update_status() {
+        Some(crate::version_check::UpdateStatus::Outdated { version, url }) => {
+            link_button(format!("NEW VERSION AVAILABLE (v{version})"), url)
         }
+        Some(crate::version_check::UpdateStatus::UpToDate) => text("LATEST VERSION")
+            .size(CAPTION_SIZE)
+            .color(NICOTINE_GREEN)
+            .font(BOLD)
+            .into(),
+        None => Space::new().into(),
+    };
 
-        ui.add_space(6.0);
-        let prev_lock = self.config.positions_locked;
-        ui.checkbox(
-            &mut self.config.positions_locked,
-            "Lock positions (drag disabled on previews and list)",
-        );
-        if self.config.positions_locked != prev_lock {
-            self.touch();
-            // Live-apply so the running preview manager stops honoring
-            // drags immediately — no save + restart needed.
-            self.live.lock().unwrap().positions_locked = self.config.positions_locked;
-        }
+    let bar =
+        container(row![links, Space::new().width(Length::Fill), badge].align_y(Alignment::Center))
+            .width(Length::Fill)
+            .padding([10, 16])
+            .style(|_| filled(NICOTINE_CREAM));
 
-        ui.add_space(6.0);
-        // Restack EVE clients to the configured stack geometry. Sends
-        // the request over the IPC socket so the daemon (which owns the
-        // WindowManager) does the work — same path as `nicotine stack`
-        // on the CLI. Errors are silent: if the daemon isn't running,
-        // there's nothing to restack anyway.
-        if ui.button("Restack EVE Windows").clicked() {
-            let _ = crate::daemon::send_command("stack");
-        }
-    }
+    column![divider(), bar].into()
+}
 
-    pub(super) fn draw_characters_section(&mut self, ui: &mut egui::Ui) {
-        Self::draw_section_header(ui, "Cycle Order");
-        ui.label(
-            egui::RichText::new(
-                "Characters cycle in the order shown. Names must match EVE's window title \
-                 exactly (the part after \"EVE - \").",
-            )
-            .size(11.0)
-            .color(NICOTINE_BLACK),
-        );
-        ui.add_space(6.0);
+fn link_button(label: impl Into<String>, url: impl Into<String>) -> Element<'static, Message> {
+    let url = url.into();
+    button(
+        text(label.into())
+            .size(CAPTION_SIZE)
+            .color(NICOTINE_RED)
+            .font(BOLD),
+    )
+    .style(button::text)
+    .padding(0)
+    .on_press(Message::OpenLink(url))
+    .into()
+}
 
-        let mut swap: Option<(usize, usize)> = None;
-        let mut remove: Option<usize> = None;
-        // Track edits locally; `self.touch()` can't be called from
-        // inside the closures below because the closures borrow self.
-        let mut dirty = false;
+pub(super) fn tab_sidebar(panel: &Panel) -> Element<'_, Message> {
+    let col = column![
+        tab_button("Display", Tab::Display, panel.active_tab == Tab::Display),
+        tab_button(
+            "Characters",
+            Tab::Characters,
+            panel.active_tab == Tab::Characters
+        ),
+        tab_button("Hotkeys", Tab::Hotkeys, panel.active_tab == Tab::Hotkeys),
+    ]
+    .spacing(4);
 
-        let len = self.config.characters.len();
-        for idx in 0..len {
-            // Row 1 — name + reorder + delete.
-            ui.horizontal(|ui| {
-                ui.label(format!("{}.", idx + 1));
-                if ui
-                    .text_edit_singleline(&mut self.config.characters[idx])
-                    .changed()
-                {
-                    dirty = true;
-                }
-                if ui.button("↑").clicked() && idx > 0 {
-                    swap = Some((idx, idx - 1));
-                }
-                if ui.button("↓").clicked() {
-                    swap = Some((idx, idx + 1));
-                }
-                if ui.button("✕").clicked() {
-                    remove = Some(idx);
-                }
-            });
+    container(col)
+        .padding(8)
+        .width(Length::Fixed(150.0))
+        .height(Length::Fill)
+        .style(|_| filled(NICOTINE_CREAM))
+        .into()
+}
 
-            // Row 2 — per-character jump hotkey.
-            let name = self.config.characters[idx].clone();
-            ui.horizontal(|ui| {
-                ui.add_space(22.0);
-                ui.label("Hotkey:");
-
-                // Modifier dropdown.
-                let current_mod = self
-                    .config
-                    .character_hotkeys
-                    .get(&name)
-                    .and_then(|h| h.modifier);
-                let selected_label = MODIFIER_CHOICES
-                    .iter()
-                    .find(|(m, _)| *m == current_mod)
-                    .map(|(_, l)| *l)
-                    .unwrap_or("None");
-                let mut new_mod = current_mod;
-                egui::ComboBox::from_id_salt(format!("char_mod_{}", idx))
-                    .selected_text(selected_label)
-                    .width(70.0)
-                    .show_ui(ui, |ui| {
-                        for (code, label) in MODIFIER_CHOICES {
-                            if ui.selectable_label(new_mod == *code, *label).clicked() {
-                                new_mod = *code;
-                            }
-                        }
-                    });
-                if new_mod != current_mod {
-                    // Always persist the modifier choice. If no key has
-                    // been bound yet, we create a placeholder entry
-                    // with vk=0; the daemon's register_hotkeys skips
-                    // vk=0 entries, and the next captured keypress
-                    // fills in the vk while preserving this modifier.
-                    let entry = self.config.character_hotkeys.entry(name.clone()).or_insert(
-                        crate::config::CharacterHotkey {
-                            vk: 0,
-                            modifier: None,
-                        },
-                    );
-                    entry.modifier = new_mod;
-                    dirty = true;
-                }
-
-                // Bind button — shows current VK or "none." vk == 0
-                // means "only the modifier is set so far," so we also
-                // display that as "none" until a real key is captured.
-                let binding_label = self
-                    .config
-                    .character_hotkeys
-                    .get(&name)
-                    .filter(|h| h.vk != 0)
-                    .map(|h| code_to_label(h.vk))
-                    .unwrap_or_else(|| "none".into());
-                self.draw_bind_button_sized(
-                    ui,
-                    &CaptureTarget::Character(name.clone()),
-                    binding_label,
-                    egui::vec2(100.0, 20.0),
-                );
-
-                // Clear the binding entirely.
-                if self.config.character_hotkeys.contains_key(&name) && ui.button("✕").clicked() {
-                    self.config.character_hotkeys.remove(&name);
-                    dirty = true;
-                }
-            });
-
-            ui.add_space(2.0);
-        }
-
-        if dirty {
-            self.touch();
-        }
-        if let Some((a, b)) = swap {
-            if b < self.config.characters.len() {
-                self.config.characters.swap(a, b);
-                self.touch();
-            }
-        }
-        if let Some(idx) = remove {
-            // Drop the per-character hotkey for the removed name too.
-            let removed_name = self.config.characters.remove(idx);
-            self.config.character_hotkeys.remove(&removed_name);
-            self.touch();
-        }
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("Add:");
-            let response = ui.text_edit_singleline(&mut self.new_character_buffer);
-            let add_clicked = ui.button("+").clicked();
-            let enter_pressed =
-                response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (add_clicked || enter_pressed) && !self.new_character_buffer.trim().is_empty() {
-                self.config
-                    .characters
-                    .push(self.new_character_buffer.trim().to_string());
-                self.new_character_buffer.clear();
-                self.touch();
-            }
-        });
-    }
-
-    pub(super) fn draw_hotkeys_section(&mut self, ui: &mut egui::Ui) {
-        Self::draw_section_header(ui, "Keyboard Hotkeys");
-
-        let prev_enable = self.config.enable_keyboard_buttons;
-        ui.checkbox(
-            &mut self.config.enable_keyboard_buttons,
-            "Enable keyboard cycling",
-        );
-        if self.config.enable_keyboard_buttons != prev_enable {
-            self.touch();
-        }
-
-        ui.add_enabled_ui(self.config.enable_keyboard_buttons, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Forward:");
-                self.draw_bind_button(
-                    ui,
-                    &CaptureTarget::ForwardKey,
-                    code_to_label(self.config.forward_key),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Backward:");
-                self.draw_bind_button(
-                    ui,
-                    &CaptureTarget::BackwardKey,
-                    code_to_label(self.config.backward_key),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Modifier:");
-                let label = match self.config.modifier_key {
-                    Some(vk) => code_to_label(vk),
-                    None => "None".to_string(),
-                };
-                self.draw_bind_button(ui, &CaptureTarget::ModifierKey, label);
-                if self.config.modifier_key.is_some() && ui.button("Clear").clicked() {
-                    self.config.modifier_key = None;
-                    self.touch();
-                }
-            });
-            ui.label(
-                egui::RichText::new(
-                    "Click a binding to record the next key you press. Esc cancels. \
-                     Set both keys to the same value with a modifier to cycle backward \
-                     via modifier+key (e.g. Tab + Shift+Tab).",
-                )
-                .size(10.0)
-                .color(NICOTINE_BLACK),
-            );
-        });
-
-        ui.add_space(8.0);
-        let prev_mouse = self.config.enable_mouse_buttons;
-        ui.checkbox(
-            &mut self.config.enable_mouse_buttons,
-            "Cycle on mouse side buttons (XBUTTON1/XBUTTON2)",
-        );
-        if self.config.enable_mouse_buttons != prev_mouse {
-            self.touch();
-        }
-        ui.label(
-            egui::RichText::new(
-                "Off by default. Turn on only if you don't already remap your mouse \
-                 side buttons via driver software (Logi Options+, Razer Synapse, etc.) \
-                 — otherwise this will hijack the buttons in browsers/games too.",
-            )
-            .size(10.0)
-            .color(NICOTINE_BLACK),
-        );
-    }
-
-    /// Button that toggles capture for a given config field. When
-    /// capturing, shows a hint; otherwise shows the current binding's
-    /// label. Click while already capturing to cancel.
-    fn draw_bind_button(&mut self, ui: &mut egui::Ui, target: &CaptureTarget, label: String) {
-        self.draw_bind_button_sized(ui, target, label, egui::vec2(200.0, 22.0));
-    }
-
-    fn draw_bind_button_sized(
-        &mut self,
-        ui: &mut egui::Ui,
-        target: &CaptureTarget,
-        label: String,
-        size: egui::Vec2,
-    ) {
-        let is_capturing = self.capturing.as_ref() == Some(target);
-        let text = if is_capturing {
-            "[press key — Esc]".to_string()
-        } else {
-            label
-        };
-        let mut button = egui::Button::new(text).min_size(size);
-        if is_capturing {
-            button = button
-                .fill(NICOTINE_GOLD)
-                .stroke(egui::Stroke::new(1.5, NICOTINE_RED));
-        }
-        if ui.add(button).clicked() {
-            self.capturing = if is_capturing {
-                None
+fn tab_button(label: &'static str, tab: Tab, active: bool) -> Element<'static, Message> {
+    button(text(label))
+        .width(Length::Fill)
+        .padding([8, 12])
+        .on_press(Message::TabSelected(tab))
+        .style(move |_theme, status| {
+            // Press is styled like hover, so clicking a tab doesn't flash.
+            let (bg, fg) = if active {
+                (NICOTINE_RED, NICOTINE_CREAM)
+            } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                (NICOTINE_GOLD, NICOTINE_BLACK)
             } else {
-                Some(target.clone())
+                (NICOTINE_CREAM, NICOTINE_BLACK)
             };
-        }
-    }
-
-    pub(super) fn draw_previews_section(&mut self, ui: &mut egui::Ui) {
-        Self::draw_section_header(ui, "Preview Windows");
-        let prev_show = self.config.show_previews;
-        ui.checkbox(&mut self.config.show_previews, "Show preview windows");
-        if self.config.show_previews != prev_show {
-            self.touch();
-            // Push to LiveSettings so the preview manager spawns or tears
-            // down its windows on its next reconcile tick instead of
-            // waiting for a daemon restart.
-            self.live.lock().unwrap().show_previews = self.config.show_previews;
-        }
-        ui.add_enabled_ui(self.config.show_previews, |ui| {
-            // Widen sliders so a 1px step is actually reachable without
-            // sub-pixel cursor precision. 3× the egui default width.
-            ui.spacing_mut().slider_width = ui.spacing().slider_width * 3.0;
-
-            let prev_w = self.config.preview_width;
-            let prev_h = self.config.preview_height;
-            ui.horizontal(|ui| {
-                ui.label("Width:");
-                ui.add(
-                    egui::Slider::new(&mut self.config.preview_width, 120..=800)
-                        .suffix(" px")
-                        .smart_aim(false)
-                        .step_by(1.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Height:");
-                ui.add(
-                    egui::Slider::new(&mut self.config.preview_height, 80..=600)
-                        .suffix(" px")
-                        .smart_aim(false)
-                        .step_by(1.0),
-                );
-            });
-            if self.config.preview_width != prev_w || self.config.preview_height != prev_h {
-                self.touch();
-                // Push the new size to the shared LiveSettings so the
-                // preview manager resizes its windows on the next tick —
-                // no need to wait for Save + hot-reload.
-                let mut live = self.live.lock().unwrap();
-                live.preview_width = self.config.preview_width;
-                live.preview_height = self.config.preview_height;
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: fg,
+                ..button::Style::default()
             }
-        });
+        })
+        .into()
+}
+
+pub(super) fn vdivider() -> Element<'static, Message> {
+    container(Space::new().width(Length::Fixed(1.0)).height(Length::Fill))
+        .height(Length::Fill)
+        .style(|_| filled(NICOTINE_GOLD))
+        .into()
+}
+
+pub(super) fn tab_content(panel: &Panel) -> Element<'_, Message> {
+    let inner: Element<'_, Message> = match panel.active_tab {
+        Tab::Display => column![display_mode_section(panel), previews_section(panel)]
+            .spacing(20)
+            .into(),
+        Tab::Characters => characters_section(panel),
+        Tab::Hotkeys => hotkeys_section(panel),
+    };
+    container(inner)
+        .padding([12, 16])
+        .width(Length::Fill)
+        .into()
+}
+
+fn section_header(label: &'static str) -> Element<'static, Message> {
+    column![
+        text(label)
+            .size(SECTION_SIZE)
+            .color(NICOTINE_RED)
+            .font(BOLD),
+        divider(),
+    ]
+    .spacing(4)
+    .into()
+}
+
+fn divider() -> Element<'static, Message> {
+    container(Space::new().height(Length::Fixed(1.0)).width(Length::Fill))
+        .width(Length::Fill)
+        .style(|_| filled(NICOTINE_GOLD))
+        .into()
+}
+
+fn caption(s: &'static str) -> Element<'static, Message> {
+    text(s).size(CAPTION_SIZE).color(NICOTINE_BLACK).into()
+}
+
+/// Drag handle for a cycle-list row — press and drag it to reorder.
+fn grip(i: usize) -> Element<'static, Message> {
+    mouse_area(text("≡").size(SECTION_SIZE).color(Color {
+        a: 0.55,
+        ..NICOTINE_BLACK
+    }))
+    .on_press(Message::GrabRow(i))
+    .into()
+}
+
+/// Container style for a cycle-list row mid-drag: the grabbed row lifts off
+/// as a white card; the row under the cursor becomes a soft gold drop slot.
+fn drag_row_style(is_dragged: bool, is_target: bool) -> container::Style {
+    let gold_border = Border {
+        color: NICOTINE_GOLD,
+        width: 1.0,
+        radius: 6.0_f32.into(),
+    };
+    if is_dragged {
+        container::Style {
+            background: Some(Background::Color(Color::WHITE)),
+            border: gold_border,
+            shadow: Shadow {
+                color: Color {
+                    a: 0.18,
+                    ..NICOTINE_BLACK
+                },
+                offset: Vector { x: 0.0, y: 2.0 },
+                blur_radius: 8.0,
+            },
+            ..container::Style::default()
+        }
+    } else if is_target {
+        container::Style {
+            background: Some(Background::Color(Color {
+                a: 0.15,
+                ..NICOTINE_GOLD
+            })),
+            border: gold_border,
+            ..container::Style::default()
+        }
+    } else {
+        container::Style::default()
     }
+}
+
+fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
+    column![
+        section_header("Display Mode"),
+        caption(
+            "How Nicotine shows your running clients on screen. Preview windows mirror each \
+             client live; the list view is a compact always-on-top window of names."
+        ),
+        row![
+            radio(
+                "Preview windows",
+                DisplayMode::Previews,
+                Some(panel.config.display_mode),
+                Message::DisplayModeChanged,
+            ),
+            radio(
+                "Client list",
+                DisplayMode::List,
+                Some(panel.config.display_mode),
+                Message::DisplayModeChanged,
+            ),
+        ]
+        .spacing(16),
+        checkbox(panel.config.positions_locked)
+            .label("Lock positions (drag disabled on previews and list)")
+            .on_toggle(Message::LockToggled),
+        button(text("Restack EVE Windows")).on_press(Message::RestackClicked),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn characters_section(panel: &Panel) -> Element<'_, Message> {
+    let mut col = column![
+        section_header("Cycle Order"),
+        caption(
+            "Characters cycle in the order shown. Names must match EVE's window title exactly \
+             (the part after \"EVE - \")."
+        ),
+    ]
+    .spacing(8);
+
+    for (i, name) in panel.config.characters.iter().enumerate() {
+        let row1 = row![
+            grip(i),
+            text(format!("{}.", i + 1)),
+            text_input("character name", name)
+                .on_input(move |s| Message::CharacterNameChanged(i, s))
+                .width(Length::Fill),
+            button(text("↑")).on_press(Message::MoveCharacterUp(i)),
+            button(text("↓")).on_press(Message::MoveCharacterDown(i)),
+            button(text("✕")).on_press(Message::RemoveCharacter(i)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        let current_mod = panel
+            .config
+            .character_hotkeys
+            .get(name)
+            .and_then(|h| h.modifier);
+        let selected = MODIFIER_CHOICES
+            .iter()
+            .copied()
+            .find(|m| m.code == current_mod);
+        let name_for_mod = name.clone();
+        let modifier_pick = pick_list(MODIFIER_CHOICES, selected, move |c| {
+            Message::CharacterModifierChanged(name_for_mod.clone(), c)
+        })
+        .width(Length::Fixed(80.0));
+
+        let binding_label = panel
+            .config
+            .character_hotkeys
+            .get(name)
+            .filter(|h| h.vk != 0)
+            .map(|h| code_to_label(h.vk))
+            .unwrap_or_else(|| "none".into());
+
+        let mut row2 = row![
+            Space::new().width(Length::Fixed(20.0)),
+            text("Hotkey:"),
+            modifier_pick,
+            bind_button(
+                panel,
+                CaptureTarget::Character(name.clone()),
+                binding_label,
+                110.0
+            ),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        if panel.config.character_hotkeys.contains_key(name) {
+            let n = name.clone();
+            row2 = row2.push(button(text("✕")).on_press(Message::ClearCharacterHotkey(n)));
+        }
+
+        let is_dragged = panel.dragging == Some(i);
+        let is_target = panel.dragging.is_some() && panel.drag_hover == Some(i) && !is_dragged;
+        let block = container(column![row1, row2].spacing(2))
+            .padding(6)
+            .style(move |_| drag_row_style(is_dragged, is_target));
+        col = col.push(
+            mouse_area(block)
+                .on_enter(Message::HoverRow(i))
+                .on_exit(Message::UnhoverRow(i)),
+        );
+    }
+
+    col = col.push(
+        row![
+            text("Add:"),
+            text_input("new character", &panel.new_character_buffer)
+                .on_input(Message::NewCharacterChanged)
+                .on_submit(Message::AddCharacter)
+                .width(Length::Fill),
+            button(text("+")).on_press(Message::AddCharacter),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    );
+
+    col.into()
+}
+
+fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
+    let forward = bind_row(
+        panel,
+        "Forward:",
+        CaptureTarget::ForwardKey,
+        code_to_label(panel.config.forward_key),
+    );
+    let backward = bind_row(
+        panel,
+        "Backward:",
+        CaptureTarget::BackwardKey,
+        code_to_label(panel.config.backward_key),
+    );
+
+    let modifier_label = match panel.config.modifier_key {
+        Some(vk) => code_to_label(vk),
+        None => "None".to_string(),
+    };
+    let mut modifier = bind_row(
+        panel,
+        "Modifier:",
+        CaptureTarget::ModifierKey,
+        modifier_label,
+    );
+    if panel.config.modifier_key.is_some() {
+        modifier = modifier.push(button(text("Clear")).on_press(Message::ClearModifier));
+    }
+
+    column![
+        section_header("Keyboard Hotkeys"),
+        checkbox(panel.config.enable_keyboard_buttons)
+            .label("Enable keyboard cycling")
+            .on_toggle(Message::KeyboardEnabledToggled),
+        forward,
+        backward,
+        modifier,
+        caption(
+            "Click a binding to record the next key you press. Esc cancels. Set both keys to the \
+             same value with a modifier to cycle backward via modifier+key (e.g. Tab + Shift+Tab)."
+        ),
+        checkbox(panel.config.enable_mouse_buttons)
+            .label("Cycle on mouse side buttons (XBUTTON1/XBUTTON2)")
+            .on_toggle(Message::MouseEnabledToggled),
+        caption(
+            "Off by default. Turn on only if you don't already remap your mouse side buttons via \
+             driver software (Logi Options+, Razer Synapse, etc.)."
+        ),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn previews_section(panel: &Panel) -> Element<'_, Message> {
+    column![
+        section_header("Preview Windows"),
+        checkbox(panel.config.show_previews)
+            .label("Show preview windows")
+            .on_toggle(Message::ShowPreviewsToggled),
+        row![
+            text("Width:").width(Length::Fixed(70.0)),
+            slider(
+                120..=800u32,
+                panel.config.preview_width,
+                Message::PreviewWidthChanged
+            )
+            .step(1u32),
+            text(format!("{} px", panel.config.preview_width)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+        row![
+            text("Height:").width(Length::Fixed(70.0)),
+            slider(
+                80..=600u32,
+                panel.config.preview_height,
+                Message::PreviewHeightChanged
+            )
+            .step(1u32),
+            text(format!("{} px", panel.config.preview_height)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(8)
+    .into()
+}
+
+/// A labeled key-binding row (`<label>  [ bind chip ]`) for the
+/// Forward/Backward/Modifier entries on the Hotkeys tab.
+fn bind_row(
+    panel: &Panel,
+    label: &'static str,
+    target: CaptureTarget,
+    current: String,
+) -> iced::widget::Row<'static, Message> {
+    row![
+        text(label).width(Length::Fixed(90.0)),
+        bind_button(panel, target, current, 200.0),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+}
+
+fn bind_button(
+    panel: &Panel,
+    target: CaptureTarget,
+    label: String,
+    width: f32,
+) -> Element<'static, Message> {
+    let is_capturing = panel.capturing.as_ref() == Some(&target);
+    let txt = if is_capturing {
+        "[press key — Esc]".to_string()
+    } else {
+        label
+    };
+    button(text(txt))
+        .width(Length::Fixed(width))
+        .on_press(Message::StartCapture(target))
+        .style(move |_theme, status| {
+            if is_capturing {
+                // Armed and listening for the next key.
+                button::Style {
+                    background: Some(Background::Color(NICOTINE_GOLD)),
+                    text_color: NICOTINE_BLACK,
+                    border: Border {
+                        color: NICOTINE_RED,
+                        width: 1.5,
+                        radius: 4.0_f32.into(),
+                    },
+                    ..button::Style::default()
+                }
+            } else {
+                // Neutral outlined chip showing the current binding.
+                let background =
+                    matches!(status, button::Status::Hovered).then_some(Background::Color(Color {
+                        a: 0.18,
+                        ..NICOTINE_GOLD
+                    }));
+                button::Style {
+                    background,
+                    text_color: NICOTINE_BLACK,
+                    border: Border {
+                        color: NICOTINE_GOLD,
+                        width: 1.0,
+                        radius: 4.0_f32.into(),
+                    },
+                    ..button::Style::default()
+                }
+            }
+        })
+        .into()
 }
