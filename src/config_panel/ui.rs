@@ -10,8 +10,9 @@ use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, 
 use crate::config::DisplayMode;
 
 use super::{
-    code_to_label, CaptureTarget, Message, Panel, Tab, CAPTION_SIZE, LOGO_SIZE, MODIFIER_CHOICES,
-    NICOTINE_BLACK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED, SECTION_SIZE,
+    code_to_label, CaptureTarget, Message, Panel, SliderField, Tab, CAPTION_SIZE, LOGO_SIZE,
+    MODIFIER_CHOICES, NICOTINE_BLACK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED,
+    SECTION_SIZE,
 };
 
 const LOGO_FONT: Font = Font::with_name("Marlboro");
@@ -408,32 +409,48 @@ fn previews_section(panel: &Panel) -> Element<'_, Message> {
         checkbox(panel.config.show_previews)
             .label("Show preview windows")
             .on_toggle(Message::ShowPreviewsToggled),
-        row![
-            text("Width:").width(Length::Fixed(70.0)),
-            slider(
-                120..=800u32,
-                panel.config.preview_width,
-                Message::PreviewWidthChanged
-            )
-            .step(1u32),
-            text(format!("{} px", panel.config.preview_width)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-        row![
-            text("Height:").width(Length::Fixed(70.0)),
-            slider(
-                80..=600u32,
-                panel.config.preview_height,
-                Message::PreviewHeightChanged
-            )
-            .step(1u32),
-            text(format!("{} px", panel.config.preview_height)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
+        slider_field(
+            panel,
+            SliderField::PreviewWidth,
+            "Width:",
+            panel.config.preview_width
+        ),
+        slider_field(
+            panel,
+            SliderField::PreviewHeight,
+            "Height:",
+            panel.config.preview_height,
+        ),
     ]
     .spacing(8)
+    .into()
+}
+
+/// A slider with a typable numeric readout: click the value, type an exact
+/// number, press Enter and the slider snaps to it. The text mirrors the
+/// value except while you're mid-edit. Reused for every slider.
+fn slider_field<'a>(
+    panel: &'a Panel,
+    field: SliderField,
+    label: &'static str,
+    value: u32,
+) -> Element<'a, Message> {
+    let buffer = panel
+        .slider_text
+        .get(&field)
+        .map(String::as_str)
+        .unwrap_or("");
+    row![
+        text(label).width(Length::Fixed(70.0)),
+        slider(field.range(), value, move |v| field.change_message(v)).step(1u32),
+        text_input("", buffer)
+            .on_input(move |s| Message::SliderTextChanged(field, s))
+            .on_submit(Message::SliderTextCommit(field))
+            .width(Length::Fixed(56.0)),
+        text("px"),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
     .into()
 }
 

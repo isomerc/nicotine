@@ -1,5 +1,6 @@
 use crate::config::{CharacterHotkey, Config, LiveSettings};
 use iced::{Color, Element, Subscription, Task, Theme};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -67,6 +68,53 @@ pub(super) enum Tab {
     Display,
     Characters,
     Hotkeys,
+}
+
+/// A slider whose value can also be typed into its readout. Centralizes the
+/// per-slider range and apply-message so the view helper and `update` agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum SliderField {
+    PreviewWidth,
+    PreviewHeight,
+}
+
+impl SliderField {
+    pub(super) fn range(self) -> std::ops::RangeInclusive<u32> {
+        match self {
+            SliderField::PreviewWidth => 120..=800,
+            SliderField::PreviewHeight => 80..=600,
+        }
+    }
+
+    /// The message that applies a value — shared by dragging the slider and
+    /// committing a typed value, so both go through the same code path.
+    pub(super) fn change_message(self, value: u32) -> Message {
+        match self {
+            SliderField::PreviewWidth => Message::PreviewWidthChanged(value),
+            SliderField::PreviewHeight => Message::PreviewHeightChanged(value),
+        }
+    }
+
+    /// Parse and clamp a typed readout value to the slider's range. `None`
+    /// if the text isn't a usable number (empty / non-numeric / overflow),
+    /// in which case the readout should snap back to the live value.
+    fn parse_input(self, text: &str) -> Option<u32> {
+        let value = text.parse::<u32>().ok()?;
+        let range = self.range();
+        Some(value.clamp(*range.start(), *range.end()))
+    }
+
+    fn current_value(self, panel: &Panel) -> u32 {
+        match self {
+            SliderField::PreviewWidth => panel.config.preview_width,
+            SliderField::PreviewHeight => panel.config.preview_height,
+        }
+    }
+}
+
+/// Keep only ASCII digits — constrains the editable slider readouts.
+fn digits_only(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
 /// One entry in the modifier dropdown. Codes are platform-specific:
@@ -146,6 +194,10 @@ pub(super) struct Panel {
     /// Bounds the post-launch poll so it can't spin forever if the check
     /// never returns (e.g. offline).
     pub version_polls: u8,
+    /// In-progress text for each editable slider readout, keyed by field.
+    /// Mirrors the value except while the user is typing, until they press
+    /// Enter (commit) or drag the slider (re-sync).
+    pub slider_text: HashMap<SliderField, String>,
 }
 
 impl Panel {
@@ -154,10 +206,17 @@ impl Panel {
         live: Arc<Mutex<LiveSettings>>,
         audio: std::sync::mpsc::Sender<()>,
     ) -> Self {
+        let mut slider_text = HashMap::new();
+        slider_text.insert(SliderField::PreviewWidth, config.preview_width.to_string());
+        slider_text.insert(
+            SliderField::PreviewHeight,
+            config.preview_height.to_string(),
+        );
         Self {
             config,
             live,
             audio,
+            slider_text,
             new_character_buffer: String::new(),
             capturing: None,
             last_change: None,
@@ -267,6 +326,8 @@ pub(super) enum Message {
     ShowPreviewsToggled(bool),
     PreviewWidthChanged(u32),
     PreviewHeightChanged(u32),
+    SliderTextChanged(SliderField, String),
+    SliderTextCommit(SliderField),
     OpenLink(String),
     FlushIfIdle,
     VersionPoll,
@@ -411,12 +472,39 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         Message::PreviewWidthChanged(w) => {
             panel.config.preview_width = w;
             panel.live.lock().unwrap().preview_width = w;
+            panel
+                .slider_text
+                .insert(SliderField::PreviewWidth, w.to_string());
             panel.touch();
         }
         Message::PreviewHeightChanged(h) => {
             panel.config.preview_height = h;
             panel.live.lock().unwrap().preview_height = h;
+            panel
+                .slider_text
+                .insert(SliderField::PreviewHeight, h.to_string());
             panel.touch();
+        }
+        Message::SliderTextChanged(field, s) => {
+            panel.slider_text.insert(field, digits_only(&s));
+        }
+        Message::SliderTextCommit(field) => {
+            let parsed = field.parse_input(
+                panel
+                    .slider_text
+                    .get(&field)
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            );
+            if let Some(v) = parsed {
+                panel.slider_text.insert(field, v.to_string());
+                // Re-dispatch the field's change message so the value applies
+                // through the same path as dragging (and snaps the slider).
+                return Task::done(field.change_message(v));
+            }
+            // Invalid / empty input — restore the readout to the live value.
+            let current = field.current_value(panel);
+            panel.slider_text.insert(field, current.to_string());
         }
         Message::OpenLink(url) => {
             open_url(&url);
@@ -983,6 +1071,16 @@ mod tests {
         // A printable key arrives as Key::Character; ensure letters/digits map.
         assert!(iced_key_to_code(&Key::Character("a".into())).is_some());
         assert!(iced_key_to_code(&Key::Character("1".into())).is_some());
+    }
+
+    #[test]
+    fn slider_input_clamps_typed_value_to_range() {
+        for field in [SliderField::PreviewWidth, SliderField::PreviewHeight] {
+            let r = field.range();
+            assert_eq!(field.parse_input("999999"), Some(*r.end()));
+            assert_eq!(field.parse_input("0"), Some(*r.start()));
+            assert_eq!(field.parse_input(""), None);
+        }
     }
 
     #[cfg(windows)]
