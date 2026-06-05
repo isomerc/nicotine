@@ -94,3 +94,48 @@ pub fn detect_wayland_compositor() -> WaylandCompositor {
 
     WaylandCompositor::Other
 }
+
+/// Whether the running session can honor `stack_windows` (move/resize EVE
+/// clients to absolute coordinates). This is the ONE operation GNOME's
+/// Wayland session forbids: Mutter implements no client-facing window
+/// positioning, so an X11/EWMH move-resize on an XWayland window is
+/// silently dropped. Every other session — plain X11, GNOME-on-Xorg
+/// (positioning works under a real X server), KWin, Sway, Hyprland —
+/// supports it. The config panel uses this to hide the Restack button
+/// where it would do nothing.
+#[cfg(unix)]
+pub fn restack_supported(server: DisplayServer, compositor: WaylandCompositor) -> bool {
+    !(server == DisplayServer::Wayland && compositor == WaylandCompositor::Gnome)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restack_unsupported_only_on_gnome_wayland() {
+        // The single blocked case.
+        assert!(!restack_supported(
+            DisplayServer::Wayland,
+            WaylandCompositor::Gnome
+        ));
+        // GNOME-on-Xorg keeps positioning — it's a real X server, so the
+        // compositor value is GNOME but the server is X11 and restack works.
+        assert!(restack_supported(
+            DisplayServer::X11,
+            WaylandCompositor::Gnome
+        ));
+        // Every other Wayland compositor supports positioning.
+        for c in [
+            WaylandCompositor::Kde,
+            WaylandCompositor::Sway,
+            WaylandCompositor::Hyprland,
+            WaylandCompositor::Other,
+        ] {
+            assert!(
+                restack_supported(DisplayServer::Wayland, c),
+                "{c:?} should support restack"
+            );
+        }
+    }
+}
