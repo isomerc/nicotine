@@ -418,6 +418,8 @@ pub(super) enum Message {
     OpenLink(String),
     FlushIfIdle,
     VersionPoll,
+    WindowResized(u32, u32),
+    CloseRequested,
 }
 
 fn update(panel: &mut Panel, message: Message) -> Task<Message> {
@@ -678,6 +680,29 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             // the footer pick up the version-check result once it lands.
             panel.version_polls = panel.version_polls.saturating_add(1);
         }
+        Message::WindowResized(w, h) => {
+            // Persist the panel size so it survives restarts. Only mark dirty
+            // on an actual change, so the Resized event iced emits at startup
+            // (and resizes that return to the same size) don't trigger
+            // redundant disk writes.
+            if w != panel.config.window_width || h != panel.config.window_height {
+                panel.config.window_width = w;
+                panel.config.window_height = h;
+                panel.touch();
+            }
+        }
+        Message::CloseRequested => {
+            // The window is closing — flush a pending edit (e.g. a resize made
+            // within the autosave debounce) before we exit, so it isn't lost.
+            // Paired with `exit_on_close_request(false)` so we control teardown;
+            // `exit()` then ends the runtime (and tears the window down).
+            if panel.last_change.take().is_some() {
+                if let Err(e) = panel.config.save() {
+                    eprintln!("config save on close failed: {e}");
+                }
+            }
+            return iced::exit();
+        }
     }
     Task::none()
 }
@@ -745,6 +770,14 @@ fn subscription(panel: &Panel) -> Subscription<Message> {
     if panel.version_polls < 20 && crate::version_check::get_update_status().is_none() {
         subs.push(iced::time::every(Duration::from_millis(700)).map(|_| Message::VersionPoll));
     }
+    // Persist panel window resizes. Always subscribed, but only fires on an
+    // actual resize; the handler no-ops unless the size really changed.
+    subs.push(iced::window::resize_events().map(|(_id, size)| {
+        Message::WindowResized(size.width.round() as u32, size.height.round() as u32)
+    }));
+    // Save-on-close: flush a just-made resize the debounce hasn't written yet.
+    // Paired with `exit_on_close_request(false)` in `run`.
+    subs.push(iced::window::close_requests().map(|_| Message::CloseRequested));
     Subscription::batch(subs)
 }
 
@@ -1143,7 +1176,9 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
     // there to keep `-D warnings` green.
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut window = iced::window::Settings {
-        size: iced::Size::new(720.0, 680.0),
+        // Restore the user's last panel size; defaults match the original
+        // fixed size. `min_size` still clamps absurdly small persisted values.
+        size: iced::Size::new(config.window_width as f32, config.window_height as f32),
         min_size: Some(iced::Size::new(560.0, 420.0)),
         resizable: true,
         icon,
@@ -1170,6 +1205,9 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
     })
     .theme(theme)
     .subscription(subscription)
+    // We handle close ourselves (flush a pending resize before exit); see the
+    // CloseRequested message + close_requests subscription.
+    .exit_on_close_request(false)
     .default_font(iced::Font::with_name("JetBrains Mono"))
     .font(include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf").as_slice())
     .font(include_bytes!("../../assets/fonts/Marlboro.ttf").as_slice())
