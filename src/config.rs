@@ -157,6 +157,13 @@ pub struct Config {
     /// without reassigning keys.
     #[serde(default)]
     pub character_hotkeys: HashMap<String, CharacterHotkey>,
+    /// Config-panel window size in logical pixels. Persisted so a manual
+    /// resize of the panel survives restarts; defaults to the original
+    /// fixed window size.
+    #[serde(default = "default_window_width")]
+    pub window_width: u32,
+    #[serde(default = "default_window_height")]
+    pub window_height: u32,
 }
 
 #[cfg(unix)]
@@ -272,6 +279,14 @@ fn default_display_mode() -> DisplayMode {
     DisplayMode::Previews
 }
 
+fn default_window_width() -> u32 {
+    720
+}
+
+fn default_window_height() -> u32 {
+    680
+}
+
 impl Config {
     /// Resolve the directory holding `config.toml`. Production callers
     /// get the platform-standard config dir (XDG on Linux, Roaming
@@ -380,6 +395,8 @@ impl Config {
             display_mode: default_display_mode(),
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            window_width: default_window_width(),
+            window_height: default_window_height(),
         }
     }
 
@@ -437,6 +454,8 @@ mod tests {
             display_width: 1920,
             display_height: 1080,
             panel_height: 40,
+            window_width: 720,
+            window_height: 680,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -474,6 +493,8 @@ mod tests {
             display_width: 1920,
             display_height: 1080,
             panel_height: 0,
+            window_width: 720,
+            window_height: 680,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -510,6 +531,8 @@ mod tests {
             display_width: 7680,
             display_height: 2160,
             panel_height: 0,
+            window_width: 900,
+            window_height: 800,
             eve_width: 4147,
             eve_height: 2160,
             enable_mouse_buttons: true,
@@ -563,6 +586,14 @@ mod tests {
             deserialized.toggle_previews_modifier,
             Some(42),
             "toggle_previews_modifier must survive a save/load round-trip"
+        );
+        assert_eq!(
+            deserialized.window_width, 900,
+            "window_width must survive a save/load round-trip"
+        );
+        assert_eq!(
+            deserialized.window_height, 800,
+            "window_height must survive a save/load round-trip"
         );
     }
 }
