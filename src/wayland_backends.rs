@@ -1,10 +1,11 @@
 use crate::config::Config;
+use crate::pointer_nudge::{schedule_nudge, PointerNudger};
 use crate::window_manager::{EveWindow, WindowManager};
 use crate::xdg_activation::XdgActivation;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as _, EventMask, InputFocus,
@@ -165,6 +166,11 @@ pub struct KWinManager {
     /// activate_window falls back to the token-less EWMH path in that
     /// case, which matches the pre-token behavior.
     xdg_activation: Option<XdgActivation>,
+    /// Lazily-created virtual pointer for the Wayland pointer-focus nudge
+    /// (see `pointer_nudge`). Built on first activation so one-shot CLI
+    /// commands that never activate a window don't spawn a uinput device.
+    /// A cached `None` means uinput wasn't available.
+    pointer_nudger: OnceLock<Option<PointerNudger>>,
 }
 
 impl KWinManager {
@@ -206,6 +212,7 @@ impl KWinManager {
             net_startup_id_atom,
             wm_change_state_atom,
             xdg_activation,
+            pointer_nudger: OnceLock::new(),
         })
     }
 
@@ -320,7 +327,11 @@ impl WindowManager for KWinManager {
             self.net_startup_id_atom,
             &self.xdg_activation,
             window_id,
-        )
+        )?;
+        // Pointer-focus nudge: KWin won't re-target clicks to the newly
+        // raised client until the pointer moves. See `pointer_nudge`.
+        schedule_nudge(&self.pointer_nudger);
+        Ok(())
     }
 
     fn stack_windows(&self, windows: &[EveWindow], config: &Config) -> Result<()> {
@@ -789,6 +800,10 @@ pub struct GnomeManager {
     /// token-less EWMH path. Mutter advertises xdg_activation_v1, so this
     /// is normally `Some`.
     xdg_activation: Option<XdgActivation>,
+    /// Lazily-created virtual pointer for the Wayland pointer-focus nudge
+    /// (see `pointer_nudge`). Same rationale as the KWin backend — Mutter
+    /// also only re-targets clicks on pointer motion.
+    pointer_nudger: OnceLock<Option<PointerNudger>>,
 }
 
 impl GnomeManager {
@@ -831,6 +846,7 @@ impl GnomeManager {
             utf8_string_atom,
             wm_change_state_atom,
             xdg_activation,
+            pointer_nudger: OnceLock::new(),
         })
     }
 
@@ -943,7 +959,11 @@ impl WindowManager for GnomeManager {
             self.net_startup_id_atom,
             &self.xdg_activation,
             window_id,
-        )
+        )?;
+        // Pointer-focus nudge — Mutter, like KWin, only re-targets clicks
+        // on pointer motion. See `pointer_nudge`.
+        schedule_nudge(&self.pointer_nudger);
+        Ok(())
     }
 
     fn stack_windows(&self, _windows: &[EveWindow], _config: &Config) -> Result<()> {
