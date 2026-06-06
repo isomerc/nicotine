@@ -241,7 +241,6 @@ fn stop_command() {
         .args(["-9", "-i", "nicotine"])
         .output();
     let _ = std::fs::remove_file("/tmp/nicotine.sock");
-    let _ = std::fs::remove_file("/tmp/nicotine-index");
     let _ = std::fs::remove_file(paths::lock_file_path());
 }
 
@@ -254,7 +253,6 @@ fn stop_command() {
         .args(["/IM", "nicotine.exe", "/F"])
         .output();
     let _ = std::fs::remove_file(paths::lock_file_path());
-    let _ = std::fs::remove_file(paths::index_file_path());
 }
 
 fn run_cycle_direct(wm: &Arc<dyn WindowManager>, config: &Config, op: CycleOp) -> Result<()> {

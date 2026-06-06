@@ -93,6 +93,40 @@ fn ewmh_active_window(
     Ok(reply.value32().and_then(|mut v| v.next()).unwrap_or(0))
 }
 
+/// Iconify (minimize) an XWayland window via an ICCCM `WM_CHANGE_STATE` →
+/// IconicState(3) ClientMessage. Sent on the caller's *own* X connection so
+/// the WM processes it in order relative to an `ewmh_activate` issued on the
+/// same connection: minimizing the previously-focused client can't race
+/// ahead of the new client's activation and make the compositor fall back to
+/// an arbitrary focus. (The previous KWin path shelled out to `xdotool`,
+/// i.e. a *separate* X client, so the WM could iconify the still-focused old
+/// window before our activation landed.)
+fn ewmh_iconify(
+    conn: &RustConnection,
+    screen_num: usize,
+    wm_change_state_atom: u32,
+    window_id: u32,
+) -> Result<()> {
+    let root = conn.setup().roots[screen_num].root;
+    let event = ClientMessageEvent {
+        response_type: CLIENT_MESSAGE_EVENT,
+        format: 32,
+        sequence: 0,
+        window: window_id,
+        type_: wm_change_state_atom,
+        data: ClientMessageData::from([3, 0, 0, 0, 0]),
+    };
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+        event,
+    )
+    .context("send WM_CHANGE_STATE")?;
+    conn.flush()?;
+    Ok(())
+}
+
 // ============================================================================
 // KDE Plasma / KWin Backend
 // ============================================================================
@@ -121,6 +155,10 @@ pub struct KWinManager {
     /// sending the EWMH activate ClientMessage so KWin can promote the
     /// activation to Wayland surface focus, not just X11 focus.
     net_startup_id_atom: u32,
+    /// `WM_CHANGE_STATE` — ICCCM iconify carrier. `minimize_window` sends
+    /// IconicState through this on `conn` (not via a `xdotool` subprocess)
+    /// so the iconify is ordered after activate on the same connection.
+    wm_change_state_atom: u32,
     /// Wayland-side companion that mints activation tokens. `None`
     /// means we couldn't set it up — either we're not on a Wayland
     /// session, or the compositor doesn't advertise xdg_activation_v1.
@@ -144,6 +182,7 @@ impl KWinManager {
             .reply()?
             .atom;
         let net_startup_id_atom = conn.intern_atom(false, b"_NET_STARTUP_ID")?.reply()?.atom;
+        let wm_change_state_atom = conn.intern_atom(false, b"WM_CHANGE_STATE")?.reply()?.atom;
 
         // Best-effort: open the Wayland connection for xdg-activation
         // tokens. Failures here are expected on X11-only sessions and on
@@ -165,6 +204,7 @@ impl KWinManager {
             screen_num,
             net_active_window_atom,
             net_startup_id_atom,
+            wm_change_state_atom,
             xdg_activation,
         })
     }
@@ -313,12 +353,15 @@ impl WindowManager for KWinManager {
     }
 
     fn minimize_window(&self, window_id: u32) -> Result<()> {
-        let hex_id = format!("0x{:08x}", window_id);
-        Command::new("xdotool")
-            .args(["windowminimize", &hex_id])
-            .output()
-            .context("Failed to minimize window")?;
-        Ok(())
+        // Iconify on our own X connection (see `ewmh_iconify`) so it's
+        // ordered after the activation of the newly-focused client, instead
+        // of racing it via a separate `xdotool` connection.
+        ewmh_iconify(
+            &self.conn,
+            self.screen_num,
+            self.wm_change_state_atom,
+            window_id,
+        )
     }
 
     fn restore_window(&self, window_id: u32) -> Result<()> {
@@ -921,28 +964,14 @@ impl WindowManager for GnomeManager {
     }
 
     fn minimize_window(&self, window_id: u32) -> Result<()> {
-        // ICCCM iconify: send WM_CHANGE_STATE → IconicState (3) to the root.
-        // This is exactly what XIconifyWindow does; Mutter honors it for X11
-        // windows under XWayland.
-        let root = self.conn.setup().roots[self.screen_num].root;
-        let event = ClientMessageEvent {
-            response_type: CLIENT_MESSAGE_EVENT,
-            format: 32,
-            sequence: 0,
-            window: window_id,
-            type_: self.wm_change_state_atom,
-            data: ClientMessageData::from([3, 0, 0, 0, 0]),
-        };
-        self.conn
-            .send_event(
-                false,
-                root,
-                EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
-                event,
-            )
-            .context("send WM_CHANGE_STATE")?;
-        self.conn.flush()?;
-        Ok(())
+        // ICCCM iconify (WM_CHANGE_STATE → IconicState). Mutter honors it for
+        // XWayland windows. Shared with the KWin backend — see `ewmh_iconify`.
+        ewmh_iconify(
+            &self.conn,
+            self.screen_num,
+            self.wm_change_state_atom,
+            window_id,
+        )
     }
 
     fn restore_window(&self, window_id: u32) -> Result<()> {

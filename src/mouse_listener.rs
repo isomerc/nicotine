@@ -25,7 +25,7 @@ use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct MouseConfig {
@@ -54,6 +54,14 @@ impl MouseConfig {
 /// listener noticing. 200 ms is responsive without burning CPU.
 const POLL_TIMEOUT_MS: u16 = 200;
 
+/// Coalescing window for cycle triggers. Some mice expose the same physical
+/// side buttons on two `/dev/input/event*` nodes, so one click is delivered
+/// twice; in autodetect mode we listen on both, which would cycle twice. A
+/// second trigger within this window is dropped. 30 ms is far below a human
+/// double-press (caps cycling at ~33/s) but well above the sub-millisecond
+/// gap between a duplicated press's two reports.
+const CYCLE_DEBOUNCE: Duration = Duration::from_millis(30);
+
 pub struct MouseListener;
 
 impl MouseListener {
@@ -79,6 +87,9 @@ impl MouseListener {
         let mut current_dev_key: (Option<String>, Option<String>) = (None, None);
         let mut announced_listening = false;
         let mut announced_idle = false;
+        // Last time we acted on a cycle trigger, for de-duping echoed presses
+        // across multiple device nodes. See `CYCLE_DEBOUNCE`.
+        let mut last_cycle: Option<Instant> = None;
 
         loop {
             let snap = shared.lock().unwrap().clone();
@@ -215,6 +226,16 @@ impl MouseListener {
                             continue;
                         }
                         let code = key.code();
+                        let is_cycle = code == snap.forward_button || code == snap.backward_button;
+                        if is_cycle {
+                            // Drop a duplicate press echoed by a second device
+                            // node within the debounce window.
+                            let now = Instant::now();
+                            if last_cycle.is_some_and(|t| now.duration_since(t) < CYCLE_DEBOUNCE) {
+                                continue;
+                            }
+                            last_cycle = Some(now);
+                        }
                         if code == snap.forward_button {
                             if let Err(e) = Self::cycle_forward(&wm, &state, snap.minimize_inactive)
                             {

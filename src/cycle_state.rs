@@ -1,7 +1,15 @@
-use crate::paths;
 use crate::window_manager::{EveWindow, WindowManager};
 use anyhow::Result;
-use std::fs;
+use std::time::{Duration, Instant};
+
+/// After Nicotine itself drives a focus change via `activate_window`, the
+/// compositor commits that focus asynchronously and only then updates
+/// `_NET_ACTIVE_WINDOW`. For this long we treat our own `current_index` as
+/// the source of truth and skip `sync_with_active`, so a fast burst of
+/// cycles isn't rewound to a stale read of the compositor's lagging focus.
+/// Once it elapses (the user has paused), the next sync is honored so a
+/// manual alt-tab / click switch is still picked up.
+const ACTIVATION_GRACE: Duration = Duration::from_millis(300);
 
 pub struct CycleState {
     current_index: usize,
@@ -11,6 +19,10 @@ pub struct CycleState {
     /// listed names that aren't currently logged in. When None, cycles
     /// through windows in whatever order the window manager reports them.
     character_order: Option<Vec<String>>,
+    /// When we last drove an activation ourselves. Gates `sync_with_active`
+    /// against the compositor's asynchronous focus commit — see
+    /// `ACTIVATION_GRACE`.
+    last_activated: Option<Instant>,
 }
 
 impl CycleState {
@@ -19,6 +31,7 @@ impl CycleState {
             current_index: 0,
             windows: Vec::new(),
             character_order: None,
+            last_activated: None,
         }
     }
 
@@ -53,8 +66,21 @@ impl CycleState {
     }
 
     pub fn update_windows(&mut self, windows: Vec<EveWindow>) {
+        // Preserve which client we're on across a wholesale list rebuild.
+        // `current_index` is positional, but the periodic rescan can return
+        // windows in a different order or with an entry added/removed (a
+        // client opened or closed). Without remapping by id, the index would
+        // silently start pointing at a *different* client and the next cycle
+        // would compute from the wrong base. Fall back to a clamp only when
+        // the window we were on is genuinely gone.
+        let current_id = self.windows.get(self.current_index).map(|w| w.id);
         self.windows = windows;
-        // Clamp current index
+        if let Some(id) = current_id {
+            if let Some(pos) = self.windows.iter().position(|w| w.id == id) {
+                self.current_index = pos;
+                return;
+            }
+        }
         if self.current_index >= self.windows.len() && !self.windows.is_empty() {
             self.current_index = 0;
         }
@@ -93,18 +119,19 @@ impl CycleState {
             // foreground (in case another app stole focus) and return.
             let id = self.windows[target_idx].id;
             wm.activate_window(id)?;
+            self.last_activated = Some(Instant::now());
             return Ok(());
         }
 
         let previous_index = self.current_index;
         self.current_index = target_idx;
-        self.write_index();
 
         let new_id = self.windows[target_idx].id;
         if minimize_inactive {
             let _ = wm.restore_window(new_id);
         }
         wm.activate_window(new_id)?;
+        self.last_activated = Some(Instant::now());
         if minimize_inactive {
             let prev_id = self.windows[previous_index].id;
             let _ = wm.minimize_window(prev_id);
@@ -164,7 +191,6 @@ impl CycleState {
 
         let previous_index = self.current_index;
         self.current_index = cycle[next_position];
-        self.write_index();
 
         let new_window_id = self.windows[self.current_index].id;
 
@@ -173,6 +199,7 @@ impl CycleState {
         }
 
         wm.activate_window(new_window_id)?;
+        self.last_activated = Some(Instant::now());
 
         if minimize_inactive && previous_index != self.current_index {
             let previous_window_id = self.windows[previous_index].id;
@@ -182,26 +209,10 @@ impl CycleState {
         Ok(())
     }
 
-    fn write_index(&self) {
-        let _ = fs::write(paths::index_file_path(), self.current_index.to_string());
-    }
-
-    // The next three methods are called by the Linux overlay and the
-    // unit tests but not by any release-mode Windows code path.
-    // `#[allow(dead_code)]` keeps them defined cross-platform without
-    // tripping the Windows `cargo clippy -- -D warnings` job.
-
-    #[allow(dead_code)]
-    pub fn read_index_from_file() -> Option<usize> {
-        let path = paths::index_file_path();
-        if path.exists() {
-            fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-        } else {
-            None
-        }
-    }
+    // The accessors below are used by the unit tests and the preview
+    // managers but not by every release code path; `#[allow(dead_code)]`
+    // keeps them defined cross-platform without tripping the Windows
+    // `cargo clippy -- -D warnings` job.
 
     /// Windows preview manager reads this for paint; on Linux the
     /// XComposite preview manager enumerates X11 windows directly so
@@ -224,6 +235,18 @@ impl CycleState {
     }
 
     pub fn sync_with_active(&mut self, active_window: u32) {
+        // Within the grace window after our own activation, the compositor's
+        // reported active window may still be the *previous* one — its focus
+        // commit is asynchronous. Trust `current_index` rather than rewinding
+        // to that stale read, which is what made rapid cycling "jump back" or
+        // skip. Once grace elapses (the user paused), honor the report so a
+        // manual alt-tab / click switch is still picked up. See
+        // `ACTIVATION_GRACE`.
+        if let Some(at) = self.last_activated {
+            if at.elapsed() < ACTIVATION_GRACE {
+                return;
+            }
+        }
         // Find which window is active and update current_index
         for (i, window) in self.windows.iter().enumerate() {
             if window.id == active_window {
@@ -287,7 +310,6 @@ impl CycleState {
 
         let previous_index = self.current_index;
         self.current_index = target_index;
-        self.write_index();
 
         let new_window_id = self.windows[self.current_index].id;
 
@@ -296,6 +318,7 @@ impl CycleState {
         }
 
         wm.activate_window(new_window_id)?;
+        self.last_activated = Some(Instant::now());
 
         if minimize_inactive {
             let previous_window_id = self.windows[previous_index].id;
@@ -753,5 +776,97 @@ mod tests {
 
         assert_eq!(wm.get_activated(), vec![200]);
         assert_eq!(state.get_current_index(), 1);
+    }
+
+    // --- activation-grace resync guard ------------------------------
+
+    #[test]
+    fn sync_is_ignored_within_activation_grace() {
+        // Regression guard for the rapid-cycle "jump back": right after we
+        // drive an activation, the compositor's _NET_ACTIVE_WINDOW can still
+        // report the previous window. sync_with_active must NOT rewind to it.
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(100, "Alpha"),
+            create_test_window(200, "Beta"),
+            create_test_window(300, "Gamma"),
+        ]);
+        state.current_index = 2; // we just cycled to Gamma
+        state.last_activated = Some(std::time::Instant::now());
+
+        // Compositor still reports the old window (Alpha) — must be ignored.
+        state.sync_with_active(100);
+        assert_eq!(state.get_current_index(), 2);
+    }
+
+    #[test]
+    fn sync_applies_after_activation_grace() {
+        // Once grace elapses, a genuine external focus change (user clicked /
+        // alt-tabbed to another client) is honored again.
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(100, "Alpha"),
+            create_test_window(200, "Beta"),
+            create_test_window(300, "Gamma"),
+        ]);
+        state.current_index = 2;
+        state.last_activated = std::time::Instant::now().checked_sub(ACTIVATION_GRACE * 2);
+        assert!(state.last_activated.is_some(), "test clock underflow");
+
+        state.sync_with_active(100);
+        assert_eq!(state.get_current_index(), 0);
+    }
+
+    #[test]
+    fn sync_applies_when_never_activated() {
+        // Fresh daemon, no activation yet: the first sync adopts whatever
+        // client is currently focused.
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(100, "Alpha"),
+            create_test_window(200, "Beta"),
+        ]);
+        assert!(state.last_activated.is_none());
+        state.sync_with_active(200);
+        assert_eq!(state.get_current_index(), 1);
+    }
+
+    // --- update_windows identity stability --------------------------
+
+    #[test]
+    fn update_windows_remaps_current_index_by_id_on_reorder() {
+        // The rescan can return the same clients in a different order. The
+        // index must follow the client we were on (by id), not stay put.
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(1, "A"),
+            create_test_window(2, "B"),
+            create_test_window(3, "C"),
+        ]);
+        state.current_index = 2; // on C (id 3)
+
+        // Same clients, reordered: C is now first.
+        state.update_windows(vec![
+            create_test_window(3, "C"),
+            create_test_window(1, "A"),
+            create_test_window(2, "B"),
+        ]);
+        assert_eq!(state.get_current_index(), 0); // still on C
+    }
+
+    #[test]
+    fn update_windows_falls_back_when_current_window_closes() {
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(1, "A"),
+            create_test_window(2, "B"),
+            create_test_window(3, "C"),
+        ]);
+        state.current_index = 2; // on C (id 3)
+
+        // C closed; only A and B remain. Index can't follow C, so it clamps
+        // back into range rather than pointing past the end.
+        state.update_windows(vec![create_test_window(1, "A"), create_test_window(2, "B")]);
+        assert_eq!(state.get_current_index(), 0);
     }
 }
