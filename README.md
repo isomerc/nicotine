@@ -23,7 +23,7 @@ High-performance EVE Online multiboxing tool for Linux (X11 & Wayland) and Windo
 - **Daemon architecture** for near-zero-latency window switching
 - **Auto-stack windows** to perfectly center multiple EVE clients
 - **Drag-to-position with snap-to-dock** on previews and the list window; lockable layout for play
-- **Multi-compositor support** — X11, KDE Plasma (Wayland), Sway, Hyprland
+- **Multi-compositor support** — X11, KDE Plasma (Wayland), Sway, Hyprland, GNOME (Wayland; auto-stack excepted)
 - **Minimize inactive clients** — optional, reduces resource usage when cycling away
 
 ## Roadmap
@@ -227,7 +227,7 @@ Nicotine supports both **X11** and **Wayland** (compositor-dependent):
 - **Wayland - KDE Plasma** - Full support via wmctrl (XWayland)
 - **Wayland - Sway** - Full support via swaymsg
 - **Wayland - Hyprland** - Full support via hyprctl
-- **Wayland - GNOME** - Not supported (restrictive APIs)
+- **Wayland - GNOME** - Cycling + preview windows work (via XWayland/EWMH); auto-stack is disabled because Mutter blocks applications from positioning windows. GNOME-on-Xorg supports everything.
 
 ### Dependencies
 
@@ -258,12 +258,12 @@ For **mouse button support**, add yourself to the `input` group (see Mouse Bindi
 **What works:**
 - Mouse buttons (native evdev support, no external tools needed)
 - Window detection and cycling (all supported compositors)
-- Window stacking (KDE/Sway/Hyprland)
+- Window stacking (KDE/Sway/Hyprland; not GNOME Wayland)
 - Preview windows (XComposite + XRender via XWayland)
 - Auto-detection of display server and compositor
 
 **Limitations:**
-- GNOME not supported (restrictive window management APIs)
+- GNOME (Wayland): auto-stacking is unavailable. Mutter does not let applications position windows, and there is no extension-free way around it. Client cycling and preview windows work normally via XWayland, and the Restack button is hidden on this session. GNOME-on-Xorg supports everything (including stacking), but note the GNOME Xorg session is being removed upstream (GNOME 49+/Fedora 43).
 
 ## Building from Source
 

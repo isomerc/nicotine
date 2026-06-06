@@ -57,7 +57,7 @@ use window_manager::WindowManager;
 #[cfg(unix)]
 use daemonize::Daemonize;
 #[cfg(unix)]
-use wayland_backends::{HyprlandManager, KWinManager, SwayManager};
+use wayland_backends::{GnomeManager, HyprlandManager, KWinManager, SwayManager};
 #[cfg(unix)]
 use window_manager::{
     detect_display_server, detect_wayland_compositor, DisplayServer, WaylandCompositor,
@@ -95,7 +95,11 @@ fn create_window_manager() -> Result<Arc<dyn WindowManager>> {
                     Ok(Arc::new(HyprlandManager::new()?))
                 }
                 WaylandCompositor::Gnome => {
-                    anyhow::bail!("GNOME Shell is not yet supported due to restrictive window management APIs")
+                    // GNOME runs EVE as XWayland clients; we drive them via
+                    // EWMH like the KWin backend. Restack is disabled (Mutter
+                    // blocks window positioning) — cycling + previews work.
+                    println!("Using GNOME/Mutter backend (XWayland EWMH; restack disabled)");
+                    Ok(Arc::new(GnomeManager::new()?))
                 }
                 WaylandCompositor::Other => {
                     anyhow::bail!(

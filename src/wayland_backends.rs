@@ -14,6 +14,86 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 // ============================================================================
+// Shared XWayland / EWMH helpers (KWin + GNOME)
+// ============================================================================
+//
+// Both the KWin and GNOME backends run EVE as XWayland clients and drive
+// focus through an EWMH `_NET_ACTIVE_WINDOW` ClientMessage rather than a
+// Wayland-native protocol. The activation primitive (xdg-activation token
+// stamped on `_NET_STARTUP_ID`, then a pager-sourced activate message) and
+// the active-window read are byte-for-byte identical across the two
+// compositors, so they live here instead of being duplicated per backend.
+
+/// Mint an xdg-activation token (best-effort) and send the EWMH activate
+/// ClientMessage for `window_id`. The token, stamped on `_NET_STARTUP_ID`,
+/// lets the compositor promote X11 focus to Wayland surface focus so the
+/// next click reaches EVE; source = 2 (pager) dodges the focus-stealing
+/// penalty applied to source = 1 (application). Token-mint failures are
+/// non-fatal — we fall through to the token-less EWMH path.
+fn ewmh_activate(
+    conn: &RustConnection,
+    screen_num: usize,
+    net_active_window_atom: u32,
+    net_startup_id_atom: u32,
+    xdg_activation: &Option<XdgActivation>,
+    window_id: u32,
+) -> Result<()> {
+    if let Some(activation) = xdg_activation {
+        match activation.request_token() {
+            Ok(token) => {
+                let _ = conn.change_property8(
+                    PropMode::REPLACE,
+                    window_id,
+                    net_startup_id_atom,
+                    AtomEnum::STRING,
+                    token.as_bytes(),
+                );
+            }
+            Err(e) => {
+                eprintln!("xdg_activation token request failed: {e:?}");
+            }
+        }
+    }
+
+    let screen = &conn.setup().roots[screen_num];
+    let event = ClientMessageEvent {
+        response_type: CLIENT_MESSAGE_EVENT,
+        format: 32,
+        sequence: 0,
+        window: window_id,
+        type_: net_active_window_atom,
+        data: ClientMessageData::from([2, x11rb::CURRENT_TIME, 0, 0, 0]),
+    };
+    conn.send_event(
+        false,
+        screen.root,
+        EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+        event,
+    )?;
+    // Belt-and-suspenders explicit focus for compositors that don't act on
+    // the ClientMessage alone under strict focus-stealing prevention.
+    let _ = conn.set_input_focus(InputFocus::PARENT, window_id, x11rb::CURRENT_TIME);
+    conn.flush()?;
+    Ok(())
+}
+
+/// Read `_NET_ACTIVE_WINDOW` off the root and return the focused window id
+/// (0 if unset / no X11 window focused).
+fn ewmh_active_window(
+    conn: &RustConnection,
+    screen_num: usize,
+    net_active_window_atom: u32,
+) -> Result<u32> {
+    let root = conn.setup().roots[screen_num].root;
+    let reply = conn
+        .get_property(false, root, net_active_window_atom, AtomEnum::WINDOW, 0, 1)
+        .context("get_property _NET_ACTIVE_WINDOW")?
+        .reply()
+        .context("get_property reply")?;
+    Ok(reply.value32().and_then(|mut v| v.next()).unwrap_or(0))
+}
+
+// ============================================================================
 // KDE Plasma / KWin Backend
 // ============================================================================
 //
@@ -189,64 +269,18 @@ impl WindowManager for KWinManager {
     }
 
     fn activate_window(&self, window_id: u32) -> Result<()> {
-        // xdg-activation bridge: if we have a Wayland connection, mint a
-        // fresh token and stamp it on the target's `_NET_STARTUP_ID`
-        // X11 property. KWin reads this property when handling the
-        // _NET_ACTIVE_WINDOW ClientMessage below, and uses the token to
-        // authorize Wayland surface focus — not just X11 focus —
-        // transferring to the target. Without the token, X11 focus moves
-        // but the next click on EVE is consumed by KWin's click-to-focus
-        // logic at the Wayland layer instead of being delivered to EVE.
-        //
-        // Token-mint failures (timeout, compositor declines, connection
-        // dropped) are non-fatal — we keep going through the existing
-        // EWMH path, matching the pre-token behavior.
-        if let Some(activation) = &self.xdg_activation {
-            match activation.request_token() {
-                Ok(token) => {
-                    let _ = self.conn.change_property8(
-                        PropMode::REPLACE,
-                        window_id,
-                        self.net_startup_id_atom,
-                        AtomEnum::STRING,
-                        token.as_bytes(),
-                    );
-                }
-                Err(e) => {
-                    eprintln!("xdg_activation token request failed: {e:?}");
-                }
-            }
-        }
-
-        // Send the EWMH activation message directly. wmctrl -i -a
-        // silently no-ops under KDE Wayland for XWayland clients; the
-        // ClientMessage path is what KWin actually honors.
-        let screen = &self.conn.setup().roots[self.screen_num];
-        let event = ClientMessageEvent {
-            response_type: CLIENT_MESSAGE_EVENT,
-            format: 32,
-            sequence: 0,
-            window: window_id,
-            type_: self.net_active_window_atom,
-            // EWMH source: 2 = pager (avoids the focus-stealing-
-            // prevention penalty KWin applies to source 1 = application).
-            data: ClientMessageData::from([2, x11rb::CURRENT_TIME, 0, 0, 0]),
-        };
-        self.conn.send_event(
-            false,
-            screen.root,
-            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
-            event,
-        )?;
-        // Belt-and-suspenders SetInputFocus for compositors that don't
-        // act on the ClientMessage alone. KWin alone is usually fine
-        // but a few KDE setups under strict focus-stealing-prevention
-        // need the explicit focus request.
-        let _ = self
-            .conn
-            .set_input_focus(InputFocus::PARENT, window_id, x11rb::CURRENT_TIME);
-        self.conn.flush()?;
-        Ok(())
+        // Shared XWayland/EWMH activation. `wmctrl -i -a` silently no-ops
+        // under KDE Wayland for XWayland clients, so we send the
+        // `_NET_ACTIVE_WINDOW` ClientMessage ourselves (with the
+        // xdg-activation token bridge); see `ewmh_activate`.
+        ewmh_activate(
+            &self.conn,
+            self.screen_num,
+            self.net_active_window_atom,
+            self.net_startup_id_atom,
+            &self.xdg_activation,
+            window_id,
+        )
     }
 
     fn stack_windows(&self, windows: &[EveWindow], config: &Config) -> Result<()> {
@@ -273,29 +307,9 @@ impl WindowManager for KWinManager {
     }
 
     fn get_active_window(&self) -> Result<u32> {
-        // Read _NET_ACTIVE_WINDOW directly via x11rb under XWayland.
-        // Previously shelled out to `xdotool getactivewindow`, which
-        // added a runtime dep and silently no-op'd the daemon's
-        // sync_with_active path on systems without xdotool installed —
-        // the cycle would drift when the user clicked an EVE client
-        // directly. The x11rb path matches what X11Manager already
-        // does and reuses the connection + atom we cache in new().
-        let root = self.conn.setup().roots[self.screen_num].root;
-        let reply = self
-            .conn
-            .get_property(
-                false,
-                root,
-                self.net_active_window_atom,
-                AtomEnum::WINDOW,
-                0,
-                1,
-            )
-            .context("get_property _NET_ACTIVE_WINDOW")?
-            .reply()
-            .context("get_property reply")?;
-        let active = reply.value32().and_then(|mut v| v.next()).unwrap_or(0);
-        Ok(active)
+        // Read _NET_ACTIVE_WINDOW directly via x11rb under XWayland —
+        // matches what X11Manager does and avoids an `xdotool` runtime dep.
+        ewmh_active_window(&self.conn, self.screen_num, self.net_active_window_atom)
     }
 
     fn minimize_window(&self, window_id: u32) -> Result<()> {
@@ -691,5 +705,248 @@ impl WindowManager for HyprlandManager {
             .output()
             .context("Failed to restore window")?;
         Ok(())
+    }
+}
+
+// ============================================================================
+// GNOME / Mutter Backend (XWayland + EWMH, no restack)
+// ============================================================================
+//
+// GNOME Shell on Wayland exposes no client-facing window-management IPC and
+// deliberately implements no wlroots control protocol, so — like every other
+// backend — we drive EVE (which runs as XWayland X11 windows under Proton)
+// through the X server directly. Enumeration reads `_NET_CLIENT_LIST` and
+// filters by the EVE title + process identity; activation reuses the shared
+// EWMH path (xdg-activation token + pager-sourced `_NET_ACTIVE_WINDOW`),
+// exactly as KWin does.
+//
+// We deliberately go straight to x11rb rather than shelling out to
+// wmctrl/xdotool the way the KWin backend does for some calls: under Mutter's
+// XWayland several EWMH conveniences are only partly wired up (e.g. `wmctrl
+// -m`'s supporting-WM check fails), so the direct property reads are the
+// reliable path — the same approach other Linux-native EVE tools take.
+//
+// `stack_windows` is a no-op: Wayland forbids a client positioning another
+// window and there is no extension-free way around it on Mutter. The config
+// panel hides the Restack button on this session (see
+// `window_manager::restack_supported`).
+
+pub struct GnomeManager {
+    conn: Arc<RustConnection>,
+    screen_num: usize,
+    net_active_window_atom: u32,
+    net_startup_id_atom: u32,
+    net_client_list_atom: u32,
+    net_wm_pid_atom: u32,
+    net_wm_name_atom: u32,
+    utf8_string_atom: u32,
+    wm_change_state_atom: u32,
+    /// Wayland-side token minter for the activation focus bridge. `None`
+    /// when xdg_activation_v1 isn't available; activation then uses the
+    /// token-less EWMH path. Mutter advertises xdg_activation_v1, so this
+    /// is normally `Some`.
+    xdg_activation: Option<XdgActivation>,
+}
+
+impl GnomeManager {
+    pub fn new() -> Result<Self> {
+        let (conn, screen_num) = x11rb::connect(None)
+            .context("X11 connect failed — is XWayland running under GNOME?")?;
+        let conn = Arc::new(conn);
+
+        let net_active_window_atom = conn
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
+            .reply()?
+            .atom;
+        let net_startup_id_atom = conn.intern_atom(false, b"_NET_STARTUP_ID")?.reply()?.atom;
+        let net_client_list_atom = conn.intern_atom(false, b"_NET_CLIENT_LIST")?.reply()?.atom;
+        let net_wm_pid_atom = conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
+        let net_wm_name_atom = conn.intern_atom(false, b"_NET_WM_NAME")?.reply()?.atom;
+        let utf8_string_atom = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+        let wm_change_state_atom = conn.intern_atom(false, b"WM_CHANGE_STATE")?.reply()?.atom;
+
+        // Best-effort: open the Wayland connection for xdg-activation tokens.
+        // Same focus-bridge rationale as the KWin backend.
+        let xdg_activation = XdgActivation::new()
+            .map_err(|e| {
+                eprintln!(
+                    "xdg-activation unavailable ({e:?}); cycle activation will use the \
+                     token-less EWMH path. The first click on a newly-active EVE client \
+                     may need a second click on Mutter."
+                );
+            })
+            .ok();
+
+        Ok(Self {
+            conn,
+            screen_num,
+            net_active_window_atom,
+            net_startup_id_atom,
+            net_client_list_atom,
+            net_wm_pid_atom,
+            net_wm_name_atom,
+            utf8_string_atom,
+            wm_change_state_atom,
+            xdg_activation,
+        })
+    }
+
+    /// Read a window's title, preferring `_NET_WM_NAME` (UTF-8) and falling
+    /// back to the legacy `WM_NAME` (Latin-1). EVE sets the former.
+    fn window_title(&self, window: u32) -> Option<String> {
+        if let Some(reply) = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.net_wm_name_atom,
+                self.utf8_string_atom,
+                0,
+                u32::MAX,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+        {
+            if !reply.value.is_empty() {
+                if let Ok(s) = String::from_utf8(reply.value) {
+                    return Some(s);
+                }
+            }
+        }
+        if let Some(reply) = self
+            .conn
+            .get_property(
+                false,
+                window,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                0,
+                u32::MAX,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+        {
+            if !reply.value.is_empty() {
+                return Some(String::from_utf8_lossy(&reply.value).into_owned());
+            }
+        }
+        None
+    }
+
+    /// Read a window's owning PID from `_NET_WM_PID` (0 if unset).
+    fn window_pid(&self, window: u32) -> u32 {
+        self.conn
+            .get_property(
+                false,
+                window,
+                self.net_wm_pid_atom,
+                AtomEnum::CARDINAL,
+                0,
+                1,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut v| v.next()))
+            .unwrap_or(0)
+    }
+}
+
+impl WindowManager for GnomeManager {
+    fn get_eve_windows(&self) -> Result<Vec<EveWindow>> {
+        let root = self.conn.setup().roots[self.screen_num].root;
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                root,
+                self.net_client_list_atom,
+                AtomEnum::WINDOW,
+                0,
+                u32::MAX,
+            )
+            .context("get_property _NET_CLIENT_LIST")?
+            .reply()
+            .context("_NET_CLIENT_LIST reply")?;
+        let ids: Vec<u32> = reply.value32().map(|it| it.collect()).unwrap_or_default();
+
+        let mut eve_windows = Vec::new();
+        for id in ids {
+            let Some(title) = self.window_title(id) else {
+                continue;
+            };
+            if !title.starts_with("EVE - ") {
+                continue;
+            }
+            // Process gate: reject anything titled "EVE - …" whose owning
+            // process isn't the actual game (`exefile.exe`) — browser tabs,
+            // Discord channels, etc. Matches the other backends.
+            let pid = self.window_pid(id);
+            if pid == 0 || !crate::eve_match::pid_is_eve_client(pid) {
+                continue;
+            }
+            eve_windows.push(EveWindow {
+                id,
+                title: title.trim_start_matches("EVE - ").to_string(),
+            });
+        }
+        Ok(eve_windows)
+    }
+
+    fn activate_window(&self, window_id: u32) -> Result<()> {
+        ewmh_activate(
+            &self.conn,
+            self.screen_num,
+            self.net_active_window_atom,
+            self.net_startup_id_atom,
+            &self.xdg_activation,
+            window_id,
+        )
+    }
+
+    fn stack_windows(&self, _windows: &[EveWindow], _config: &Config) -> Result<()> {
+        // No-op on GNOME Wayland: Mutter implements no client-facing window
+        // positioning, and there is no extension-free way to move another
+        // window to absolute coordinates. The panel hides the Restack button
+        // here; the CLI `stack` falls through to this and intentionally does
+        // nothing rather than failing loudly.
+        eprintln!(
+            "Restack is unavailable on GNOME Wayland — the compositor does not allow \
+             applications to position windows. Skipping."
+        );
+        Ok(())
+    }
+
+    fn get_active_window(&self) -> Result<u32> {
+        ewmh_active_window(&self.conn, self.screen_num, self.net_active_window_atom)
+    }
+
+    fn minimize_window(&self, window_id: u32) -> Result<()> {
+        // ICCCM iconify: send WM_CHANGE_STATE → IconicState (3) to the root.
+        // This is exactly what XIconifyWindow does; Mutter honors it for X11
+        // windows under XWayland.
+        let root = self.conn.setup().roots[self.screen_num].root;
+        let event = ClientMessageEvent {
+            response_type: CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: window_id,
+            type_: self.wm_change_state_atom,
+            data: ClientMessageData::from([3, 0, 0, 0, 0]),
+        };
+        self.conn
+            .send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+                event,
+            )
+            .context("send WM_CHANGE_STATE")?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn restore_window(&self, window_id: u32) -> Result<()> {
+        // Activating an iconified window both un-minimizes and focuses it.
+        self.activate_window(window_id)
     }
 }

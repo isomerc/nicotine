@@ -254,6 +254,10 @@ pub(super) struct Panel {
     /// isn't persisted separately — `preview_width`/`preview_height` are
     /// always kept in this ratio.
     pub aspect_ratio: f64,
+    /// Whether to show the Restack button. False on GNOME Wayland, where
+    /// Mutter forbids a client positioning windows, so restack is a no-op
+    /// (see `window_manager::restack_supported`). Always true on Windows.
+    pub restack_supported: bool,
 }
 
 impl Panel {
@@ -274,12 +278,25 @@ impl Panel {
         );
         slider_text.insert(SliderField::PreviewSize, config.preview_width.to_string());
         let aspect_ratio = aspect_ratio_of(config.preview_width, config.preview_height);
+
+        // Hide Restack where it can't work. Only GNOME Wayland blocks
+        // window positioning; everything else (Windows, X11, KWin, Sway,
+        // Hyprland, GNOME-on-Xorg) supports it.
+        #[cfg(target_os = "linux")]
+        let restack_supported = crate::window_manager::restack_supported(
+            crate::window_manager::detect_display_server(),
+            crate::window_manager::detect_wayland_compositor(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let restack_supported = true;
+
         Self {
             config,
             live,
             audio,
             slider_text,
             aspect_ratio,
+            restack_supported,
             new_character_buffer: String::new(),
             capturing: None,
             last_change: None,

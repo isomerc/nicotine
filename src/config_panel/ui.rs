@@ -227,7 +227,7 @@ fn drag_row_style(is_dragged: bool, is_target: bool) -> container::Style {
 }
 
 fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
-    column![
+    let mut col = column![
         section_header("Display Mode"),
         caption(
             "How Nicotine shows your running clients on screen. Preview windows mirror each \
@@ -251,10 +251,16 @@ fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
         checkbox(panel.config.positions_locked)
             .label("Lock positions (drag disabled on previews and list)")
             .on_toggle(Message::LockToggled),
-        button(text("Restack EVE Windows")).on_press(Message::RestackClicked),
     ]
-    .spacing(8)
-    .into()
+    .spacing(8);
+
+    // Hidden on GNOME Wayland, where the compositor blocks window
+    // positioning so restacking can't do anything.
+    if panel.restack_supported {
+        col = col.push(button(text("Restack EVE Windows")).on_press(Message::RestackClicked));
+    }
+
+    col.into()
 }
 
 fn characters_section(panel: &Panel) -> Element<'_, Message> {
