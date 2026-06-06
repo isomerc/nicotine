@@ -29,6 +29,8 @@ mod keyboard_listener;
 #[cfg(unix)]
 mod mouse_listener;
 #[cfg(unix)]
+mod pointer_nudge;
+#[cfg(unix)]
 mod preview_x11;
 #[cfg(unix)]
 mod wayland_backends;
