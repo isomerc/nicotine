@@ -32,12 +32,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST, IDC_ARROW, MSG,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WINEVENT_OUTOFCONTEXT, WM_DESTROY,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST,
+    IDC_ARROW, LWA_ALPHA, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+    WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE,
 };
 
 /// Type alias for DWM thumbnail handles. windows-rs 0.59 doesn't expose a
@@ -505,7 +506,6 @@ impl PreviewManager {
         self.config.preview_height = want_h;
         let w = want_w as i32;
         let h = want_h as i32;
-        let opacity = opacity_to_byte(self.config.preview_opacity);
         for preview in self.previews.values() {
             unsafe {
                 // Resize the window without touching its position or z-order.
@@ -523,7 +523,7 @@ impl PreviewManager {
                 let ptr =
                     GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
                 if !ptr.is_null() {
-                    update_thumbnail_rect((*ptr).thumbnail, w, h, opacity);
+                    update_thumbnail_rect((*ptr).thumbnail, w, h);
                 }
                 // Repaint title strip + border at the new dimensions.
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
@@ -542,17 +542,8 @@ impl PreviewManager {
             return;
         }
         self.config.preview_opacity = want;
-        let w = self.config.preview_width as i32;
-        let h = self.config.preview_height as i32;
-        let opacity = opacity_to_byte(want);
         for preview in self.previews.values() {
-            unsafe {
-                let ptr =
-                    GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
-                if !ptr.is_null() {
-                    update_thumbnail_rect((*ptr).thumbnail, w, h, opacity);
-                }
-            }
+            apply_window_opacity(preview.hwnd, want);
         }
     }
 
@@ -679,7 +670,7 @@ impl PreviewManager {
 
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(title_w.as_ptr()),
                 WS_POPUP | WS_VISIBLE,
@@ -695,18 +686,19 @@ impl PreviewManager {
         }
         .context("CreateWindowExW failed for preview window")?;
 
+        // Translucency comes from the layered-window alpha (see
+        // apply_window_opacity), which blends the whole window against the
+        // desktop behind it. Apply it before the window is composited so it
+        // never flashes fully opaque.
+        apply_window_opacity(hwnd, self.config.preview_opacity);
+
         // Register a DWM thumbnail mirroring the EVE source HWND into our
         // window's client area below the title strip.
         let thumbnail: Hthumbnail = unsafe {
             DwmRegisterThumbnail(hwnd, id_to_hwnd(window.id))
                 .context("DwmRegisterThumbnail failed")?
         };
-        update_thumbnail_rect(
-            thumbnail,
-            width,
-            height,
-            opacity_to_byte(self.config.preview_opacity),
-        );
+        update_thumbnail_rect(thumbnail, width, height);
 
         let per_window = Box::new(PreviewWindowState {
             source_id: window.id,
@@ -763,9 +755,14 @@ impl PreviewManager {
 /// mirror the whole source window (including any title bar/border) — EVE's
 /// client area definition reportedly hides the actual game render surface,
 /// so SOURCECLIENTAREAONLY gives a blank preview.
-fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32, opacity: u8) {
+fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
     let border = px(BORDER_WIDTH);
     let title = px(TITLE_HEIGHT);
+    // The thumbnail is always pushed fully opaque (255). User-facing
+    // translucency is applied to the host window via apply_window_opacity;
+    // scaling the thumbnail opacity instead would blend the mirror against
+    // the opaque chrome background (CHROME_DARK), darkening toward black
+    // rather than revealing the desktop behind.
     let props = DWM_THUMBNAIL_PROPERTIES {
         dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
         rcDestination: RECT {
@@ -775,7 +772,7 @@ fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32, opacity
             bottom: height - border,
         },
         rcSource: RECT::default(),
-        opacity,
+        opacity: 255,
         fVisible: true.into(),
         fSourceClientAreaOnly: false.into(),
     };
@@ -784,8 +781,20 @@ fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32, opacity
     }
 }
 
+/// Apply per-window translucency by setting the layered-window alpha. The
+/// preview is created WS_EX_LAYERED, so this constant alpha blends the whole
+/// window (chrome + DWM thumbnail) against the desktop behind it — matching
+/// the X11 backend's whole-window opacity. This is deliberately *not* the
+/// DWM thumbnail's own opacity, which only blends against the host window's
+/// opaque background and so just darkens the mirror.
+fn apply_window_opacity(hwnd: HWND, percent: u32) {
+    unsafe {
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), opacity_to_byte(percent), LWA_ALPHA);
+    }
+}
+
 /// Map an opacity percent (slider range 10..=100) to the 0..=255 byte the
-/// DWM thumbnail `opacity` field expects. 100% maps to fully opaque (255).
+/// layered-window alpha expects. 100% maps to fully opaque (255).
 fn opacity_to_byte(percent: u32) -> u8 {
     (percent.min(100) * 255 / 100) as u8
 }
