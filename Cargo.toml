@@ -1,6 +1,6 @@
 [package]
 name = "nicotine"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "High-performance EVE Online multiboxing tool (Linux X11/Wayland and Windows)"
 license = "MIT"
