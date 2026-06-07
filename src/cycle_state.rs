@@ -1,6 +1,16 @@
 use crate::window_manager::{EveWindow, WindowManager};
 use anyhow::Result;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// Opt-in cycle tracing (`NICOTINE_DEBUG_CYCLE=1`). Logs each sync / step /
+/// activation decision to stderr (→ /tmp/nicotine.err under the daemon) so
+/// an intermittent "cycling goes weird after a while" report can be caught
+/// in the act. Cached, so it's a cheap bool check when disabled.
+pub fn debug_cycle() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NICOTINE_DEBUG_CYCLE").is_ok())
+}
 
 /// After Nicotine itself drives a focus change via `activate_window`, the
 /// compositor commits that focus asynchronously and only then updates
@@ -194,6 +204,14 @@ impl CycleState {
 
         let new_window_id = self.windows[self.current_index].id;
 
+        if debug_cycle() {
+            eprintln!(
+                "[cycle] step={step} cur_idx {previous_index}->{} win=0x{new_window_id:x} cycle_len={}",
+                self.current_index,
+                cycle.len()
+            );
+        }
+
         if minimize_inactive {
             let _ = wm.restore_window(new_window_id);
         }
@@ -234,6 +252,16 @@ impl CycleState {
         }
     }
 
+    /// True if we drove an activation within the last `ACTIVATION_GRACE`.
+    /// Callers can use this to skip the `get_active_window` round-trip +
+    /// `sync_with_active` during a fast cycle burst: the sync would be a
+    /// no-op anyway (we trust our own index inside the grace window), so the
+    /// round-trip is pure latency on the hot path.
+    pub fn in_activation_grace(&self) -> bool {
+        self.last_activated
+            .is_some_and(|t| t.elapsed() < ACTIVATION_GRACE)
+    }
+
     pub fn sync_with_active(&mut self, active_window: u32) {
         // Within the grace window after our own activation, the compositor's
         // reported active window may still be the *previous* one — its focus
@@ -242,10 +270,18 @@ impl CycleState {
         // skip. Once grace elapses (the user paused), honor the report so a
         // manual alt-tab / click switch is still picked up. See
         // `ACTIVATION_GRACE`.
-        if let Some(at) = self.last_activated {
-            if at.elapsed() < ACTIVATION_GRACE {
-                return;
-            }
+        let in_grace = self
+            .last_activated
+            .is_some_and(|at| at.elapsed() < ACTIVATION_GRACE);
+        if debug_cycle() {
+            let matched = self.windows.iter().position(|w| w.id == active_window);
+            eprintln!(
+                "[sync] active=0x{active_window:x} grace_skip={in_grace} matched_idx={matched:?} cur_idx={}",
+                self.current_index
+            );
+        }
+        if in_grace {
+            return;
         }
         // Find which window is active and update current_index
         for (i, window) in self.windows.iter().enumerate() {

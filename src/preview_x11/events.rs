@@ -48,17 +48,25 @@ impl PreviewManager {
             // previews (whose first paint can't be triggered by a
             // damage event yet) and for the Expose path below.
             Event::DamageNotify(ev) => {
+                // Mark the matching preview dirty. Only repaint *now* if we
+                // aren't already waiting on a present to reach the screen —
+                // otherwise the repaint is deferred to the next
+                // PresentCompleteNotify (vblank). This is what paces us to the
+                // display rate instead of flooding KWin with one present per
+                // EVE frame (which backed its commit queue up over a session).
                 let key = self
                     .previews
                     .values_mut()
                     .find(|p| p.damage_id == ev.damage)
                     .map(|p| {
                         p.dirty = true;
-                        p.character_name.clone()
+                        (p.character_name.clone(), p.can_present())
                     });
-                if let Some(k) = key {
-                    if let Err(e) = self.paint_preview_now(&k) {
-                        eprintln!("paint_preview_now({}): {}", k, e);
+                if let Some((k, can_present)) = key {
+                    if can_present {
+                        if let Err(e) = self.paint_preview_now(&k) {
+                            eprintln!("paint_preview_now({}): {}", k, e);
+                        }
                     }
                 }
                 // damage_subtract clears the accumulated damage region
@@ -67,6 +75,27 @@ impl PreviewManager {
                 let _ = self
                     .conn
                     .damage_subtract(ev.damage, x11rb::NONE, x11rb::NONE);
+            }
+            // A presented frame reached the screen (vblank). This is the
+            // pacing clock: clear the in-flight flag and, if the source has
+            // drawn since, paint the next frame now. Replaces painting on
+            // every EVE DamageNotify.
+            Event::PresentCompleteNotify(ev) => {
+                let key = self
+                    .previews
+                    .values_mut()
+                    .find(|p| p.window == ev.window)
+                    .map(|p| {
+                        p.present_in_flight = false;
+                        (p.character_name.clone(), p.dirty)
+                    });
+                if let Some((k, dirty)) = key {
+                    if dirty {
+                        if let Err(e) = self.paint_preview_now(&k) {
+                            eprintln!("paint_preview_now({}): {}", k, e);
+                        }
+                    }
+                }
             }
             // The X server (or compositor on first map) cleared our
             // window content; present a fresh full frame.

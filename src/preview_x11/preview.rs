@@ -6,11 +6,12 @@
 
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
 use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
-use x11rb::protocol::present::ConnectionExt as _;
+use x11rb::protocol::present::{ConnectionExt as _, EventMask as PresentEventMask};
 use x11rb::protocol::render::{
     ConnectionExt as _, CreatePictureAux as RenderCreatePictureAux, PictOp,
 };
@@ -31,6 +32,12 @@ use super::{
     NICOTINE_CREAM, NICOTINE_RED, PREVIEW_HEIGHT, PREVIEW_WIDTH, TITLE_FONT_PX, TITLE_STRIP_HEIGHT,
     TITLE_TEXT_LEFT_PAD,
 };
+
+/// If a present's CompleteNotify hasn't arrived within this long, assume it
+/// was dropped and allow a new present rather than freezing the thumbnail.
+/// Far longer than a vblank (~16ms at 60Hz) so it only fires on genuinely
+/// lost notifications, not normal pacing.
+const STALE_PRESENT: Duration = Duration::from_millis(200);
 
 /// Owns one preview window's resources. Drop releases everything in
 /// reverse construction order. Best-effort — if the X11 connection has
@@ -100,6 +107,29 @@ pub(super) struct OwnedPreview {
     /// treat the gesture as click-only — but we still need to know
     /// whether to ungrab on release.
     pub(super) grabbed: bool,
+    /// Present event-context id for `present_select_input` (CompleteNotify).
+    /// Lets us pace repaints to the compositor's vblank instead of EVE's
+    /// frame rate. Cleaned up when the window is destroyed.
+    pub(super) present_eid: u32,
+    /// True between issuing a present and receiving its CompleteNotify. While
+    /// set we don't issue another present (we just mark `dirty`), so we
+    /// present at most once per vblank. The previous unbounded one-present-
+    /// per-EVE-frame flooded KWin's commit queue and degraded the whole
+    /// session over time.
+    pub(super) present_in_flight: bool,
+    /// When the in-flight present was issued — lets us recover if a
+    /// CompleteNotify is ever dropped (treat the present as done after a
+    /// generous timeout instead of freezing the thumbnail forever).
+    pub(super) present_at: Option<Instant>,
+}
+
+impl OwnedPreview {
+    /// Whether we may issue a present right now: nothing in flight, or the
+    /// last present's CompleteNotify never arrived and we've waited long
+    /// enough to assume it was lost.
+    pub(super) fn can_present(&self) -> bool {
+        !self.present_in_flight || self.present_at.is_none_or(|t| t.elapsed() > STALE_PRESENT)
+    }
 }
 
 impl Drop for OwnedPreview {
@@ -126,6 +156,13 @@ impl Drop for OwnedPreview {
         let _ = self
             .conn
             .composite_unredirect_window(self.source_id, Redirect::AUTOMATIC);
+        // Delete the present event context (empty mask) before tearing the
+        // window down, so the server stops tracking CompleteNotify for it.
+        let _ = self.conn.present_select_input(
+            self.present_eid,
+            self.window,
+            PresentEventMask::NO_EVENT,
+        );
         let _ = self.conn.destroy_window(self.window);
         let _ = self.conn.flush();
     }
@@ -287,6 +324,12 @@ impl PreviewManager {
         conn.map_window(our_window)?;
         conn.sync()?;
 
+        // Ask the X server for a CompleteNotify after each present, so the
+        // repaint can be paced to the compositor's vblank instead of EVE's
+        // frame rate (see `OwnedPreview::present_in_flight`).
+        let present_eid = conn.generate_id()?;
+        conn.present_select_input(present_eid, our_window, PresentEventMask::COMPLETE_NOTIFY)?;
+
         // Pre-rasterize the character name into a premultiplied-ARGB32
         // pixmap. The cream text color and per-pixel alpha are baked
         // into the pixmap itself, so chrome's text composite is just one
@@ -356,6 +399,9 @@ impl PreviewManager {
             hidden: false,
             drag: DragState::default(),
             grabbed: false,
+            present_eid,
+            present_in_flight: false,
+            present_at: None,
         };
         self.previews.insert(title.to_string(), preview);
 
@@ -576,6 +622,11 @@ impl PreviewManager {
             &[],
         )?;
         preview.dirty = false;
+        // Mark the present in flight: we won't issue another until its
+        // CompleteNotify arrives (or STALE_PRESENT elapses), which paces us
+        // to the compositor's vblank instead of EVE's frame rate.
+        preview.present_in_flight = true;
+        preview.present_at = Some(Instant::now());
         // Flush right now so the present hits the X server in time for
         // the next vblank instead of waiting up to a full loop tick to
         // flush — that extra 0-8ms of buffer latency reads as judder.
@@ -589,10 +640,14 @@ impl PreviewManager {
     /// for the post-Expose redraw path. Steady-state painting happens
     /// from the DamageNotify handler.
     pub(super) fn repaint_thumbnails(&mut self) -> Result<()> {
+        // Only previews that are dirty AND not mid-present (or whose present
+        // went stale). The steady-state repaint clock is now
+        // PresentCompleteNotify; this backstop just covers the first frame
+        // and recovery from a dropped notify.
         let dirty_keys: Vec<String> = self
             .previews
             .iter()
-            .filter(|(_, p)| p.dirty)
+            .filter(|(_, p)| p.dirty && p.can_present())
             .map(|(k, _)| k.clone())
             .collect();
         for key in &dirty_keys {

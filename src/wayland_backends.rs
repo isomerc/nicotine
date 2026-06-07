@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::pointer_nudge::{schedule_nudge, PointerNudger};
 use crate::window_manager::{EveWindow, WindowManager};
-use crate::xdg_activation::XdgActivation;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::process::Command;
@@ -9,10 +8,9 @@ use std::sync::{Arc, OnceLock};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as _, EventMask, InputFocus,
-    PropMode, CLIENT_MESSAGE_EVENT,
+    CLIENT_MESSAGE_EVENT,
 };
 use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as _;
 
 // ============================================================================
 // Shared XWayland / EWMH helpers (KWin + GNOME)
@@ -20,42 +18,30 @@ use x11rb::wrapper::ConnectionExt as _;
 //
 // Both the KWin and GNOME backends run EVE as XWayland clients and drive
 // focus through an EWMH `_NET_ACTIVE_WINDOW` ClientMessage rather than a
-// Wayland-native protocol. The activation primitive (xdg-activation token
-// stamped on `_NET_STARTUP_ID`, then a pager-sourced activate message) and
-// the active-window read are byte-for-byte identical across the two
-// compositors, so they live here instead of being duplicated per backend.
+// Wayland-native protocol. The activate primitive (a pager-sourced
+// `_NET_ACTIVE_WINDOW` message plus an explicit input-focus) and the
+// active-window read are identical across the two compositors, so they live
+// here instead of being duplicated per backend.
 
-/// Mint an xdg-activation token (best-effort) and send the EWMH activate
-/// ClientMessage for `window_id`. The token, stamped on `_NET_STARTUP_ID`,
-/// lets the compositor promote X11 focus to Wayland surface focus so the
-/// next click reaches EVE; source = 2 (pager) dodges the focus-stealing
-/// penalty applied to source = 1 (application). Token-mint failures are
-/// non-fatal — we fall through to the token-less EWMH path.
+/// Send the EWMH `_NET_ACTIVE_WINDOW` activate ClientMessage for `window_id`
+/// (source = 2, pager, which dodges the focus-stealing penalty applied to
+/// source = 1) plus an explicit `set_input_focus`. Together these move both
+/// the raise and keyboard focus to the target XWayland window.
+///
+/// We used to also mint an xdg-activation token and stamp it on
+/// `_NET_STARTUP_ID` to bridge X11 focus to Wayland surface focus. On KWin
+/// that request was always *denied* (focus-stealing prevention rejects our
+/// serial-less requests — our input arrives via evdev, not the Wayland
+/// seat), so it did nothing while its per-cycle round-trip slowly backed the
+/// compositor up and made cycling degrade over a session. Removed: the pager
+/// message + `set_input_focus` already deliver focus, and pointer focus is
+/// handled separately by the pointer nudge.
 fn ewmh_activate(
     conn: &RustConnection,
     screen_num: usize,
     net_active_window_atom: u32,
-    net_startup_id_atom: u32,
-    xdg_activation: &Option<XdgActivation>,
     window_id: u32,
 ) -> Result<()> {
-    if let Some(activation) = xdg_activation {
-        match activation.request_token() {
-            Ok(token) => {
-                let _ = conn.change_property8(
-                    PropMode::REPLACE,
-                    window_id,
-                    net_startup_id_atom,
-                    AtomEnum::STRING,
-                    token.as_bytes(),
-                );
-            }
-            Err(e) => {
-                eprintln!("xdg_activation token request failed: {e:?}");
-            }
-        }
-    }
-
     let screen = &conn.setup().roots[screen_num];
     let event = ClientMessageEvent {
         response_type: CLIENT_MESSAGE_EVENT,
@@ -71,10 +57,11 @@ fn ewmh_activate(
         EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
         event,
     )?;
-    // Belt-and-suspenders explicit focus for compositors that don't act on
-    // the ClientMessage alone under strict focus-stealing prevention.
     let _ = conn.set_input_focus(InputFocus::PARENT, window_id, x11rb::CURRENT_TIME);
     conn.flush()?;
+    if crate::cycle_state::debug_cycle() {
+        eprintln!("[activate] win=0x{window_id:x} ewmh sent + focus + flush");
+    }
     Ok(())
 }
 
@@ -151,21 +138,10 @@ pub struct KWinManager {
     conn: Arc<RustConnection>,
     screen_num: usize,
     net_active_window_atom: u32,
-    /// `_NET_STARTUP_ID` — the X11-side carrier for a Wayland
-    /// xdg-activation token. Set on the target EVE window before
-    /// sending the EWMH activate ClientMessage so KWin can promote the
-    /// activation to Wayland surface focus, not just X11 focus.
-    net_startup_id_atom: u32,
     /// `WM_CHANGE_STATE` — ICCCM iconify carrier. `minimize_window` sends
     /// IconicState through this on `conn` (not via a `xdotool` subprocess)
     /// so the iconify is ordered after activate on the same connection.
     wm_change_state_atom: u32,
-    /// Wayland-side companion that mints activation tokens. `None`
-    /// means we couldn't set it up — either we're not on a Wayland
-    /// session, or the compositor doesn't advertise xdg_activation_v1.
-    /// activate_window falls back to the token-less EWMH path in that
-    /// case, which matches the pre-token behavior.
-    xdg_activation: Option<XdgActivation>,
     /// Lazily-created virtual pointer for the Wayland pointer-focus nudge
     /// (see `pointer_nudge`). Built on first activation so one-shot CLI
     /// commands that never activate a window don't spawn a uinput device.
@@ -187,31 +163,13 @@ impl KWinManager {
             .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
             .reply()?
             .atom;
-        let net_startup_id_atom = conn.intern_atom(false, b"_NET_STARTUP_ID")?.reply()?.atom;
         let wm_change_state_atom = conn.intern_atom(false, b"WM_CHANGE_STATE")?.reply()?.atom;
-
-        // Best-effort: open the Wayland connection for xdg-activation
-        // tokens. Failures here are expected on X11-only sessions and on
-        // compositors that don't advertise xdg_activation_v1; activate
-        // still works without tokens, just without the Wayland focus
-        // bridge that fixes the "first click is consumed" symptom.
-        let xdg_activation = XdgActivation::new()
-            .map_err(|e| {
-                eprintln!(
-                    "xdg-activation unavailable ({e:?}); cycle activation will use the \
-                     token-less EWMH path. Subsequent clicks on the newly-active EVE \
-                     client may need a second click to register on KWin Wayland."
-                );
-            })
-            .ok();
 
         Ok(Self {
             conn,
             screen_num,
             net_active_window_atom,
-            net_startup_id_atom,
             wm_change_state_atom,
-            xdg_activation,
             pointer_nudger: OnceLock::new(),
         })
     }
@@ -324,8 +282,6 @@ impl WindowManager for KWinManager {
             &self.conn,
             self.screen_num,
             self.net_active_window_atom,
-            self.net_startup_id_atom,
-            &self.xdg_activation,
             window_id,
         )?;
         // Pointer-focus nudge: KWin won't re-target clicks to the newly
@@ -789,17 +745,11 @@ pub struct GnomeManager {
     conn: Arc<RustConnection>,
     screen_num: usize,
     net_active_window_atom: u32,
-    net_startup_id_atom: u32,
     net_client_list_atom: u32,
     net_wm_pid_atom: u32,
     net_wm_name_atom: u32,
     utf8_string_atom: u32,
     wm_change_state_atom: u32,
-    /// Wayland-side token minter for the activation focus bridge. `None`
-    /// when xdg_activation_v1 isn't available; activation then uses the
-    /// token-less EWMH path. Mutter advertises xdg_activation_v1, so this
-    /// is normally `Some`.
-    xdg_activation: Option<XdgActivation>,
     /// Lazily-created virtual pointer for the Wayland pointer-focus nudge
     /// (see `pointer_nudge`). Same rationale as the KWin backend — Mutter
     /// also only re-targets clicks on pointer motion.
@@ -816,36 +766,21 @@ impl GnomeManager {
             .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
             .reply()?
             .atom;
-        let net_startup_id_atom = conn.intern_atom(false, b"_NET_STARTUP_ID")?.reply()?.atom;
         let net_client_list_atom = conn.intern_atom(false, b"_NET_CLIENT_LIST")?.reply()?.atom;
         let net_wm_pid_atom = conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
         let net_wm_name_atom = conn.intern_atom(false, b"_NET_WM_NAME")?.reply()?.atom;
         let utf8_string_atom = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
         let wm_change_state_atom = conn.intern_atom(false, b"WM_CHANGE_STATE")?.reply()?.atom;
 
-        // Best-effort: open the Wayland connection for xdg-activation tokens.
-        // Same focus-bridge rationale as the KWin backend.
-        let xdg_activation = XdgActivation::new()
-            .map_err(|e| {
-                eprintln!(
-                    "xdg-activation unavailable ({e:?}); cycle activation will use the \
-                     token-less EWMH path. The first click on a newly-active EVE client \
-                     may need a second click on Mutter."
-                );
-            })
-            .ok();
-
         Ok(Self {
             conn,
             screen_num,
             net_active_window_atom,
-            net_startup_id_atom,
             net_client_list_atom,
             net_wm_pid_atom,
             net_wm_name_atom,
             utf8_string_atom,
             wm_change_state_atom,
-            xdg_activation,
             pointer_nudger: OnceLock::new(),
         })
     }
@@ -956,8 +891,6 @@ impl WindowManager for GnomeManager {
             &self.conn,
             self.screen_num,
             self.net_active_window_atom,
-            self.net_startup_id_atom,
-            &self.xdg_activation,
             window_id,
         )?;
         // Pointer-focus nudge — Mutter, like KWin, only re-targets clicks
