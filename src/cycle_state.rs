@@ -238,7 +238,10 @@ impl CycleState {
     /// Callers can use this to skip the `get_active_window` round-trip +
     /// `sync_with_active` during a fast cycle burst: the sync would be a
     /// no-op anyway (we trust our own index inside the grace window), so the
-    /// round-trip is pure latency on the hot path.
+    /// round-trip is pure latency on the hot path. Only the Linux evdev
+    /// listeners call this; the Windows cycle path relies on the grace
+    /// early-return inside `sync_with_active` instead.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn in_activation_grace(&self) -> bool {
         self.last_activated
             .is_some_and(|t| t.elapsed() < ACTIVATION_GRACE)
