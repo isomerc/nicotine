@@ -59,9 +59,6 @@ fn ewmh_activate(
     )?;
     let _ = conn.set_input_focus(InputFocus::PARENT, window_id, x11rb::CURRENT_TIME);
     conn.flush()?;
-    if crate::cycle_state::debug_cycle() {
-        eprintln!("[activate] win=0x{window_id:x} ewmh sent + focus + flush");
-    }
     Ok(())
 }
 

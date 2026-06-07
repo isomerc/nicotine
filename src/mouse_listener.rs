@@ -220,10 +220,6 @@ impl MouseListener {
                         continue;
                     }
                 };
-                // Batch size is a backlog signal: a large batch means the
-                // listener fell behind (e.g. blocked in a slow cycle) and the
-                // kernel queued a pile of motion events meanwhile.
-                let batch_len = events.len();
                 for event in events {
                     if let InputEventKind::Key(key) = event.kind() {
                         if event.value() != 1 {
@@ -232,26 +228,13 @@ impl MouseListener {
                         let code = key.code();
                         let is_cycle = code == snap.forward_button || code == snap.backward_button;
                         if is_cycle {
-                            let now = Instant::now();
-                            let gap = last_cycle.map(|t| now.duration_since(t).as_millis());
                             // Drop a duplicate press echoed by a second device
                             // node within the debounce window.
+                            let now = Instant::now();
                             if last_cycle.is_some_and(|t| now.duration_since(t) < CYCLE_DEBOUNCE) {
-                                if crate::cycle_state::debug_cycle() {
-                                    eprintln!(
-                                        "[mouse] DEBOUNCED code={code} gap_ms={gap:?} batch={batch_len}"
-                                    );
-                                }
                                 continue;
                             }
                             last_cycle = Some(now);
-                            if crate::cycle_state::debug_cycle() {
-                                let dev = devices[i].name().unwrap_or("?").to_string();
-                                eprintln!(
-                                    "[mouse] press code={code} dev='{dev}' gap_ms={gap:?} batch={batch_len}"
-                                );
-                            }
-                            let t0 = Instant::now();
                             let result = if code == snap.forward_button {
                                 Self::cycle_forward(&wm, &state, snap.minimize_inactive)
                             } else {
@@ -259,9 +242,6 @@ impl MouseListener {
                             };
                             if let Err(e) = result {
                                 eprintln!("Failed to cycle: {}", e);
-                            }
-                            if crate::cycle_state::debug_cycle() {
-                                eprintln!("[mouse] cycle took {}ms", t0.elapsed().as_millis());
                             }
                         }
                     }
@@ -395,36 +375,21 @@ impl MouseListener {
         Self::run_cycle(wm, state, minimize_inactive, -1)
     }
 
-    /// Shared lock → sync-with-active → cycle path for both directions.
-    /// Times the lock acquisition and the `get_active_window` round-trip
-    /// separately (under `NICOTINE_DEBUG_CYCLE`) so a slow cycle can be
-    /// decomposed against the `[activate] req_ms` token timing.
+    /// Shared lock → (grace-gated) sync-with-active → cycle path for both
+    /// directions. The `get_active_window` round-trip is skipped inside the
+    /// activation grace window, where `sync_with_active` would no-op anyway,
+    /// so it's pure latency on a fast burst.
     fn run_cycle(
         wm: &Arc<dyn WindowManager>,
         state: &Arc<Mutex<CycleState>>,
         minimize_inactive: bool,
         step: isize,
     ) -> Result<()> {
-        let lock_t = Instant::now();
         let mut state = state.lock().unwrap();
-        let lock_ms = lock_t.elapsed().as_millis();
-        // Skip the get_active_window round-trip during the grace window —
-        // sync_with_active would no-op anyway, so it's pure latency on a
-        // fast burst.
-        let in_grace = state.in_activation_grace();
-        let mut ga_ms = 0u128;
-        if !in_grace {
-            let ga_t = Instant::now();
-            let active = wm.get_active_window();
-            ga_ms = ga_t.elapsed().as_millis();
-            if let Ok(active) = active {
+        if !state.in_activation_grace() {
+            if let Ok(active) = wm.get_active_window() {
                 state.sync_with_active(active);
             }
-        }
-        if crate::cycle_state::debug_cycle() {
-            eprintln!(
-                "[mouse] lock_ms={lock_ms} get_active_ms={ga_ms} grace_skip_active={in_grace}"
-            );
         }
         if step >= 0 {
             state.cycle_forward(&**wm, minimize_inactive)?;
