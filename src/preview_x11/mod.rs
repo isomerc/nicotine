@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::ConnectionExt as _;
 use x11rb::protocol::damage::ConnectionExt as _;
-use x11rb::protocol::present::ConnectionExt as _;
 use x11rb::protocol::render::{ConnectionExt as _, CreatePictureAux as RenderCreatePictureAux};
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{
@@ -195,16 +194,6 @@ fn run_manager(
         .context("Damage extension query")?
         .reply()
         .context("Damage extension reply — Damage not supported by X server?")?;
-    // Present is what gives us vsync-paced presentation under XWayland.
-    // Without it, KWin schedules our override_redirect surface at its
-    // own slow, irregular cadence regardless of how fast we render.
-    // With present_pixmap, the X server pushes our buffer through
-    // XWayland with proper Wayland presentation-time scheduling at
-    // every vblank.
-    conn.present_query_version(1, 0)
-        .context("Present extension query")?
-        .reply()
-        .context("Present extension reply — Present not supported by X server?")?;
 
     let formats_reply = conn
         .render_query_pict_formats()?

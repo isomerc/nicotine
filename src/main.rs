@@ -36,8 +36,6 @@ mod preview_x11;
 mod wayland_backends;
 #[cfg(unix)]
 mod x11_manager;
-#[cfg(unix)]
-mod xdg_activation;
 
 #[cfg(windows)]
 mod preview_windows;

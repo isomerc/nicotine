@@ -234,6 +234,19 @@ impl CycleState {
         }
     }
 
+    /// True if we drove an activation within the last `ACTIVATION_GRACE`.
+    /// Callers can use this to skip the `get_active_window` round-trip +
+    /// `sync_with_active` during a fast cycle burst: the sync would be a
+    /// no-op anyway (we trust our own index inside the grace window), so the
+    /// round-trip is pure latency on the hot path. Only the Linux evdev
+    /// listeners call this; the Windows cycle path relies on the grace
+    /// early-return inside `sync_with_active` instead.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn in_activation_grace(&self) -> bool {
+        self.last_activated
+            .is_some_and(|t| t.elapsed() < ACTIVATION_GRACE)
+    }
+
     pub fn sync_with_active(&mut self, active_window: u32) {
         // Within the grace window after our own activation, the compositor's
         // reported active window may still be the *previous* one — its focus
@@ -242,10 +255,11 @@ impl CycleState {
         // skip. Once grace elapses (the user paused), honor the report so a
         // manual alt-tab / click switch is still picked up. See
         // `ACTIVATION_GRACE`.
-        if let Some(at) = self.last_activated {
-            if at.elapsed() < ACTIVATION_GRACE {
-                return;
-            }
+        if self
+            .last_activated
+            .is_some_and(|at| at.elapsed() < ACTIVATION_GRACE)
+        {
+            return;
         }
         // Find which window is active and update current_index
         for (i, window) in self.windows.iter().enumerate() {

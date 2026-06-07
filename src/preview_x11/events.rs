@@ -42,11 +42,12 @@ impl PreviewManager {
             Event::PropertyNotify(ev) if ev.atom == self.atoms.net_client_list => {
                 self.needs_window_scan = true;
             }
-            // EVE drew a frame. Composite + present right here on the
-            // event arrival to minimize damage→display latency. The
-            // dirty flag is left as a backstop for newly-created
-            // previews (whose first paint can't be triggered by a
-            // damage event yet) and for the Expose path below.
+            // EVE drew a frame: composite it and blit straight to the preview
+            // window now. We do NOT use the X Present extension — presenting to
+            // these override-redirect windows is what accumulated state in KWin
+            // and degraded cycling over a session (bisected). A direct blit is
+            // a plain composite and doesn't. The dirty flag backstops the first
+            // frame and the Expose path.
             Event::DamageNotify(ev) => {
                 let key = self
                     .previews

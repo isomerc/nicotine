@@ -340,8 +340,12 @@ impl KeyboardListener {
         minimize_inactive: bool,
     ) -> Result<()> {
         let mut state = state.lock().unwrap();
-        if let Ok(active) = wm.get_active_window() {
-            state.sync_with_active(active);
+        // Skip the get_active_window round-trip during the grace window;
+        // see mouse_listener::run_cycle for the rationale.
+        if !state.in_activation_grace() {
+            if let Ok(active) = wm.get_active_window() {
+                state.sync_with_active(active);
+            }
         }
         state.cycle_forward(&**wm, minimize_inactive)?;
         Ok(())
@@ -353,8 +357,10 @@ impl KeyboardListener {
         minimize_inactive: bool,
     ) -> Result<()> {
         let mut state = state.lock().unwrap();
-        if let Ok(active) = wm.get_active_window() {
-            state.sync_with_active(active);
+        if !state.in_activation_grace() {
+            if let Ok(active) = wm.get_active_window() {
+                state.sync_with_active(active);
+            }
         }
         state.cycle_backward(&**wm, minimize_inactive)?;
         Ok(())

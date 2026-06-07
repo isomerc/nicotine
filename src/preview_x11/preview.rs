@@ -1,7 +1,7 @@
 //! Per-EVE-client preview window: an always-on-top thumbnail surface
-//! that mirrors the source via XComposite redirect + XRender composite
-//! at vsync via Present. Owns the X11 resources (redirect pixmap, two
-//! pictures, render target pixmap/picture, title text, damage handle)
+//! that mirrors the source via XComposite redirect + XRender composite,
+//! blitted to the window each frame. Owns the X11 resources (redirect +
+//! source / render / window / title pictures and pixmaps, damage handle)
 //! and frees them in reverse construction order on Drop.
 
 use anyhow::Result;
@@ -10,7 +10,6 @@ use std::sync::Arc;
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
 use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
-use x11rb::protocol::present::ConnectionExt as _;
 use x11rb::protocol::render::{
     ConnectionExt as _, CreatePictureAux as RenderCreatePictureAux, PictOp,
 };
@@ -55,13 +54,10 @@ pub(super) struct OwnedPreview {
     pub(super) dirty: bool,
     pub(super) src_pixmap: u32,
     pub(super) src_picture: u32,
-    /// Offscreen render target sized to match the preview window. Each
-    /// frame we paint chrome + the scaled thumbnail into this pixmap,
-    /// then present_pixmap flips it onto the window. Going through
-    /// Present (instead of rendering straight to the window) gives us
-    /// vsync-paced presentation under KWin/XWayland — the previous
-    /// "render directly to the window" path used to land at the
-    /// compositor's slow scheduling rate for override_redirect surfaces.
+    /// Offscreen render target sized to match the preview window. Each frame
+    /// we paint chrome + the scaled thumbnail into this pixmap, then blit it
+    /// to the window in one composite. Assembling offscreen first keeps the
+    /// window from ever showing a half-painted frame (no flicker).
     pub(super) render_pixmap: u32,
     pub(super) render_picture: u32,
     /// Premultiplied-ARGB32 pixmap with the rasterized character name
@@ -100,6 +96,13 @@ pub(super) struct OwnedPreview {
     /// treat the gesture as click-only — but we still need to know
     /// whether to ungrab on release.
     pub(super) grabbed: bool,
+    /// XRender Picture wrapping the preview *window* itself. Each frame we
+    /// assemble chrome + thumbnail into the offscreen `render_pixmap`, then
+    /// blit it here with one composite. This replaced the X Present extension:
+    /// presenting to these override-redirect windows accumulated state inside
+    /// KWin and slowly degraded the whole session over time (bisected — the
+    /// `present_pixmap` call was the sole cause). A direct blit doesn't.
+    pub(super) window_picture: u32,
 }
 
 impl Drop for OwnedPreview {
@@ -120,6 +123,7 @@ impl Drop for OwnedPreview {
         let _ = self.conn.render_free_picture(self.src_picture);
         let _ = self.conn.render_free_picture(self.render_picture);
         let _ = self.conn.free_pixmap(self.render_pixmap);
+        let _ = self.conn.render_free_picture(self.window_picture);
         let _ = self.conn.render_free_picture(self.title_picture);
         let _ = self.conn.free_pixmap(self.title_pixmap);
         let _ = self.conn.free_pixmap(self.src_pixmap);
@@ -305,9 +309,9 @@ impl PreviewManager {
 
         // Build XRender pictures. Source wraps the redirected pixmap
         // (with a downscale transform set below). Render target is an
-        // offscreen pixmap sized to match the preview window — each
-        // frame paints chrome + thumbnail into it, then present_pixmap
-        // flips it onto the window for vsync-paced display.
+        // offscreen pixmap sized to match the preview window — each frame
+        // paints chrome + thumbnail into it, then a single composite blits
+        // it onto the window.
         let pic_aux = RenderCreatePictureAux::new().subwindowmode(SubwindowMode::INCLUDE_INFERIORS);
 
         let src_picture = conn.generate_id()?;
@@ -317,6 +321,12 @@ impl PreviewManager {
         conn.create_pixmap(screen.root_depth, render_pixmap, our_window, init_w, init_h)?;
         let render_picture = conn.generate_id()?;
         conn.render_create_picture(render_picture, render_pixmap, self.visual_format, &pic_aux)?;
+
+        // Picture wrapping the window itself; each paint blits the finished
+        // offscreen frame straight here (no Present extension — see the
+        // `window_picture` field doc for why).
+        let window_picture = conn.generate_id()?;
+        conn.render_create_picture(window_picture, our_window, self.visual_format, &pic_aux)?;
 
         // Transform: dest coords (within the *thumbnail* area, not the
         // full window) → source coords. Scale factors are >1 because the
@@ -356,11 +366,12 @@ impl PreviewManager {
             hidden: false,
             drag: DragState::default(),
             grabbed: false,
+            window_picture,
         };
         self.previews.insert(title.to_string(), preview);
 
         // Push the first complete frame eagerly. paint_preview_now bundles
-        // chrome + source composite + present, so this both fills the
+        // chrome + source composite + window blit, so this both fills the
         // newly-allocated render_pixmap and gets it onscreen before any
         // Expose can race against undefined content.
         let _ = self.paint_preview_now(title);
@@ -510,20 +521,16 @@ impl PreviewManager {
         Ok(())
     }
 
-    /// Refresh + composite + present one preview right now, in response
-    /// to a DamageNotify. Doing this synchronously on the event arrival
-    /// (vs. deferring to the loop tick) minimizes the time between EVE's
-    /// buffer swap and our sample of it, which is the difference between
-    /// "fps tracks EVE's rate" and "jittery sub-rate cadence".
+    /// Refresh + composite + blit one preview right now, in response to a
+    /// DamageNotify. Doing it synchronously on event arrival (vs. deferring to
+    /// the loop tick) minimizes the time between EVE's buffer swap and our
+    /// sample of it.
     ///
-    /// Repaints chrome at the top of every call so each presented pixmap
-    /// is a complete, self-consistent frame (chrome + thumbnail). The
-    /// X Present extension references the source pixmap until the
-    /// presentation completes; if chrome were modified out-of-band by
-    /// `update_active` between a present and its vblank, the displayed
-    /// frame could capture the new chrome on top of the old thumbnail
-    /// (or vice versa) — the flicker that was previously visible when
-    /// switching clients.
+    /// The whole frame (chrome + thumbnail) is assembled in the offscreen
+    /// `render_pixmap` and then blitted to the window in a single composite,
+    /// so the window never shows a half-painted frame — no flicker when
+    /// switching clients. We do not use the X Present extension (see the
+    /// `window_picture` field doc for why).
     pub(super) fn paint_preview_now(&mut self, key: &str) -> Result<()> {
         self.refresh_source_pixmap(key)?;
         let preview_snapshot = match self.previews.get(key) {
@@ -554,40 +561,30 @@ impl PreviewManager {
             thumb_w,
             thumb_h,
         )?;
-        // Hand the finished pixmap to the X server / XWayland for
-        // presentation at the next vblank. target_msc=0 means "soonest
-        // possible" — XWayland forwards to KWin via the wp_presentation
-        // Wayland protocol with correct timing.
-        self.conn.present_pixmap(
-            preview.window,
-            preview.render_pixmap,
-            0,
+        // Blit the finished offscreen frame straight onto the window with one
+        // composite — no X Present extension (see `window_picture`).
+        self.conn.render_composite(
+            PictOp::SRC,
+            preview.render_picture,
             x11rb::NONE,
-            x11rb::NONE,
-            0,
-            0,
-            x11rb::NONE,
-            x11rb::NONE,
-            x11rb::NONE,
+            preview.window_picture,
             0,
             0,
             0,
             0,
-            &[],
+            0,
+            0,
+            preview.width,
+            preview.height,
         )?;
         preview.dirty = false;
-        // Flush right now so the present hits the X server in time for
-        // the next vblank instead of waiting up to a full loop tick to
-        // flush — that extra 0-8ms of buffer latency reads as judder.
         self.conn.flush()?;
         Ok(())
     }
 
-    /// Loop-tick backstop: composite + present any preview still marked
-    /// dirty. This is mostly a safety net for newly-created previews
-    /// whose first paint can't be triggered by a damage event yet, and
-    /// for the post-Expose redraw path. Steady-state painting happens
-    /// from the DamageNotify handler.
+    /// Loop-tick backstop: repaint any preview still marked dirty. Mostly a
+    /// safety net for newly-created previews and the post-Expose redraw path;
+    /// steady-state painting happens from the DamageNotify handler.
     pub(super) fn repaint_thumbnails(&mut self) -> Result<()> {
         let dirty_keys: Vec<String> = self
             .previews

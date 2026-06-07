@@ -235,17 +235,13 @@ impl MouseListener {
                                 continue;
                             }
                             last_cycle = Some(now);
-                        }
-                        if code == snap.forward_button {
-                            if let Err(e) = Self::cycle_forward(&wm, &state, snap.minimize_inactive)
-                            {
-                                eprintln!("Failed to cycle forward: {}", e);
-                            }
-                        } else if code == snap.backward_button {
-                            if let Err(e) =
+                            let result = if code == snap.forward_button {
+                                Self::cycle_forward(&wm, &state, snap.minimize_inactive)
+                            } else {
                                 Self::cycle_backward(&wm, &state, snap.minimize_inactive)
-                            {
-                                eprintln!("Failed to cycle backward: {}", e);
+                            };
+                            if let Err(e) = result {
+                                eprintln!("Failed to cycle: {}", e);
                             }
                         }
                     }
@@ -368,12 +364,7 @@ impl MouseListener {
         state: &Arc<Mutex<CycleState>>,
         minimize_inactive: bool,
     ) -> Result<()> {
-        let mut state = state.lock().unwrap();
-        if let Ok(active) = wm.get_active_window() {
-            state.sync_with_active(active);
-        }
-        state.cycle_forward(&**wm, minimize_inactive)?;
-        Ok(())
+        Self::run_cycle(wm, state, minimize_inactive, 1)
     }
 
     fn cycle_backward(
@@ -381,11 +372,30 @@ impl MouseListener {
         state: &Arc<Mutex<CycleState>>,
         minimize_inactive: bool,
     ) -> Result<()> {
+        Self::run_cycle(wm, state, minimize_inactive, -1)
+    }
+
+    /// Shared lock → (grace-gated) sync-with-active → cycle path for both
+    /// directions. The `get_active_window` round-trip is skipped inside the
+    /// activation grace window, where `sync_with_active` would no-op anyway,
+    /// so it's pure latency on a fast burst.
+    fn run_cycle(
+        wm: &Arc<dyn WindowManager>,
+        state: &Arc<Mutex<CycleState>>,
+        minimize_inactive: bool,
+        step: isize,
+    ) -> Result<()> {
         let mut state = state.lock().unwrap();
-        if let Ok(active) = wm.get_active_window() {
-            state.sync_with_active(active);
+        if !state.in_activation_grace() {
+            if let Ok(active) = wm.get_active_window() {
+                state.sync_with_active(active);
+            }
         }
-        state.cycle_backward(&**wm, minimize_inactive)?;
+        if step >= 0 {
+            state.cycle_forward(&**wm, minimize_inactive)?;
+        } else {
+            state.cycle_backward(&**wm, minimize_inactive)?;
+        }
         Ok(())
     }
 }
