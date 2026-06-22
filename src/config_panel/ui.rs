@@ -2,16 +2,16 @@
 //! the four body sections (display mode, cycle order, hotkeys, previews).
 
 use iced::widget::{
-    button, checkbox, column, container, mouse_area, pick_list, radio, row, slider, text,
-    text_input, tooltip, Space,
+    button, checkbox, column, container, mouse_area, radio, row, slider, text, text_input,
+    tooltip, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, Vector};
 
-use crate::config::DisplayMode;
+use crate::config::{DisplayMode, Hotkey};
 
 use super::{
-    code_to_label, hotkey_label, CaptureTarget, Message, Panel, SliderField, Tab, CAPTION_SIZE, LOGO_SIZE,
-    MODIFIER_CHOICES, NICOTINE_BLACK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED,
+    hotkey_label, CaptureTarget, Message, Panel, SliderField, Tab, CAPTION_SIZE, LOGO_SIZE,
+    NICOTINE_BLACK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED,
     SECTION_SIZE,
 };
 
@@ -290,7 +290,7 @@ fn characters_section(panel: &Panel) -> Element<'_, Message> {
                 label,
                 130.0,
             ))
-            .on_right_press(Message::ClearCharacterHotkey(name.clone())),
+            .on_right_press(Message::ClearBinding(CaptureTarget::Character(name.clone()))),
             container(
                 text("Left-click: set  ·  Right-click: clear")
                     .size(CAPTION_SIZE)
@@ -344,75 +344,30 @@ fn characters_section(panel: &Panel) -> Element<'_, Message> {
 }
 
 fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
-    let forward = bind_row(
-        panel,
-        "Forward:",
-        CaptureTarget::ForwardKey,
-        code_to_label(panel.config.forward_key),
-    );
-    let backward = bind_row(
-        panel,
-        "Backward:",
-        CaptureTarget::BackwardKey,
-        code_to_label(panel.config.backward_key),
-    );
-
-    let modifier_label = match panel.config.modifier_key {
-        Some(vk) => code_to_label(vk),
-        None => "None".to_string(),
-    };
-    let mut modifier = bind_row(
-        panel,
-        "Modifier:",
-        CaptureTarget::ModifierKey,
-        modifier_label,
-    );
-    if panel.config.modifier_key.is_some() {
-        modifier = modifier.push(button(text("Clear")).on_press(Message::ClearModifier));
-    }
-
-    let toggle_label = match panel.config.toggle_previews_key {
-        Some(vk) => code_to_label(vk),
-        None => "None".to_string(),
-    };
-    let toggle_mod_selected = MODIFIER_CHOICES
-        .iter()
-        .copied()
-        .find(|m| m.code == panel.config.toggle_previews_modifier);
-    let mut toggle_previews = bind_row(
-        panel,
-        "Toggle previews:",
-        CaptureTarget::TogglePreviews,
-        toggle_label,
-    );
-    toggle_previews = toggle_previews.push(
-        pick_list(
-            MODIFIER_CHOICES,
-            toggle_mod_selected,
-            Message::TogglePreviewsModifierChanged,
-        )
-        .width(Length::Fixed(80.0)),
-    );
-    if panel.config.toggle_previews_key.is_some() {
-        toggle_previews =
-            toggle_previews.push(button(text("Clear")).on_press(Message::ClearTogglePreviews));
-    }
-
     column![
         section_header("Keyboard Hotkeys"),
         checkbox(panel.config.enable_keyboard_buttons)
             .label("Enable keyboard cycling")
             .on_toggle(Message::KeyboardEnabledToggled),
-        forward,
-        backward,
-        modifier,
-        caption(
-            "Click a binding to record the next key you press. Esc cancels. Set both keys to the \
-             same value with a modifier to cycle backward via modifier+key (e.g. Tab + Shift+Tab)."
+        keybind_chip_row(panel, "Forward:", CaptureTarget::ForwardKey, &panel.config.forward_key),
+        keybind_chip_row(
+            panel,
+            "Backward:",
+            CaptureTarget::BackwardKey,
+            &panel.config.backward_key,
         ),
-        toggle_previews,
         caption(
-            "Toggle previews shows/hides all preview windows with one key — independent of \
+            "Left-click a binding to record a key chord, mouse button, or wheel notch \
+             (Esc cancels). Right-click clears it. Backward defaults to Shift+forward."
+        ),
+        keybind_chip_row(
+            panel,
+            "Toggle overlay:",
+            CaptureTarget::TogglePreviews,
+            &panel.config.toggle_previews_key,
+        ),
+        caption(
+            "Toggle overlay shows/hides the whole overlay with one binding — independent of \
              keyboard cycling. Leave unbound if you don't want it."
         ),
         checkbox(panel.config.enable_mouse_buttons)
@@ -424,6 +379,40 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
         ),
     ]
     .spacing(8)
+    .into()
+}
+
+/// A labelled keybind chip: left-click to record (key chord / mouse button /
+/// wheel), right-click to clear, with a tooltip. Shared by every bind site.
+fn keybind_chip_row(
+    panel: &Panel,
+    label: &'static str,
+    target: CaptureTarget,
+    hk: &Hotkey,
+) -> Element<'static, Message> {
+    let text_label = if hk.is_bound() {
+        hotkey_label(hk)
+    } else {
+        "unbound".into()
+    };
+    let chip = tooltip(
+        mouse_area(bind_button(panel, target.clone(), text_label, 150.0))
+            .on_right_press(Message::ClearBinding(target)),
+        container(
+            text("Left-click: set  ·  Right-click: clear")
+                .size(CAPTION_SIZE)
+                .color(NICOTINE_BLACK),
+        )
+        .padding(6)
+        .style(|_| filled(NICOTINE_CREAM)),
+        tooltip::Position::Top,
+    );
+    row![
+        text(label).width(Length::Fixed(120.0)),
+        chip,
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
     .into()
 }
 
@@ -506,22 +495,6 @@ fn slider_field<'a>(
     .spacing(8)
     .align_y(Alignment::Center)
     .into()
-}
-
-/// A labeled key-binding row (`<label>  [ bind chip ]`) for the
-/// Forward/Backward/Modifier entries on the Hotkeys tab.
-fn bind_row(
-    panel: &Panel,
-    label: &'static str,
-    target: CaptureTarget,
-    current: String,
-) -> iced::widget::Row<'static, Message> {
-    row![
-        text(label).width(Length::Fixed(120.0)),
-        bind_button(panel, target, current, 200.0),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center)
 }
 
 fn bind_button(

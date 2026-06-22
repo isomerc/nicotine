@@ -58,7 +58,6 @@ pub(super) const LOGO_SIZE: f32 = 44.0;
 pub(super) enum CaptureTarget {
     ForwardKey,
     BackwardKey,
-    ModifierKey,
     TogglePreviews,
     Character(String),
 }
@@ -236,60 +235,6 @@ fn constrain_dimensions(target_width: u32, ratio: f64) -> (u32, u32) {
     }
 }
 
-/// One entry in the modifier dropdown. Codes are platform-specific:
-/// Win32 VK on Windows, Linux evdev keycodes on Linux.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ModifierChoice {
-    pub code: Option<u16>,
-    pub label: &'static str,
-}
-
-impl std::fmt::Display for ModifierChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.label)
-    }
-}
-
-#[cfg(windows)]
-pub(super) const MODIFIER_CHOICES: &[ModifierChoice] = &[
-    ModifierChoice {
-        code: None,
-        label: "None",
-    },
-    ModifierChoice {
-        code: Some(0x10),
-        label: "Shift",
-    },
-    ModifierChoice {
-        code: Some(0x11),
-        label: "Ctrl",
-    },
-    ModifierChoice {
-        code: Some(0x12),
-        label: "Alt",
-    },
-];
-
-#[cfg(unix)]
-pub(super) const MODIFIER_CHOICES: &[ModifierChoice] = &[
-    ModifierChoice {
-        code: None,
-        label: "None",
-    },
-    ModifierChoice {
-        code: Some(42),
-        label: "Shift",
-    }, // KEY_LEFTSHIFT
-    ModifierChoice {
-        code: Some(29),
-        label: "Ctrl",
-    }, // KEY_LEFTCTRL
-    ModifierChoice {
-        code: Some(56),
-        label: "Alt",
-    }, // KEY_LEFTALT
-];
-
 pub(super) struct Panel {
     pub config: Config,
     /// Shared settings watched by the preview manager for live updates.
@@ -397,14 +342,19 @@ impl Panel {
         mods.sort_unstable();
         mods.dedup();
         let hk = Hotkey { mods, kind, code };
-        if let CaptureTarget::Character(name) = &target {
-            self.config.character_hotkeys.insert(name.clone(), hk);
-            self.capturing = None;
-            self.capture_mods = iced::keyboard::Modifiers::empty();
-            self.touch();
-            #[cfg(windows)]
-            self.end_windows_capture();
+        match &target {
+            CaptureTarget::ForwardKey => self.config.forward_key = hk,
+            CaptureTarget::BackwardKey => self.config.backward_key = hk,
+            CaptureTarget::TogglePreviews => self.config.toggle_previews_key = hk,
+            CaptureTarget::Character(name) => {
+                self.config.character_hotkeys.insert(name.clone(), hk);
+            }
         }
+        self.capturing = None;
+        self.capture_mods = iced::keyboard::Modifiers::empty();
+        self.touch();
+        #[cfg(windows)]
+        self.end_windows_capture();
     }
 
     fn handle_capture_key(&mut self, event: iced::keyboard::Event) -> Task<Message> {
@@ -445,7 +395,7 @@ impl Panel {
             key,
             Key::Named(Named::Control | Named::Shift | Named::Alt | Named::Super)
         );
-        if is_mod_key && matches!(target, CaptureTarget::Character(_)) {
+        if is_mod_key {
             return Task::none();
         }
 
@@ -455,16 +405,13 @@ impl Panel {
         let code = iced_key_to_code(&key);
 
         if let Some(vk) = code {
+            let hk = Hotkey::key_with_mods(vk, iced_mods_to_codes(&modifiers));
             match &target {
-                CaptureTarget::ForwardKey => self.config.forward_key = vk,
-                CaptureTarget::BackwardKey => self.config.backward_key = vk,
-                CaptureTarget::ModifierKey => self.config.modifier_key = Some(vk),
-                CaptureTarget::TogglePreviews => self.config.toggle_previews_key = Some(vk),
+                CaptureTarget::ForwardKey => self.config.forward_key = hk,
+                CaptureTarget::BackwardKey => self.config.backward_key = hk,
+                CaptureTarget::TogglePreviews => self.config.toggle_previews_key = hk,
                 CaptureTarget::Character(name) => {
-                    let mods = iced_mods_to_codes(&modifiers);
-                    self.config
-                        .character_hotkeys
-                        .insert(name.clone(), Hotkey::key_with_mods(vk, mods));
+                    self.config.character_hotkeys.insert(name.clone(), hk);
                 }
             }
             self.capturing = None;
@@ -501,12 +448,9 @@ pub(super) enum Message {
     RemoveCharacter(usize),
     NewCharacterChanged(String),
     AddCharacter,
-    ClearCharacterHotkey(String),
     KeyboardEnabledToggled(bool),
     MouseEnabledToggled(bool),
-    ClearModifier,
-    ClearTogglePreviews,
-    TogglePreviewsModifierChanged(ModifierChoice),
+    ClearBinding(CaptureTarget),
     StartCapture(CaptureTarget),
     TabSelected(Tab),
     GrabRow(usize),
@@ -588,10 +532,6 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
                 panel.touch();
             }
         }
-        Message::ClearCharacterHotkey(name) => {
-            panel.config.character_hotkeys.remove(&name);
-            panel.touch();
-        }
         Message::KeyboardEnabledToggled(v) => {
             panel.config.enable_keyboard_buttons = v;
             panel.touch();
@@ -600,17 +540,17 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             panel.config.enable_mouse_buttons = v;
             panel.touch();
         }
-        Message::ClearModifier => {
-            panel.config.modifier_key = None;
-            panel.touch();
-        }
-        Message::ClearTogglePreviews => {
-            panel.config.toggle_previews_key = None;
-            panel.config.toggle_previews_modifier = None;
-            panel.touch();
-        }
-        Message::TogglePreviewsModifierChanged(choice) => {
-            panel.config.toggle_previews_modifier = choice.code;
+        Message::ClearBinding(target) => {
+            match target {
+                CaptureTarget::ForwardKey => panel.config.forward_key = Hotkey::default(),
+                CaptureTarget::BackwardKey => panel.config.backward_key = Hotkey::default(),
+                CaptureTarget::TogglePreviews => {
+                    panel.config.toggle_previews_key = Hotkey::default()
+                }
+                CaptureTarget::Character(name) => {
+                    panel.config.character_hotkeys.remove(&name);
+                }
+            }
             panel.touch();
         }
         Message::StartCapture(target) => {

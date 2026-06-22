@@ -51,7 +51,6 @@ pub struct Hotkey {
     pub code: u16,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // wired into the bind sites in following commits
 impl Hotkey {
     /// A bare keyboard-key binding (no modifiers).
     pub fn key(code: u16) -> Self {
@@ -80,6 +79,12 @@ impl Hotkey {
     /// and vice-versa).
     pub fn mods_match(&self, held: &std::collections::HashSet<u16>) -> bool {
         self.mods.len() == held.len() && self.mods.iter().all(|m| held.contains(m))
+    }
+
+    /// Whether anything is bound. Unbound = the default (a key trigger with
+    /// code 0).
+    pub fn is_bound(&self) -> bool {
+        !(self.kind == TriggerKind::Key && self.code == 0)
     }
 
     /// True if `code`/`kind` and modifiers all match the given event.
@@ -163,10 +168,13 @@ pub struct Config {
     pub backward_button: u16, // BTN_EXTRA (mouse button 8)
     #[serde(default = "default_enable_keyboard")]
     pub enable_keyboard_buttons: bool,
+    /// Forward-cycle binding (key chord, mouse button, or wheel).
     #[serde(default = "default_forward_key")]
-    pub forward_key: u16, // KEY_TAB (15) - Tab for forward, Shift+Tab for backward
+    pub forward_key: Hotkey,
+    /// Backward-cycle binding. Default is Shift+forward as a normal chord
+    /// (no separate "modifier key" field any more).
     #[serde(default = "default_backward_key")]
-    pub backward_key: u16, // KEY_TAB (15) - Track SHIFT modifier internally
+    pub backward_key: Hotkey,
     #[serde(default = "default_mouse_device_name")]
     pub mouse_device_name: Option<String>,
     #[serde(default = "default_mouse_device_path")]
@@ -175,8 +183,6 @@ pub struct Config {
     pub minimize_inactive: bool,
     #[serde(default = "default_keyboard_device_path")]
     pub keyboard_device_path: Option<String>,
-    #[serde(default = "default_modifier_key")]
-    pub modifier_key: Option<u16>,
     /// Width of preview windows in pixels (Windows only). Single global value
     /// — every preview gets the same size. Aspect ratio is preserved on the
     /// thumbnail; the window is sized exactly as configured.
@@ -204,17 +210,10 @@ pub struct Config {
     /// preview managers still just read `preview_width`/`preview_height`.
     #[serde(default = "default_constrain_aspect")]
     pub constrain_aspect: bool,
-    /// Optional global hotkey (platform key code — evdev on Linux, Win32
-    /// VK on Windows) that toggles preview-window visibility, i.e. flips
-    /// `show_previews`. `None` = unbound. Bound via the panel's Hotkeys
-    /// tab just like the cycle keys.
+    /// Binding that toggles overlay visibility. Default unbound
+    /// (`Hotkey::default()`, code 0). Bound via the panel like the cycle keys.
     #[serde(default)]
-    pub toggle_previews_key: Option<u16>,
-    /// Optional modifier (Shift/Ctrl/Alt, as a platform key code) that
-    /// must be held with `toggle_previews_key` for the toggle to fire.
-    /// `None` = no modifier (the bare key toggles).
-    #[serde(default)]
-    pub toggle_previews_modifier: Option<u16>,
+    pub toggle_previews_key: Hotkey,
     /// Ordered list of EVE character names. Forward/backward cycling
     /// traverses this order; `switch N` maps target N to entry N-1.
     /// Empty list = cycle through whatever order the window manager
@@ -290,23 +289,23 @@ fn default_enable_keyboard() -> bool {
 }
 
 #[cfg(unix)]
-fn default_forward_key() -> u16 {
-    15 // KEY_TAB — evdev code
+fn default_forward_key() -> Hotkey {
+    Hotkey::key(15) // Tab
 }
 
 #[cfg(windows)]
-fn default_forward_key() -> u16 {
-    0x7A // VK_F11
+fn default_forward_key() -> Hotkey {
+    Hotkey::key(0x7A) // F11
 }
 
 #[cfg(unix)]
-fn default_backward_key() -> u16 {
-    15 // KEY_TAB (Modifier applied if set) — evdev code
+fn default_backward_key() -> Hotkey {
+    Hotkey::key_with_mods(15, vec![42]) // Shift+Tab
 }
 
 #[cfg(windows)]
-fn default_backward_key() -> u16 {
-    0x79 // VK_F10
+fn default_backward_key() -> Hotkey {
+    Hotkey::key(0x79) // F10
 }
 
 fn default_mouse_device_name() -> Option<String> {
@@ -323,10 +322,6 @@ fn default_minimize_inactive() -> bool {
 
 fn default_keyboard_device_path() -> Option<String> {
     None
-}
-
-fn default_modifier_key() -> Option<u16> {
-    None // No modifier for backward shifting by default
 }
 
 fn default_preview_width() -> u32 {
@@ -460,15 +455,13 @@ impl Config {
             mouse_device_path: default_mouse_device_path(),
             minimize_inactive: default_minimize_inactive(),
             keyboard_device_path: default_keyboard_device_path(),
-            modifier_key: default_modifier_key(),
             preview_width: default_preview_width(),
             preview_height: default_preview_height(),
             preview_opacity: default_preview_opacity(),
             show_previews: default_show_previews(),
             hide_active_preview: default_hide_active_preview(),
             constrain_aspect: default_constrain_aspect(),
-            toggle_previews_key: None,
-            toggle_previews_modifier: None,
+            toggle_previews_key: Hotkey::default(),
             characters: Vec::new(),
             display_mode: default_display_mode(),
             positions_locked: false,
@@ -581,21 +574,19 @@ mod tests {
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
-            forward_key: 15,
-            backward_key: 15,
+            forward_key: Hotkey::key(15),
+            backward_key: Hotkey::key(15),
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
             keyboard_device_path: None,
-            modifier_key: None,
             preview_width: 320,
             preview_height: 180,
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
             constrain_aspect: false,
-            toggle_previews_key: None,
-            toggle_previews_modifier: None,
+            toggle_previews_key: Hotkey::default(),
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -620,21 +611,19 @@ mod tests {
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
-            forward_key: 15,
-            backward_key: 15,
+            forward_key: Hotkey::key(15),
+            backward_key: Hotkey::key(15),
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
             keyboard_device_path: None,
-            modifier_key: None,
             preview_width: 320,
             preview_height: 180,
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
             constrain_aspect: false,
-            toggle_previews_key: None,
-            toggle_previews_modifier: None,
+            toggle_previews_key: Hotkey::default(),
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -658,21 +647,19 @@ mod tests {
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
-            forward_key: 15,
-            backward_key: 15,
+            forward_key: Hotkey::key(15),
+            backward_key: Hotkey::key(15),
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
             keyboard_device_path: None,
-            modifier_key: None,
             preview_width: 320,
             preview_height: 180,
             preview_opacity: 55,
             show_previews: true,
             hide_active_preview: true,
             constrain_aspect: true,
-            toggle_previews_key: Some(67),
-            toggle_previews_modifier: Some(42),
+            toggle_previews_key: Hotkey::key_with_mods(67, vec![42]),
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -698,13 +685,8 @@ mod tests {
         );
         assert_eq!(
             deserialized.toggle_previews_key,
-            Some(67),
-            "toggle_previews_key binding must survive a save/load round-trip"
-        );
-        assert_eq!(
-            deserialized.toggle_previews_modifier,
-            Some(42),
-            "toggle_previews_modifier must survive a save/load round-trip"
+            Hotkey::key_with_mods(67, vec![42]),
+            "toggle_previews_key binding (chord) must survive a save/load round-trip"
         );
         assert_eq!(
             deserialized.window_width, 900,

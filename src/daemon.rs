@@ -284,6 +284,7 @@ impl Daemon {
             Arc::clone(&self.wm),
             Arc::clone(&self.state),
             Arc::clone(&held_modifiers),
+            Arc::clone(&self.live),
         );
         KeyboardListener::spawn(
             Arc::clone(&self.keyboard_config),
