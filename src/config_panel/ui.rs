@@ -395,7 +395,7 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
         .find(|m| m.code == panel.config.toggle_previews_modifier);
     let mut toggle_previews = bind_row(
         panel,
-        "Toggle previews:",
+        "Toggle overlay:",
         CaptureTarget::TogglePreviews,
         toggle_label,
     );

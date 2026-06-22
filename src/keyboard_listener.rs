@@ -228,10 +228,14 @@ impl KeyboardListener {
                 ) {
                     if event.value() == 1 {
                         let mut live = live.lock().unwrap();
-                        live.show_previews = !live.show_previews;
+                        // Instant master overlay toggle: flip the transient
+                        // overlay_hidden flag. The managers unmap/remap every
+                        // overlay window in place (no teardown), so toggling
+                        // back is instant and positions are preserved.
+                        live.overlay_hidden = !live.overlay_hidden;
                         println!(
-                            "Preview windows toggled {} via hotkey",
-                            if live.show_previews { "on" } else { "off" }
+                            "Overlay toggled {} via hotkey",
+                            if live.overlay_hidden { "hidden" } else { "shown" }
                         );
                     }
                     continue;

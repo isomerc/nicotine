@@ -54,6 +54,12 @@ pub struct LiveSettings {
     /// away from reappears. Read live so the toggle takes effect without
     /// a restart.
     pub hide_active_preview: bool,
+    /// Transient master "hide the whole overlay" flag, flipped by the
+    /// overlay toggle hotkey. Unlike `show_previews` (a persisted config
+    /// setting that tears the windows down), this just unmaps/hides every
+    /// overlay window in place so toggling back is instant and positions
+    /// are preserved. NOT persisted — always starts false on launch.
+    pub overlay_hidden: bool,
 }
 
 impl LiveSettings {
@@ -66,6 +72,7 @@ impl LiveSettings {
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
             hide_active_preview: config.hide_active_preview,
+            overlay_hidden: false,
         }))
     }
 }

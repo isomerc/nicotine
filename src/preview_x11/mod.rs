@@ -541,9 +541,14 @@ impl PreviewManager {
     /// so re-running this hides the newly-active preview and remaps the
     /// one cycled away from.
     fn apply_active_visibility(&mut self) {
-        let hide_active = self.live.lock_recover().hide_active_preview;
+        let (hide_active, overlay_hidden) = {
+            let live = self.live.lock_recover();
+            (live.hide_active_preview, live.overlay_hidden)
+        };
         for preview in self.previews.values_mut() {
-            let want_hidden = preview_should_hide(hide_active, preview.is_active);
+            // The master overlay toggle hides everything; otherwise fall
+            // back to the per-client "hide active" rule.
+            let want_hidden = overlay_hidden || preview_should_hide(hide_active, preview.is_active);
             if want_hidden == preview.hidden {
                 continue;
             }
@@ -555,6 +560,16 @@ impl PreviewManager {
                 // Backing contents are undefined after a remap; force the
                 // loop-tick repaint to re-present a complete frame.
                 preview.dirty = true;
+            }
+        }
+        // List-view window (Display Mode = List) is a single window; the
+        // master toggle hides/shows it too. map/unmap on an already-in-state
+        // window is a no-op, so this is safe to call every tick.
+        if let Some(list) = &self.list_window {
+            if overlay_hidden {
+                let _ = self.conn.unmap_window(list.window);
+            } else {
+                let _ = self.conn.map_window(list.window);
             }
         }
     }
