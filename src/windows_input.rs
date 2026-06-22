@@ -299,18 +299,19 @@ fn run_listener(
             continue;
         }
 
-        // Preview-visibility toggle hotkey? Flip the shared LiveSettings
-        // flag the preview manager watches; it shows/hides on the next
-        // reconcile tick, same as the panel checkbox.
+        // Overlay show/hide toggle hotkey. Flips the transient
+        // `overlay_hidden` flag the managers watch; they unmap/remap every
+        // overlay window in place on the next reconcile tick (instant,
+        // positions preserved) — matching the Linux listener.
         if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_TOGGLE_PREVIEWS_ID {
             let mut live_guard = live.lock().unwrap();
-            live_guard.show_previews = !live_guard.show_previews;
+            live_guard.overlay_hidden = !live_guard.overlay_hidden;
             println!(
-                "Preview windows toggled {} via hotkey",
-                if live_guard.show_previews {
-                    "on"
+                "Overlay toggled {} via hotkey",
+                if live_guard.overlay_hidden {
+                    "hidden"
                 } else {
-                    "off"
+                    "shown"
                 }
             );
             continue;
