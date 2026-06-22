@@ -60,6 +60,8 @@ pub(super) enum CaptureTarget {
     BackwardKey,
     ModifierKey,
     TogglePreviews,
+    BossHide,
+    BossKill,
     Character(String),
 }
 
@@ -347,6 +349,8 @@ impl Panel {
                 CaptureTarget::BackwardKey => self.config.backward_key = vk,
                 CaptureTarget::ModifierKey => self.config.modifier_key = Some(vk),
                 CaptureTarget::TogglePreviews => self.config.toggle_previews_key = Some(vk),
+                CaptureTarget::BossHide => self.config.boss_hide_key = Some(vk),
+                CaptureTarget::BossKill => self.config.boss_kill_key = Some(vk),
                 CaptureTarget::Character(name) => {
                     let modifier = self
                         .config
@@ -399,6 +403,10 @@ pub(super) enum Message {
     ClearModifier,
     ClearTogglePreviews,
     TogglePreviewsModifierChanged(ModifierChoice),
+    ClearBossHide,
+    BossHideModifierChanged(ModifierChoice),
+    ClearBossKill,
+    BossKillModifierChanged(ModifierChoice),
     StartCapture(CaptureTarget),
     TabSelected(Tab),
     GrabRow(usize),
@@ -513,6 +521,24 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         }
         Message::TogglePreviewsModifierChanged(choice) => {
             panel.config.toggle_previews_modifier = choice.code;
+            panel.touch();
+        }
+        Message::ClearBossHide => {
+            panel.config.boss_hide_key = None;
+            panel.config.boss_hide_modifier = None;
+            panel.touch();
+        }
+        Message::BossHideModifierChanged(choice) => {
+            panel.config.boss_hide_modifier = choice.code;
+            panel.touch();
+        }
+        Message::ClearBossKill => {
+            panel.config.boss_kill_key = None;
+            panel.config.boss_kill_modifier = None;
+            panel.touch();
+        }
+        Message::BossKillModifierChanged(choice) => {
+            panel.config.boss_kill_modifier = choice.code;
             panel.touch();
         }
         Message::StartCapture(target) => {

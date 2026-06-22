@@ -26,6 +26,8 @@ const HOTKEY_BACKWARD_ID: i32 = 1002;
 /// Global hotkey that flips `LiveSettings.show_previews` (show/hide all
 /// preview windows). Registered only when the user has bound a key.
 const HOTKEY_TOGGLE_PREVIEWS_ID: i32 = 1003;
+const HOTKEY_BOSS_HIDE_ID: i32 = 1004;
+const HOTKEY_BOSS_KILL_ID: i32 = 1005;
 /// Per-character hotkey IDs are assigned starting here, one per bound
 /// character, in the order the config lists them. Separated from the
 /// cycle IDs so the message dispatch can tell them apart by ID range.
@@ -239,6 +241,12 @@ fn run_listener(
     // Register keyboard hotkeys if enabled.
     register_hotkeys(&config);
 
+    // Boss-key (hide+mute) state, so a second press restores exactly what
+    // the first press minimized + muted.
+    let mut bossed = false;
+    let mut boss_minimized: Vec<u32> = Vec::new();
+    let mut boss_muted: Vec<u32> = Vec::new();
+
     let mut msg = MSG::default();
     loop {
         let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
@@ -316,6 +324,42 @@ fn run_listener(
             continue;
         }
 
+        // Boss key — hide + mute (a toggle). Minimize + mute every EVE
+        // client and hide the overlay; press again to restore exactly what
+        // we changed.
+        if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_BOSS_HIDE_ID {
+            if bossed {
+                for id in boss_minimized.drain(..) {
+                    let _ = wm.restore_window(id);
+                }
+                crate::boss::unmute(&boss_muted);
+                boss_muted.clear();
+                live.lock().unwrap().bossed = false;
+                bossed = false;
+                println!("Boss key: restored");
+            } else {
+                boss_minimized.clear();
+                if let Ok(windows) = wm.get_eve_windows() {
+                    for w in windows {
+                        if wm.minimize_window(w.id).is_ok() {
+                            boss_minimized.push(w.id);
+                        }
+                    }
+                }
+                boss_muted = crate::boss::mute_eve(&crate::boss::eve_client_pids());
+                live.lock().unwrap().bossed = true;
+                bossed = true;
+                println!("Boss key: hidden + muted {} client(s)", boss_minimized.len());
+            }
+            continue;
+        }
+
+        // Boss key — kill all. No undo.
+        if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_BOSS_KILL_ID {
+            eprintln!("Boss key: killing all EVE + Nicotine processes");
+            crate::boss::kill_all();
+        }
+
         // Per-character jump hotkey?
         if msg.message == WM_HOTKEY {
             let id = msg.wParam.0 as i32;
@@ -378,6 +422,26 @@ unsafe fn do_register_hotkeys(config: &Config) {
         );
     }
 
+    // Boss keys — global, independent of cycling enable.
+    if let Some(vk) = config.boss_hide_key {
+        let modifier = config.boss_hide_modifier.and_then(modifier_kind);
+        let _ = RegisterHotKey(
+            None,
+            HOTKEY_BOSS_HIDE_ID,
+            modifier_to_winapi(modifier),
+            vk as u32,
+        );
+    }
+    if let Some(vk) = config.boss_kill_key {
+        let modifier = config.boss_kill_modifier.and_then(modifier_kind);
+        let _ = RegisterHotKey(
+            None,
+            HOTKEY_BOSS_KILL_ID,
+            modifier_to_winapi(modifier),
+            vk as u32,
+        );
+    }
+
     let mut lookup = character_lookup().lock().unwrap();
     lookup.clear();
     for plan in plan_character_hotkeys(
@@ -406,6 +470,8 @@ fn unregister_hotkeys() {
         let _ = UnregisterHotKey(None, HOTKEY_FORWARD_ID);
         let _ = UnregisterHotKey(None, HOTKEY_BACKWARD_ID);
         let _ = UnregisterHotKey(None, HOTKEY_TOGGLE_PREVIEWS_ID);
+        let _ = UnregisterHotKey(None, HOTKEY_BOSS_HIDE_ID);
+        let _ = UnregisterHotKey(None, HOTKEY_BOSS_KILL_ID);
         let mut lookup = character_lookup().lock().unwrap();
         for id in lookup.keys() {
             let _ = UnregisterHotKey(None, *id);

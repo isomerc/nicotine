@@ -26,6 +26,10 @@ pub struct KeyboardConfig {
     pub character_hotkeys: HashMap<String, CharacterHotkey>,
     pub toggle_previews_key: Option<u16>,
     pub toggle_previews_modifier: Option<u16>,
+    pub boss_hide_key: Option<u16>,
+    pub boss_hide_modifier: Option<u16>,
+    pub boss_kill_key: Option<u16>,
+    pub boss_kill_modifier: Option<u16>,
 }
 
 impl KeyboardConfig {
@@ -40,6 +44,10 @@ impl KeyboardConfig {
             character_hotkeys: c.character_hotkeys.clone(),
             toggle_previews_key: c.toggle_previews_key,
             toggle_previews_modifier: c.toggle_previews_modifier,
+            boss_hide_key: c.boss_hide_key,
+            boss_hide_modifier: c.boss_hide_modifier,
+            boss_kill_key: c.boss_kill_key,
+            boss_kill_modifier: c.boss_kill_modifier,
         }
     }
 
@@ -48,7 +56,11 @@ impl KeyboardConfig {
     /// off AND no character hotkeys AND no preview-toggle key are bound —
     /// otherwise a press it cares about would be missed.
     fn has_work(&self) -> bool {
-        self.enable || !self.character_hotkeys.is_empty() || self.toggle_previews_key.is_some()
+        self.enable
+            || !self.character_hotkeys.is_empty()
+            || self.toggle_previews_key.is_some()
+            || self.boss_hide_key.is_some()
+            || self.boss_kill_key.is_some()
     }
 }
 
@@ -80,6 +92,11 @@ impl KeyboardListener {
         let mut pressed_modifiers: HashSet<u16> = HashSet::new();
         let mut announced_listening = false;
         let mut announced_idle = false;
+        // Boss-key (hide+mute) state, so a second press restores exactly
+        // what the first press minimized + muted.
+        let mut bossed = false;
+        let mut boss_minimized: Vec<u32> = Vec::new();
+        let mut boss_muted: Vec<u32> = Vec::new();
 
         loop {
             let snap = shared.lock().unwrap().clone();
@@ -150,6 +167,8 @@ impl KeyboardListener {
             let modifier_codes: HashSet<u16> = std::iter::empty()
                 .chain(snap.modifier_key)
                 .chain(snap.toggle_previews_modifier)
+                .chain(snap.boss_hide_modifier)
+                .chain(snap.boss_kill_modifier)
                 .chain(snap.character_hotkeys.values().filter_map(|hk| hk.modifier))
                 .collect();
             // Forget pressed modifiers that are no longer modifiers in
@@ -233,6 +252,63 @@ impl KeyboardListener {
                             "Preview windows toggled {} via hotkey",
                             if live.show_previews { "on" } else { "off" }
                         );
+                    }
+                    continue;
+                }
+
+                // Boss key — hide + mute (a toggle). On press, minimize and
+                // mute every EVE client and hide the overlay; on the next
+                // press, restore exactly what we changed. Global — not
+                // gated on focus (it's an emergency key). Acts on the
+                // initial press only so a held key doesn't strobe.
+                if toggle_previews_should_fire(
+                    snap.boss_hide_key,
+                    snap.boss_hide_modifier,
+                    code,
+                    &pressed_modifiers,
+                ) {
+                    if event.value() == 1 {
+                        if bossed {
+                            // Restore.
+                            for id in boss_minimized.drain(..) {
+                                let _ = wm.restore_window(id);
+                            }
+                            crate::boss::unmute(&boss_muted);
+                            boss_muted.clear();
+                            live.lock().unwrap().bossed = false;
+                            bossed = false;
+                            println!("Boss key: restored");
+                        } else {
+                            // Engage: minimize every EVE window, mute their
+                            // audio, hide the overlay.
+                            boss_minimized.clear();
+                            if let Ok(windows) = wm.get_eve_windows() {
+                                for w in windows {
+                                    if wm.minimize_window(w.id).is_ok() {
+                                        boss_minimized.push(w.id);
+                                    }
+                                }
+                            }
+                            boss_muted = crate::boss::mute_eve(&crate::boss::eve_client_pids());
+                            live.lock().unwrap().bossed = true;
+                            bossed = true;
+                            println!("Boss key: hidden + muted {} client(s)", boss_minimized.len());
+                        }
+                    }
+                    continue;
+                }
+
+                // Boss key — kill all. Force-terminate every EVE client and
+                // every Nicotine process (this one included). No undo.
+                if toggle_previews_should_fire(
+                    snap.boss_kill_key,
+                    snap.boss_kill_modifier,
+                    code,
+                    &pressed_modifiers,
+                ) {
+                    if event.value() == 1 {
+                        eprintln!("Boss key: killing all EVE + Nicotine processes");
+                        crate::boss::kill_all();
                     }
                     continue;
                 }
@@ -567,6 +643,10 @@ mod tests {
             character_hotkeys: HashMap::new(),
             toggle_previews_key: None,
             toggle_previews_modifier: None,
+            boss_hide_key: None,
+            boss_hide_modifier: None,
+            boss_kill_key: None,
+            boss_kill_modifier: None,
         }
     }
 

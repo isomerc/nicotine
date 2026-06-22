@@ -54,6 +54,11 @@ pub struct LiveSettings {
     /// away from reappears. Read live so the toggle takes effect without
     /// a restart.
     pub hide_active_preview: bool,
+    /// Transient "boss key engaged" flag. When true the overlay is hidden
+    /// (the boss-hide hotkey also minimizes + mutes the EVE clients). NOT
+    /// persisted — always starts false on launch. Restored by pressing the
+    /// boss key again.
+    pub bossed: bool,
 }
 
 impl LiveSettings {
@@ -66,6 +71,7 @@ impl LiveSettings {
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
             hide_active_preview: config.hide_active_preview,
+            bossed: false,
         }))
     }
 }
@@ -137,6 +143,19 @@ pub struct Config {
     /// `None` = no modifier (the bare key toggles).
     #[serde(default)]
     pub toggle_previews_modifier: Option<u16>,
+    /// Boss key — hide + mute. Minimizes + mutes every EVE client and hides
+    /// the overlay; press again to restore. `None` =
+    /// unbound. Bound via the panel's Hotkeys tab.
+    #[serde(default)]
+    pub boss_hide_key: Option<u16>,
+    #[serde(default)]
+    pub boss_hide_modifier: Option<u16>,
+    /// Boss key — kill all. Force-terminates every EVE client and every
+    /// Nicotine process. `None` = unbound.
+    #[serde(default)]
+    pub boss_kill_key: Option<u16>,
+    #[serde(default)]
+    pub boss_kill_modifier: Option<u16>,
     /// Ordered list of EVE character names. Forward/backward cycling
     /// traverses this order; `switch N` maps target N to entry N-1.
     /// Empty list = cycle through whatever order the window manager
@@ -391,6 +410,10 @@ impl Config {
             constrain_aspect: default_constrain_aspect(),
             toggle_previews_key: None,
             toggle_previews_modifier: None,
+            boss_hide_key: None,
+            boss_hide_modifier: None,
+            boss_kill_key: None,
+            boss_kill_modifier: None,
             characters: Vec::new(),
             display_mode: default_display_mode(),
             positions_locked: false,
@@ -477,6 +500,10 @@ mod tests {
             constrain_aspect: false,
             toggle_previews_key: None,
             toggle_previews_modifier: None,
+            boss_hide_key: None,
+            boss_hide_modifier: None,
+            boss_kill_key: None,
+            boss_kill_modifier: None,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -516,6 +543,10 @@ mod tests {
             constrain_aspect: false,
             toggle_previews_key: None,
             toggle_previews_modifier: None,
+            boss_hide_key: None,
+            boss_hide_modifier: None,
+            boss_kill_key: None,
+            boss_kill_modifier: None,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -554,6 +585,10 @@ mod tests {
             constrain_aspect: true,
             toggle_previews_key: Some(67),
             toggle_previews_modifier: Some(42),
+            boss_hide_key: Some(99),
+            boss_hide_modifier: None,
+            boss_kill_key: None,
+            boss_kill_modifier: None,
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -586,6 +621,11 @@ mod tests {
             deserialized.toggle_previews_modifier,
             Some(42),
             "toggle_previews_modifier must survive a save/load round-trip"
+        );
+        assert_eq!(
+            deserialized.boss_hide_key,
+            Some(99),
+            "boss_hide_key must survive a save/load round-trip"
         );
         assert_eq!(
             deserialized.window_width, 900,
