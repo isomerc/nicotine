@@ -1,7 +1,8 @@
 use crate::config::{Config, LiveSettings};
 use crate::cycle_state::CycleState;
 use crate::preview_common::{
-    preview_should_hide, snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
+    preview_should_hide, snap_position, snap_to_screen_edges, DragRect, DragState, DRAG_THRESHOLD_PX,
+    SNAP_THRESHOLD_PX,
 };
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
@@ -33,12 +34,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
     SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST,
-    IDC_ARROW, LWA_ALPHA, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
-    WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
-    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE,
+    TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, HICON, HMENU,
+    HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    SWP_FRAMECHANGED, SWP_NOZORDER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WS_VISIBLE,
 };
 
 /// Type alias for DWM thumbnail handles. windows-rs 0.59 doesn't expose a
@@ -72,6 +74,33 @@ fn positions_locked() -> bool {
         return false;
     }
     unsafe { (*ptr).live.lock().unwrap().positions_locked }
+}
+
+/// Read the shared `snapping` flag (defaults to true if the manager isn't
+/// up yet). Drag handlers consult it to decide whether to snap to other
+/// previews + screen edges.
+fn snapping_enabled() -> bool {
+    let ptr = MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
+    if ptr.is_null() {
+        return true;
+    }
+    unsafe { (*ptr).live.lock().unwrap().snapping }
+}
+
+/// The multi-monitor virtual desktop as a DragRect, for screen-edge snapping.
+fn virtual_screen_rect() -> DragRect {
+    unsafe {
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        DragRect {
+            left: vx,
+            top: vy,
+            right: vx + vw,
+            bottom: vy + vh,
+        }
+    }
 }
 
 /// WinEvent hook callback for EVENT_SYSTEM_FOREGROUND. Fires synchronously
@@ -320,6 +349,7 @@ impl PreviewManager {
         // windows resize in real time.
         self.apply_live_size();
         self.apply_live_opacity();
+        self.apply_live_click_through();
         // Catches the setting being toggled and previews created since the
         // last tick; the instant per-cycle response comes from the same
         // call at the end of update_active.
@@ -453,9 +483,14 @@ impl PreviewManager {
             .filter(|(x, y)| position_on_screen(*x, *y))
             .unwrap_or((20, 20));
 
+        let list_click_through = if self.config.click_through {
+            WS_EX_TRANSPARENT
+        } else {
+            WINDOW_EX_STYLE(0)
+        };
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | list_click_through,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(title.as_ptr()),
                 WS_POPUP | WS_VISIBLE,
@@ -544,6 +579,43 @@ impl PreviewManager {
         self.config.preview_opacity = want;
         for preview in self.previews.values() {
             apply_window_opacity(preview.hwnd, want);
+        }
+    }
+
+    /// Read LiveSettings.click_through; if it flipped, toggle WS_EX_TRANSPARENT
+    /// on every preview so pointer input passes through (or is captured again).
+    /// New previews get the current state at creation, so this only handles the
+    /// live toggle. Caches in `self.config.click_through`, mirroring the other
+    /// apply_live_* methods.
+    fn apply_live_click_through(&mut self) {
+        let want = self.live.lock().unwrap().click_through;
+        if want == self.config.click_through {
+            return;
+        }
+        self.config.click_through = want;
+        let bit = WS_EX_TRANSPARENT.0 as isize;
+        // The list-view window is part of the overlay too.
+        let mut hwnds: Vec<HWND> = self.previews.values().map(|p| p.hwnd).collect();
+        if let Some(list) = &self.list {
+            hwnds.push(list.hwnd);
+        }
+        for hwnd in hwnds {
+            unsafe {
+                let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                let new_ex = if want { ex | bit } else { ex & !bit };
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex);
+                // An ex-style change isn't applied until a frame update;
+                // SWP_FRAMECHANGED forces it without moving/resizing/restacking.
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
         }
     }
 
@@ -668,9 +740,22 @@ impl PreviewManager {
 
         let module = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW failed")?;
 
+        // WS_EX_TRANSPARENT makes the window click-through (pointer input
+        // falls through to whatever is behind it). Combined with the
+        // already-present WS_EX_LAYERED, this is the standard Win32 overlay
+        // passthrough. apply_live_click_through toggles it later.
+        let click_through_style = if self.config.click_through {
+            WS_EX_TRANSPARENT
+        } else {
+            WINDOW_EX_STYLE(0)
+        };
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_LAYERED
+                    | click_through_style,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(title_w.as_ptr()),
                 WS_POPUP | WS_VISIBLE,
@@ -860,25 +945,33 @@ unsafe extern "system" fn preview_wnd_proc(
                     let mut new_x = state.drag.origin_window.0 + dx;
                     let mut new_y = state.drag.origin_window.1 + dy;
 
-                    // Snap to dock with other previews if any of our edges
-                    // come within SNAP_THRESHOLD of theirs.
-                    let mut self_rect = RECT::default();
-                    if GetWindowRect(hwnd, &mut self_rect).is_ok() {
-                        let width = self_rect.right - self_rect.left;
-                        let height = self_rect.bottom - self_rect.top;
-                        let mgr_ptr = MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
-                        if !mgr_ptr.is_null() {
-                            let others = (*mgr_ptr).collect_other_rects(hwnd);
-                            let (sx, sy) = snap_position(
+                    // Snap to other previews + screen edges, unless snapping
+                    // is turned off in the panel.
+                    if snapping_enabled() {
+                        let mut self_rect = RECT::default();
+                        if GetWindowRect(hwnd, &mut self_rect).is_ok() {
+                            let width = self_rect.right - self_rect.left;
+                            let height = self_rect.bottom - self_rect.top;
+                            let snap = px(SNAP_THRESHOLD_PX);
+                            let mgr_ptr =
+                                MANAGER_PTR.load(Ordering::Acquire) as *const PreviewManager;
+                            if !mgr_ptr.is_null() {
+                                let others = (*mgr_ptr).collect_other_rects(hwnd);
+                                let (sx, sy) =
+                                    snap_position(new_x, new_y, width, height, &others, snap);
+                                new_x = sx;
+                                new_y = sy;
+                            }
+                            let (ex, ey) = snap_to_screen_edges(
                                 new_x,
                                 new_y,
                                 width,
                                 height,
-                                &others,
-                                px(SNAP_THRESHOLD_PX),
+                                virtual_screen_rect(),
+                                snap,
                             );
-                            new_x = sx;
-                            new_y = sy;
+                            new_x = ex;
+                            new_y = ey;
                         }
                     }
 

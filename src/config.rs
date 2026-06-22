@@ -54,6 +54,15 @@ pub struct LiveSettings {
     /// away from reappears. Read live so the toggle takes effect without
     /// a restart.
     pub hide_active_preview: bool,
+    /// Mirror of `config.click_through`. When true the preview/overlay
+    /// windows pass all pointer input through to whatever is behind them
+    /// (X11 empty input shape / Windows WS_EX_TRANSPARENT). Read live so
+    /// the managers can apply/clear the passthrough without a restart.
+    pub click_through: bool,
+    /// Mirror of `config.snapping`. When true, dragging a preview snaps
+    /// its edges to nearby previews and the screen edges. Read live in the
+    /// drag handlers.
+    pub snapping: bool,
 }
 
 impl LiveSettings {
@@ -66,6 +75,8 @@ impl LiveSettings {
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
             hide_active_preview: config.hide_active_preview,
+            click_through: config.click_through,
+            snapping: config.snapping,
         }))
     }
 }
@@ -120,6 +131,16 @@ pub struct Config {
     /// client.
     #[serde(default = "default_hide_active_preview")]
     pub hide_active_preview: bool,
+    /// When true, preview/overlay windows are click-through — all pointer
+    /// input passes to whatever is behind them. Default off. Live. While
+    /// on, drag / click-to-activate / hover are inert (no pointer events
+    /// reach the windows).
+    #[serde(default)]
+    pub click_through: bool,
+    /// When true (default), dragging a preview snaps its edges to nearby
+    /// previews and to the screen edges. Turn off for free placement.
+    #[serde(default = "default_snapping")]
+    pub snapping: bool,
     /// When true, the config panel locks preview width and height to a
     /// single aspect ratio and offers one "size" slider instead of
     /// separate width/height sliders. Purely a panel-side concern — the
@@ -271,6 +292,10 @@ fn default_hide_active_preview() -> bool {
     false
 }
 
+fn default_snapping() -> bool {
+    true
+}
+
 fn default_constrain_aspect() -> bool {
     false
 }
@@ -388,6 +413,8 @@ impl Config {
             preview_opacity: default_preview_opacity(),
             show_previews: default_show_previews(),
             hide_active_preview: default_hide_active_preview(),
+            click_through: false,
+            snapping: default_snapping(),
             constrain_aspect: default_constrain_aspect(),
             toggle_previews_key: None,
             toggle_previews_modifier: None,
@@ -474,6 +501,8 @@ mod tests {
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
+            click_through: false,
+            snapping: true,
             constrain_aspect: false,
             toggle_previews_key: None,
             toggle_previews_modifier: None,
@@ -513,6 +542,8 @@ mod tests {
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
+            click_through: false,
+            snapping: true,
             constrain_aspect: false,
             toggle_previews_key: None,
             toggle_previews_modifier: None,
@@ -551,6 +582,8 @@ mod tests {
             preview_opacity: 55,
             show_previews: true,
             hide_active_preview: true,
+            click_through: true,
+            snapping: false,
             constrain_aspect: true,
             toggle_previews_key: Some(67),
             toggle_previews_modifier: Some(42),
@@ -576,6 +609,14 @@ mod tests {
         assert!(
             deserialized.constrain_aspect,
             "constrain_aspect must survive a save/load round-trip"
+        );
+        assert!(
+            deserialized.click_through,
+            "click_through must survive a save/load round-trip"
+        );
+        assert!(
+            !deserialized.snapping,
+            "snapping must survive a save/load round-trip"
         );
         assert_eq!(
             deserialized.toggle_previews_key,
