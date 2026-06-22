@@ -421,8 +421,9 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
             .label("Only cycle while an EVE client is focused")
             .on_toggle(Message::CycleRequiresEveFocusToggled),
         caption(
-            "Keeps the cycle and per-character keys from firing (and grabbing input) while \
-             another application is focused. Recommended on."
+            "Keeps the forward/backward cycle keys from firing (and grabbing input) while \
+             another application is focused. Per-character jump keys still work everywhere. \
+             Recommended on."
         ),
         forward,
         backward,

@@ -95,10 +95,11 @@ pub struct Config {
     pub mouse_device_path: Option<String>,
     #[serde(default = "default_minimize_inactive")]
     pub minimize_inactive: bool,
-    /// When true (default), cycling + per-character switch hotkeys only fire
-    /// while an EVE client is the focused window, so they don't grab inputs
-    /// meant for other applications (a browser, etc.). Turn off to make the
-    /// cycle keys global again.
+    /// When true (default), the forward/backward cycle keys only fire while
+    /// an EVE client is the focused window, so they don't grab inputs meant
+    /// for other applications (a browser, etc.). Per-character jump keys are
+    /// unaffected — they target a specific client and work from anywhere.
+    /// Turn off to make the cycle keys global again.
     #[serde(default = "default_cycle_requires_eve_focus")]
     pub cycle_requires_eve_focus: bool,
     #[serde(default = "default_keyboard_device_path")]

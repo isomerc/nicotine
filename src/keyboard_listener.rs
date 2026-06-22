@@ -240,22 +240,21 @@ impl KeyboardListener {
                 }
 
                 // Resolve a possible per-character target up front (cheap
-                // hashmap lookup) so the focus gate can cover both cycling
-                // and character switching with a single check.
+                // hashmap lookup).
                 let char_target =
                     resolve_character_hotkey(code, &pressed_modifiers, &snap.character_hotkeys);
                 let is_cycle_key =
                     snap.enable && (code == snap.forward_key || code == snap.backward_key);
 
-                // Cycling + character hotkeys only act while an EVE client is
-                // focused (unless the user turned the gate off), so they don't
-                // grab inputs meant for other applications. Query focus only
-                // when the key is actually one of ours — avoids a window
-                // round-trip on every keystroke.
-                if (is_cycle_key || char_target.is_some())
-                    && snap.cycle_requires_eve_focus
-                    && !wm.focus_is_eve()
-                {
+                // Cycling only makes sense relative to the active client, so
+                // the cycle keys act only while an EVE client is focused
+                // (unless the user turned the gate off) — that's what stops
+                // them grabbing input meant for other applications. The
+                // per-character jump keys are NOT gated: they target a
+                // specific client and should work from anywhere. Focus is
+                // queried only for a cycle key, so there's no per-keystroke
+                // round-trip.
+                if is_cycle_key && snap.cycle_requires_eve_focus && !wm.focus_is_eve() {
                     continue;
                 }
 

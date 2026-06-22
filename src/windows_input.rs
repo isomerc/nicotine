@@ -291,6 +291,19 @@ fn run_listener(
         };
         if let Some(direction) = cycle {
             debug_input(format_args!("listener: cycle direction={:?}", direction));
+            // Focus gate: keyboard cycle hotkeys only fire while an EVE
+            // client is focused (so Tab/F-keys don't grab input in other
+            // apps). Mouse-button cycling and the per-character jump keys
+            // are not gated. Read the setting fresh so the toggle applies
+            // without a restart.
+            if msg.message == WM_HOTKEY
+                && Config::load()
+                    .map(|c| c.cycle_requires_eve_focus)
+                    .unwrap_or(true)
+                && !wm.focus_is_eve()
+            {
+                continue;
+            }
             let minimize_inactive = minimize_inactive_lookup();
             match perform_cycle(&wm, &state, direction, minimize_inactive) {
                 Ok(()) => debug_input(format_args!("listener: perform_cycle OK")),

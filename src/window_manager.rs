@@ -23,8 +23,9 @@ pub trait WindowManager: Send + Sync {
 
     /// Whether the currently-focused window belongs to an EVE client.
     ///
-    /// Used to gate cycling/character hotkeys so they don't fire while some
-    /// other application is focused and grab inputs meant for it. The
+    /// Used to gate the forward/backward cycle keys so they don't fire while
+    /// another application is focused and grab inputs meant for it (the
+    /// per-character jump keys are never gated). The
     /// default checks that the active window is one of our EVE windows
     /// (both queried from the same backend, so the ids are comparable).
     ///
