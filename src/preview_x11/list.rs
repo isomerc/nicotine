@@ -87,8 +87,23 @@ impl Drop for OwnedListWindow {
 
 impl PreviewManager {
     pub(super) fn reconcile_list(&mut self) -> Result<()> {
+        // Smart-hide gates the list window too. Refresh here (it only runs
+        // from reconcile_previews otherwise, so it'd go stale in List mode)
+        // and unmap when no EVE window is visible enough. `smart_hide_visible`
+        // is always true when the feature is off, so this is a no-op then.
+        self.refresh_smart_hide();
+        if !self.smart_hide_visible {
+            if let Some(list) = &self.list_window {
+                let _ = self.conn.unmap_window(list.window);
+            }
+            return Ok(());
+        }
         if self.list_window.is_none() {
             self.create_list_window()?;
+        }
+        // Re-map in case a prior smart-hide unmapped it.
+        if let Some(list) = &self.list_window {
+            let _ = self.conn.map_window(list.window);
         }
         self.update_list_rows()?;
         self.paint_list()?;

@@ -38,7 +38,7 @@ use x11rb::wrapper::ConnectionExt as _;
 
 use crate::config::{Config, DisplayMode, LiveSettings};
 use crate::cycle_state::CycleState;
-use crate::preview_common::{preview_should_hide, DragRect, DragState};
+use crate::preview_common::{preview_should_hide, visible_fraction, DragRect, DragState};
 use crate::preview_positions::PreviewPositions;
 use crate::window_manager::WindowManager;
 
@@ -83,6 +83,14 @@ const WINDOW_SCAN_BACKSTOP: Duration = Duration::from_secs(2);
 /// display rate kills the "present 1 vblank too late" cadence that an
 /// exactly-60fps loop hits on a 120Hz panel.
 const FRAME_INTERVAL: Duration = Duration::from_millis(8);
+
+/// Smart-hide: an EVE window counts as "visible enough" to keep the overlay
+/// shown when at least this fraction of its area is unoccluded.
+const SMART_HIDE_THRESHOLD: f64 = 0.90;
+/// How often the smart-hide occlusion check runs. The check enumerates
+/// managed windows (geometry + pid round-trips), so it's throttled rather
+/// than run on every 100ms reconcile tick.
+const SMART_HIDE_INTERVAL: Duration = Duration::from_millis(400);
 
 // Phase 3 still hardcodes preview dimensions; Phase 4 (live size sliders)
 // will pull these from config / LiveSettings. Includes chrome — a 480×270
@@ -134,6 +142,18 @@ mod render;
 use list::OwnedListWindow;
 use preview::OwnedPreview;
 use render::*;
+
+/// Whether `pid` is a Nicotine process (the daemon or the config panel).
+/// Used by the smart-hide check to exclude our own managed windows (e.g.
+/// the config panel) from the occluder set. `/proc/<pid>/comm` is the
+/// executable's short name — the binary is `Nicotine` (with a lowercase
+/// symlink), so match case-insensitively.
+#[cfg(unix)]
+fn pid_is_nicotine(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .map(|s| s.trim().eq_ignore_ascii_case("nicotine"))
+        .unwrap_or(false)
+}
 
 /// Total height of the list window for `n` character rows. Includes
 /// the 2-px gold border top and bottom, the red title strip, the
@@ -219,6 +239,7 @@ fn run_manager(
         net_wm_window_type: atom(&conn, b"_NET_WM_WINDOW_TYPE")?,
         net_wm_window_type_utility: atom(&conn, b"_NET_WM_WINDOW_TYPE_UTILITY")?,
         net_client_list: atom(&conn, b"_NET_CLIENT_LIST")?,
+        net_client_list_stacking: atom(&conn, b"_NET_CLIENT_LIST_STACKING")?,
         net_active_window: atom(&conn, b"_NET_ACTIVE_WINDOW")?,
         net_wm_pid: atom(&conn, b"_NET_WM_PID")?,
         net_wm_window_opacity: atom(&conn, b"_NET_WM_WINDOW_OPACITY")?,
@@ -272,6 +293,8 @@ fn run_manager(
         list_window: None,
         needs_window_scan: true,
         last_window_scan: Instant::now(),
+        smart_hide_visible: true,
+        last_smart_hide_check: Instant::now(),
     };
     manager.run()
 }
@@ -285,6 +308,10 @@ struct Atoms {
     net_wm_window_type: u32,
     net_wm_window_type_utility: u32,
     net_client_list: u32,
+    /// `_NET_CLIENT_LIST_STACKING` — managed windows bottom-to-top. Read
+    /// by the smart-hide occlusion check. Override-redirect windows (our
+    /// previews) aren't listed here, so they never count as occluders.
+    net_client_list_stacking: u32,
     net_active_window: u32,
     net_wm_pid: u32,
     /// `_NET_WM_WINDOW_OPACITY` — CARDINAL the compositor reads to blend
@@ -355,6 +382,13 @@ struct PreviewManager {
     /// `WINDOW_SCAN_BACKSTOP` periodic re-scan that catches EVE clients
     /// whose title only becomes "EVE - <name>" after the user logs in.
     last_window_scan: Instant,
+    /// Cached result of the smart-hide occlusion check: is at least one
+    /// EVE window ≥90% visible? Recomputed every `SMART_HIDE_INTERVAL`
+    /// (the check does geometry/pid round-trips, too costly per tick) and
+    /// read by `apply_active_visibility`. True when smart-hide is off.
+    smart_hide_visible: bool,
+    /// Wall time of the last smart-hide occlusion check.
+    last_smart_hide_check: Instant,
 }
 
 impl PreviewManager {
@@ -526,12 +560,27 @@ impl PreviewManager {
         // round-trips here, so safe on every 100ms tick.
         self.apply_live_size();
         self.apply_live_opacity();
+        self.refresh_smart_hide();
         // Catches the setting being toggled and previews created since
         // the last tick; the instant per-cycle response comes from the
         // same call at the end of update_active.
         self.apply_active_visibility();
 
         Ok(())
+    }
+
+    /// Recompute the cached smart-hide visibility on its throttle. No-op
+    /// (and resets the cache to "visible") when smart-hide is off, so the
+    /// gate never hides the overlay when the feature is disabled.
+    fn refresh_smart_hide(&mut self) {
+        if !self.live.lock_recover().smart_hide {
+            self.smart_hide_visible = true;
+            return;
+        }
+        if self.last_smart_hide_check.elapsed() >= SMART_HIDE_INTERVAL {
+            self.smart_hide_visible = self.any_eve_visible_enough();
+            self.last_smart_hide_check = Instant::now();
+        }
     }
 
     /// Hide the active client's preview (and reveal everything else) when
@@ -542,8 +591,12 @@ impl PreviewManager {
     /// one cycled away from.
     fn apply_active_visibility(&mut self) {
         let hide_active = self.live.lock_recover().hide_active_preview;
+        // Smart-hide gate: when no EVE window is visible enough, hide the
+        // whole overlay (`smart_hide_visible` is always true when the
+        // feature is off — see refresh_smart_hide).
+        let smart_hidden = !self.smart_hide_visible;
         for preview in self.previews.values_mut() {
-            let want_hidden = preview_should_hide(hide_active, preview.is_active);
+            let want_hidden = smart_hidden || preview_should_hide(hide_active, preview.is_active);
             if want_hidden == preview.hidden {
                 continue;
             }
@@ -557,6 +610,157 @@ impl PreviewManager {
                 preview.dirty = true;
             }
         }
+        // Smart-hide also gates the list-view window. map/unmap on an
+        // already-in-state window is a no-op, so calling each tick is fine.
+        if let Some(list) = &self.list_window {
+            if smart_hidden {
+                let _ = self.conn.unmap_window(list.window);
+            } else {
+                let _ = self.conn.map_window(list.window);
+            }
+        }
+    }
+
+    /// Smart-hide occlusion check: is at least one EVE window (including the
+    /// pre-login window, which has no character name) ≥`SMART_HIDE_THRESHOLD`
+    /// visible? Walks `_NET_CLIENT_LIST_STACKING` (managed windows, bottom to
+    /// top), and for each EVE window measures the fraction not covered by the
+    /// windows above it — excluding Nicotine's own windows so the overlay
+    /// doesn't occlude itself. Fails *open* (true) if the data is
+    /// unavailable, so the overlay never gets stuck hidden.
+    ///
+    /// Limitation: under a Wayland session this only sees X11/XWayland
+    /// windows (EVE runs as XWayland, so EVE-vs-EVE and EVE-vs-other-X11
+    /// occlusion is correct), but a *native* Wayland window covering EVE is
+    /// invisible to this query — Wayland denies clients cross-surface
+    /// geometry. There it errs toward keeping the overlay shown.
+    fn any_eve_visible_enough(&self) -> bool {
+        let root = self.conn.setup().roots[self.screen_num].root;
+        let Some(stacking) = self.read_window_stack(root) else {
+            return true;
+        };
+        // Fail *open* on an empty/missing stack (a WM can briefly publish an
+        // empty `_NET_CLIENT_LIST_STACKING` during transitions); hiding the
+        // whole overlay on that transient would be jarring, and it matches
+        // the Windows backend's empty-result behavior.
+        if stacking.is_empty() {
+            return true;
+        }
+
+        struct WinInfo {
+            rect: DragRect,
+            viewable: bool,
+            is_eve: bool,
+            is_nicotine: bool,
+        }
+
+        // Pipeline the per-window queries: send all requests, then read all
+        // replies, so this is a few flushes rather than 4 round-trips/window.
+        let translations: Vec<_> = stacking
+            .iter()
+            .map(|&w| self.conn.translate_coordinates(w, root, 0, 0))
+            .collect();
+        let geometries: Vec<_> = stacking.iter().map(|&w| self.conn.get_geometry(w)).collect();
+        let attributes: Vec<_> = stacking
+            .iter()
+            .map(|&w| self.conn.get_window_attributes(w))
+            .collect();
+        let pids: Vec<_> = stacking
+            .iter()
+            .map(|&w| {
+                self.conn.get_property(
+                    false,
+                    w,
+                    self.atoms.net_wm_pid,
+                    AtomEnum::CARDINAL,
+                    0,
+                    1,
+                )
+            })
+            .collect();
+
+        let mut infos = Vec::with_capacity(stacking.len());
+        for (((tr, ge), at), pi) in translations
+            .into_iter()
+            .zip(geometries)
+            .zip(attributes)
+            .zip(pids)
+        {
+            let (Ok(tr), Ok(ge), Ok(at), Ok(pi)) = (
+                tr.map_err(|_| ()).and_then(|c| c.reply().map_err(|_| ())),
+                ge.map_err(|_| ()).and_then(|c| c.reply().map_err(|_| ())),
+                at.map_err(|_| ()).and_then(|c| c.reply().map_err(|_| ())),
+                pi.map_err(|_| ()).and_then(|c| c.reply().map_err(|_| ())),
+            ) else {
+                // Window vanished mid-query — treat as a non-occluding,
+                // non-EVE gap so it neither hides nor reveals the overlay.
+                infos.push(WinInfo {
+                    rect: DragRect {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
+                    viewable: false,
+                    is_eve: false,
+                    is_nicotine: false,
+                });
+                continue;
+            };
+            let pid = pi.value32().and_then(|mut it| it.next());
+            let (is_eve, is_nicotine) = match pid {
+                Some(p) => (crate::eve_match::pid_is_eve_client(p), pid_is_nicotine(p)),
+                None => (false, false),
+            };
+            infos.push(WinInfo {
+                rect: DragRect {
+                    left: tr.dst_x as i32,
+                    top: tr.dst_y as i32,
+                    right: tr.dst_x as i32 + ge.width as i32,
+                    bottom: tr.dst_y as i32 + ge.height as i32,
+                },
+                viewable: at.map_state == x11rb::protocol::xproto::MapState::VIEWABLE,
+                is_eve,
+                is_nicotine,
+            });
+        }
+
+        for (i, info) in infos.iter().enumerate() {
+            if !info.viewable || !info.is_eve {
+                continue;
+            }
+            // Occluders: viewable, non-Nicotine windows stacked above this
+            // one. (Our override-redirect previews aren't in the stack at
+            // all; the managed config panel is excluded via is_nicotine.)
+            let occluders: Vec<DragRect> = infos[i + 1..]
+                .iter()
+                .filter(|o| o.viewable && !o.is_nicotine)
+                .map(|o| o.rect)
+                .collect();
+            if visible_fraction(info.rect, &occluders) >= SMART_HIDE_THRESHOLD {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Read `_NET_CLIENT_LIST_STACKING` (managed windows, bottom to top).
+    fn read_window_stack(&self, root: u32) -> Option<Vec<u32>> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                root,
+                self.atoms.net_client_list_stacking,
+                AtomEnum::WINDOW,
+                0,
+                u32::MAX,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        let windows: Vec<u32> = reply.value32()?.collect();
+        Some(windows)
     }
 
     /// Read LiveSettings.preview_opacity; if it changed since the last

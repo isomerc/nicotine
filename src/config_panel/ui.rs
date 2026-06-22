@@ -450,6 +450,9 @@ fn previews_section(panel: &Panel) -> Element<'_, Message> {
         checkbox(panel.config.hide_active_preview)
             .label("Hide the active client's preview")
             .on_toggle(Message::HideActivePreviewToggled),
+        checkbox(panel.config.smart_hide)
+            .label("Smart hide (only show while an EVE window is visible)")
+            .on_toggle(Message::SmartHideToggled),
         checkbox(panel.config.constrain_aspect)
             .label("Constrain aspect ratio")
             .on_toggle(Message::ConstrainAspectToggled),
