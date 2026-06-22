@@ -159,11 +159,11 @@ pub struct Config {
     #[serde(default = "default_enable_keyboard")]
     pub enable_keyboard_buttons: bool,
     /// Forward-cycle binding (key chord, mouse button, or wheel).
-    #[serde(default = "default_forward_key")]
+    #[serde(default = "default_forward_key", deserialize_with = "de_hotkey")]
     pub forward_key: Hotkey,
     /// Backward-cycle binding. Default is Shift+forward as a normal chord
     /// (no separate "modifier key" field any more).
-    #[serde(default = "default_backward_key")]
+    #[serde(default = "default_backward_key", deserialize_with = "de_hotkey")]
     pub backward_key: Hotkey,
     #[serde(default = "default_mouse_device_name")]
     pub mouse_device_name: Option<String>,
@@ -202,7 +202,7 @@ pub struct Config {
     pub constrain_aspect: bool,
     /// Binding that toggles overlay visibility. Default unbound
     /// (`Hotkey::default()`, code 0). Bound via the panel like the cycle keys.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_hotkey")]
     pub toggle_previews_key: Hotkey,
     /// Ordered list of EVE character names. Forward/backward cycling
     /// traverses this order; `switch N` maps target N to entry N-1.
@@ -276,6 +276,25 @@ fn default_enable_keyboard() -> bool {
 #[cfg(windows)]
 fn default_enable_keyboard() -> bool {
     true // F10/F11 are uncommon enough to enable by default for cycling
+}
+
+/// Deserialize a [`Hotkey`] from either the current table form or a legacy
+/// bare integer key code. Pre-unification configs stored `forward_key = 15`;
+/// this keeps those loading instead of erroring out on upgrade.
+fn de_hotkey<'de, D>(d: D) -> Result<Hotkey, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Compat {
+        Legacy(u16),
+        Full(Hotkey),
+    }
+    Ok(match Compat::deserialize(d)? {
+        Compat::Legacy(code) => Hotkey::key(code),
+        Compat::Full(hk) => hk,
+    })
 }
 
 #[cfg(unix)]
@@ -508,6 +527,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_integer_hotkey_deserializes_and_table_form_too() {
+        #[derive(Deserialize)]
+        struct W {
+            #[serde(deserialize_with = "de_hotkey")]
+            k: Hotkey,
+        }
+        // Legacy bare integer.
+        let w: W = toml::from_str("k = 15").unwrap();
+        assert_eq!(w.k, Hotkey::key(15));
+        // Current table form with a chord.
+        let w2: W = toml::from_str("[k]\nmods = [42]\nkind = \"Key\"\ncode = 15").unwrap();
+        assert_eq!(w2.k, Hotkey::key_with_mods(15, vec![42]));
+    }
     use std::collections::HashSet;
 
     #[test]
