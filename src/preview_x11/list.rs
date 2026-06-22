@@ -87,8 +87,21 @@ impl Drop for OwnedListWindow {
 
 impl PreviewManager {
     pub(super) fn reconcile_list(&mut self) -> Result<()> {
+        // The overlay toggle hides the list-view window too. apply_active_
+        // visibility only runs in Previews mode, so gate it here for List
+        // mode. Unmap (don't tear down) so toggling back is instant.
+        if self.live.lock_recover().overlay_hidden {
+            if let Some(list) = &self.list_window {
+                let _ = self.conn.unmap_window(list.window);
+            }
+            return Ok(());
+        }
         if self.list_window.is_none() {
             self.create_list_window()?;
+        }
+        // Re-map in case a prior overlay-hide unmapped it.
+        if let Some(list) = &self.list_window {
+            let _ = self.conn.map_window(list.window);
         }
         self.update_list_rows()?;
         self.paint_list()?;

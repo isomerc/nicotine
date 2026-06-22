@@ -364,12 +364,28 @@ impl PreviewManager {
     }
 
     fn reconcile_list(&mut self) {
+        // The overlay toggle hides the list-view window too (apply_active_
+        // visibility only runs in Previews mode, so gate here for List mode).
+        if self.live.lock().unwrap().overlay_hidden {
+            if let Some(list) = &self.list {
+                unsafe {
+                    let _ = ShowWindow(list.hwnd, SW_HIDE);
+                }
+            }
+            return;
+        }
         // Spawn the list window on first entry into this mode, or if it
         // was torn down somehow.
         if self.list.is_none() {
             if let Err(e) = self.create_list_window() {
                 eprintln!("Failed to create list window: {}", e);
                 return;
+            }
+        }
+        // Re-show in case a prior overlay-hide hid it.
+        if let Some(list) = &self.list {
+            unsafe {
+                let _ = ShowWindow(list.hwnd, SW_SHOWNOACTIVATE);
             }
         }
 
