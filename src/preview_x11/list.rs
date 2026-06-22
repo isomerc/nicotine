@@ -213,6 +213,11 @@ impl PreviewManager {
             drag: DragState::default(),
             grabbed: false,
         });
+        // Honor click-through on the freshly-created list window (the
+        // live-apply path only fires on a *change*, so a window created
+        // while the toggle is already on would otherwise miss it).
+        let click_through = self.live.lock_recover().click_through;
+        self.set_input_passthrough(our_window, click_through);
         Ok(())
     }
 

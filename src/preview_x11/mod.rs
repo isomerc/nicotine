@@ -579,7 +579,11 @@ impl PreviewManager {
             return;
         }
         self.last_applied_click_through = want;
-        let windows: Vec<u32> = self.previews.values().map(|p| p.window).collect();
+        let mut windows: Vec<u32> = self.previews.values().map(|p| p.window).collect();
+        // The list-view window is part of the overlay too.
+        if let Some(list) = &self.list_window {
+            windows.push(list.window);
+        }
         for window in windows {
             self.set_input_passthrough(window, want);
         }

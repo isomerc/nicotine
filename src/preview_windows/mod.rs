@@ -39,7 +39,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
     SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    SWP_FRAMECHANGED, SWP_NOZORDER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WS_VISIBLE,
 };
 
 /// Type alias for DWM thumbnail handles. windows-rs 0.59 doesn't expose a
@@ -482,9 +483,14 @@ impl PreviewManager {
             .filter(|(x, y)| position_on_screen(*x, *y))
             .unwrap_or((20, 20));
 
+        let list_click_through = if self.config.click_through {
+            WS_EX_TRANSPARENT
+        } else {
+            WINDOW_EX_STYLE(0)
+        };
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | list_click_through,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(title.as_ptr()),
                 WS_POPUP | WS_VISIBLE,
@@ -588,11 +594,27 @@ impl PreviewManager {
         }
         self.config.click_through = want;
         let bit = WS_EX_TRANSPARENT.0 as isize;
-        for preview in self.previews.values() {
+        // The list-view window is part of the overlay too.
+        let mut hwnds: Vec<HWND> = self.previews.values().map(|p| p.hwnd).collect();
+        if let Some(list) = &self.list {
+            hwnds.push(list.hwnd);
+        }
+        for hwnd in hwnds {
             unsafe {
-                let ex = GetWindowLongPtrW(preview.hwnd, GWL_EXSTYLE);
+                let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
                 let new_ex = if want { ex | bit } else { ex & !bit };
-                SetWindowLongPtrW(preview.hwnd, GWL_EXSTYLE, new_ex);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex);
+                // An ex-style change isn't applied until a frame update;
+                // SWP_FRAMECHANGED forces it without moving/resizing/restacking.
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
             }
         }
     }
