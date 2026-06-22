@@ -153,10 +153,19 @@ sudo evtest  # Select your mouse, then click buttons to see their codes
 Edit `~/.config/nicotine/config.toml` to customize:
 ```toml
 enable_keyboard_buttons = true
-forward_key = 15  # TAB Key
-backward_key = 15  # TAB Key - modifier_key applied if set in config
-keyboard_device_path = None # Device path /dev/input/eventX (OPTIONAL but you may need to set this if keybinds don't work)
-modifier_key = None # You will have to add this if you want a modifier key for backward cycling
+keyboard_device_path = None # /dev/input/eventX (OPTIONAL; set if keybinds don't work)
+
+# Each cycle/toggle binding is a Hotkey: a modifier chord plus a trigger
+# (key, mouse button, or wheel notch). The config panel writes these for you.
+[forward_key]
+mods = []      # held-modifier codes, e.g. [42] = Shift
+kind = "Key"   # "Key" | "Mouse" | "Wheel"
+code = 15      # KEY_TAB
+
+[backward_key]
+mods = [42]    # Shift
+kind = "Key"
+code = 15      # i.e. Shift+Tab
 ```
 
 **Common button codes:**
@@ -178,7 +187,9 @@ sudo evtest /dev/input/eventX # Replace X with the correct event number i.e even
 
 ### Config Panel & Previews
 
-`nicotine start` opens the config panel and spawns one preview window per running EVE client. The panel has four sections: **Display Mode** (Previews vs List), **Cycle Order** (character list + per-character jump hotkeys), **Keyboard Hotkeys**, and **Preview Windows** (size sliders, show/hide toggle). Changes apply live; saves debounce to disk.
+`nicotine start` opens the config panel and spawns one preview window per running EVE client. The panel has four sections: **Display Mode** (Previews vs List), **Cycle Order** (character list with a keybind chip per character), **Keyboard Hotkeys** (forward / backward / toggle-overlay), and **Preview Windows** (size sliders, show/hide toggle). Changes apply live; saves debounce to disk.
+
+Every binding uses the same keybind chip: **left-click** to record the next input — a key chord (e.g. Ctrl+Shift+J), a mouse button, or a wheel notch — and **right-click** to clear. The mouse wheel can cycle clients (forward/backward), and mouse/wheel bindings can carry modifiers too.
 
 Previews and the list window:
 - **Left-click-drag** to reposition; edges snap to adjacent windows
@@ -208,7 +219,7 @@ backward_button = 275      # Button 8
 minimize_inactive = false  # Minimize clients when cycling away (saves resources)
 ```
 
-Per-character jump hotkeys live under `[character_hotkeys."Name"]` with `vk` and optional `modifier`; the config panel writes them for you.
+Per-character jump hotkeys live under `[character_hotkeys."Name"]` as a Hotkey (`mods`, `kind`, `code`); forward/backward/toggle bindings use the same shape. All support key chords, mouse buttons, or the wheel. The config panel writes them for you.
 
 ## Architecture
 
