@@ -395,6 +395,7 @@ pub(super) enum Message {
     CharacterModifierChanged(String, ModifierChoice),
     ClearCharacterHotkey(String),
     KeyboardEnabledToggled(bool),
+    CycleRequiresEveFocusToggled(bool),
     MouseEnabledToggled(bool),
     ClearModifier,
     ClearTogglePreviews,
@@ -496,6 +497,10 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         }
         Message::KeyboardEnabledToggled(v) => {
             panel.config.enable_keyboard_buttons = v;
+            panel.touch();
+        }
+        Message::CycleRequiresEveFocusToggled(v) => {
+            panel.config.cycle_requires_eve_focus = v;
             panel.touch();
         }
         Message::MouseEnabledToggled(v) => {

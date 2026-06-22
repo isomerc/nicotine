@@ -21,6 +21,30 @@ pub trait WindowManager: Send + Sync {
     /// Get the currently active window ID
     fn get_active_window(&self) -> Result<u32>;
 
+    /// Whether the currently-focused window belongs to an EVE client.
+    ///
+    /// Used to gate the forward/backward cycle keys so they don't fire while
+    /// another application is focused and grab inputs meant for it (the
+    /// per-character jump keys are never gated). The
+    /// default checks that the active window is one of our EVE windows
+    /// (both queried from the same backend, so the ids are comparable).
+    ///
+    /// Fails *open* (returns true) if focus can't be determined, so cycling
+    /// never silently dies on a transient query error. Nicotine's own
+    /// overlay windows are no-activate / click-through and never hold focus,
+    /// so "EVE focused" is the practical condition; cycling while the config
+    /// panel is focused is intentionally inert (you're configuring, not
+    /// flying).
+    fn focus_is_eve(&self) -> bool {
+        let Ok(active) = self.get_active_window() else {
+            return true;
+        };
+        match self.get_eve_windows() {
+            Ok(windows) => windows.iter().any(|w| w.id == active),
+            Err(_) => true,
+        }
+    }
+
     /// Minimize a window
     fn minimize_window(&self, window_id: u32) -> Result<()>;
 

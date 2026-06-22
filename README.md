@@ -25,6 +25,7 @@ High-performance EVE Online multiboxing tool for Linux (X11 & Wayland) and Windo
 - **Drag-to-position with snap-to-dock** on previews and the list window; lockable layout for play
 - **Multi-compositor support** — X11, KDE Plasma (Wayland), Sway, Hyprland, GNOME (Wayland; auto-stack excepted)
 - **Minimize inactive clients** — optional, reduces resource usage when cycling away
+- **Focus-aware cycling** — the cycle keys fire only while an EVE client is focused, so they don't grab input in other apps; per-character jump keys still work everywhere (toggleable)
 
 ## Roadmap
 - Comprehensive documentation
@@ -206,6 +207,7 @@ enable_mouse_buttons = true
 forward_button = 276       # Button 9
 backward_button = 275      # Button 8
 minimize_inactive = false  # Minimize clients when cycling away (saves resources)
+cycle_requires_eve_focus = true  # Cycle keys only fire while EVE is focused
 ```
 
 Per-character jump hotkeys live under `[character_hotkeys."Name"]` with `vk` and optional `modifier`; the config panel writes them for you.

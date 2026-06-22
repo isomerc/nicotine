@@ -417,6 +417,14 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
         checkbox(panel.config.enable_keyboard_buttons)
             .label("Enable keyboard cycling")
             .on_toggle(Message::KeyboardEnabledToggled),
+        checkbox(panel.config.cycle_requires_eve_focus)
+            .label("Only cycle while an EVE client is focused")
+            .on_toggle(Message::CycleRequiresEveFocusToggled),
+        caption(
+            "Keeps the forward/backward cycle keys from firing (and grabbing input) while \
+             another application is focused. Per-character jump keys still work everywhere. \
+             Recommended on."
+        ),
         forward,
         backward,
         modifier,

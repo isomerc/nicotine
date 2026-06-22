@@ -95,6 +95,13 @@ pub struct Config {
     pub mouse_device_path: Option<String>,
     #[serde(default = "default_minimize_inactive")]
     pub minimize_inactive: bool,
+    /// When true (default), the forward/backward cycle keys only fire while
+    /// an EVE client is the focused window, so they don't grab inputs meant
+    /// for other applications (a browser, etc.). Per-character jump keys are
+    /// unaffected — they target a specific client and work from anywhere.
+    /// Turn off to make the cycle keys global again.
+    #[serde(default = "default_cycle_requires_eve_focus")]
+    pub cycle_requires_eve_focus: bool,
     #[serde(default = "default_keyboard_device_path")]
     pub keyboard_device_path: Option<String>,
     #[serde(default = "default_modifier_key")]
@@ -243,6 +250,10 @@ fn default_minimize_inactive() -> bool {
     false
 }
 
+fn default_cycle_requires_eve_focus() -> bool {
+    true
+}
+
 fn default_keyboard_device_path() -> Option<String> {
     None
 }
@@ -381,6 +392,7 @@ impl Config {
             mouse_device_name: default_mouse_device_name(),
             mouse_device_path: default_mouse_device_path(),
             minimize_inactive: default_minimize_inactive(),
+            cycle_requires_eve_focus: default_cycle_requires_eve_focus(),
             keyboard_device_path: default_keyboard_device_path(),
             modifier_key: default_modifier_key(),
             preview_width: default_preview_width(),
@@ -467,6 +479,7 @@ mod tests {
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
+            cycle_requires_eve_focus: true,
             keyboard_device_path: None,
             modifier_key: None,
             preview_width: 320,
@@ -506,6 +519,7 @@ mod tests {
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
+            cycle_requires_eve_focus: true,
             keyboard_device_path: None,
             modifier_key: None,
             preview_width: 320,
@@ -544,6 +558,7 @@ mod tests {
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
+            cycle_requires_eve_focus: false,
             keyboard_device_path: None,
             modifier_key: None,
             preview_width: 320,
@@ -569,6 +584,10 @@ mod tests {
         // Non-default on purpose: proves the value is actually persisted,
         // not silently masked by the serde default on load.
         assert_eq!(deserialized.preview_opacity, 55);
+        assert!(
+            !deserialized.cycle_requires_eve_focus,
+            "cycle_requires_eve_focus must survive a save/load round-trip"
+        );
         assert!(
             deserialized.hide_active_preview,
             "hide_active_preview must survive a save/load round-trip"
