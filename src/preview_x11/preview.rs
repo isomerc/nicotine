@@ -88,6 +88,13 @@ pub(super) struct OwnedPreview {
     pub(super) x: i16,
     pub(super) y: i16,
     pub(super) is_active: bool,
+    /// True while the pointer is hovering this preview. Drives the same
+    /// red highlight as `is_active` (red border in bordered mode, red
+    /// name in borderless mode). Only ever set when the window actually
+    /// receives Enter/Leave events — which it does NOT under click-through
+    /// (the input region is empty / WS_EX_TRANSPARENT), so hover is
+    /// naturally disabled there, as required.
+    pub(super) hovered: bool,
     /// True while this preview is unmapped because the "hide active
     /// client's preview" setting is on and this preview's source is the
     /// foreground client. Tracked so the reconcile/active-change passes
@@ -225,12 +232,18 @@ impl PreviewManager {
         // time the user switched clients. We keep the surface
         // present-driven instead: the render_pixmap is always fully
         // painted before we hand it to Present.
+        // ENTER_WINDOW | LEAVE_WINDOW drive the hover highlight. Under
+        // click-through these never arrive (the input region is empty), so
+        // hover is automatically inert there — which is the desired
+        // behavior: no hover highlight when click-through is on.
         let win_aux = CreateWindowAux::new()
             .event_mask(
                 EventMask::EXPOSURE
                     | EventMask::STRUCTURE_NOTIFY
                     | EventMask::BUTTON_PRESS
-                    | EventMask::BUTTON_RELEASE,
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::ENTER_WINDOW
+                    | EventMask::LEAVE_WINDOW,
             )
             .border_pixel(0)
             .override_redirect(1);
@@ -382,6 +395,7 @@ impl PreviewManager {
             x: init_x as i16,
             y: init_y as i16,
             is_active,
+            hovered: false,
             // Created mapped; the reconcile pass right after this unmaps
             // it if the hide-active setting says it should start hidden.
             hidden: false,
@@ -405,8 +419,9 @@ impl PreviewManager {
     /// character-name text on top of the strip.
     pub(super) fn paint_chrome(&self, preview: &OwnedPreview) -> Result<()> {
         let conn = &self.conn;
+        // Red when active OR hovered (hover highlight); dark otherwise.
         let chrome_color = xcolor(
-            if preview.is_active {
+            if preview.is_active || preview.hovered {
                 NICOTINE_RED
             } else {
                 CHROME_DARK
@@ -565,7 +580,7 @@ impl PreviewManager {
             src_picture,
             win_w,
             win_h,
-            is_active,
+            highlight,
             title_picture,
             title_picture_active,
             title_w,
@@ -577,7 +592,7 @@ impl PreviewManager {
                 p.src_picture,
                 p.width,
                 p.height,
-                p.is_active,
+                p.is_active || p.hovered,
                 p.title_picture,
                 p.title_picture_active,
                 p.title_text_w,
@@ -624,7 +639,8 @@ impl PreviewManager {
                     height: bd_h,
                 }],
             )?;
-            let text_picture = if is_active {
+            // Red name when active OR hovered (hover highlight), else cream.
+            let text_picture = if highlight {
                 title_picture_active
             } else {
                 title_picture

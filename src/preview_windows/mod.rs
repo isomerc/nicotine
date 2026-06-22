@@ -28,7 +28,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
@@ -36,7 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST,
     IDC_ARROW, LWA_ALPHA, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
-    WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSELEAVE, WM_MOUSEMOVE,
+    WM_PAINT,
     WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP, WS_VISIBLE,
 };
@@ -183,6 +186,11 @@ struct PreviewWindowState {
     /// borderless (name-bar only) vs. bordered (chrome + frame) layout.
     /// Updated by reconcile via the GWLP_USERDATA pointer.
     borderless: bool,
+    /// True while the cursor is over this preview (WM_MOUSEMOVE sets it,
+    /// WM_MOUSELEAVE clears it). Drives the same red highlight as
+    /// `is_active`. Under click-through (WS_EX_TRANSPARENT) the window gets
+    /// no mouse messages, so this stays false — hover is inert there.
+    hovered: bool,
 }
 
 /// One owned preview window. Drop unregisters the DWM thumbnail.
@@ -740,6 +748,7 @@ impl PreviewManager {
             drag: DragState::default(),
             is_active: false,
             borderless,
+            hovered: false,
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(per_window) as isize);
@@ -867,7 +876,7 @@ unsafe extern "system" fn preview_wnd_proc(
             paint_chrome(
                 hwnd,
                 &state.character_name,
-                state.is_active,
+                state.is_active || state.hovered,
                 state.borderless,
             );
             LRESULT(0)
@@ -891,6 +900,22 @@ unsafe extern "system" fn preview_wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            // Hover highlight: the first move after the cursor enters arms a
+            // WM_MOUSELEAVE notification and repaints the preview red (red
+            // border in bordered mode, red name in borderless). Under
+            // click-through (WS_EX_TRANSPARENT) no mouse messages arrive, so
+            // this never fires — hover is inert there, as required.
+            if !state.hovered {
+                state.hovered = true;
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            }
             // Positions locked: don't track motion. Keeping drag_active
             // true means the subsequent WM_LBUTTONUP's `!dragged` path
             // still fires, so click-to-activate keeps working.
@@ -963,6 +988,14 @@ unsafe extern "system" fn preview_wnd_proc(
                     let _ = state.wm.activate_window(state.source_id);
                 }
                 state.drag.dragged = false;
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            // Cursor left the preview: drop the hover highlight and repaint.
+            if state.hovered {
+                state.hovered = false;
+                let _ = InvalidateRect(Some(hwnd), None, true);
             }
             LRESULT(0)
         }
@@ -1042,7 +1075,7 @@ fn nicotine_logo_font() -> HFONT {
 /// area. Border color is Nicotine red when this client is the system
 /// foreground window, otherwise the same dark color as the title strip
 /// (so it blends seamlessly).
-unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool, borderless: bool) {
+unsafe fn paint_chrome(hwnd: HWND, character_name: &str, highlight: bool, borderless: bool) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
 
@@ -1070,7 +1103,7 @@ unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool, border
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(
             hdc,
-            if is_active {
+            if highlight {
                 NICOTINE_RED
             } else {
                 COLORREF(0x00FF_FFFF)
@@ -1093,7 +1126,7 @@ unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool, border
         return;
     }
 
-    let chrome_color = if is_active { NICOTINE_RED } else { CHROME_DARK };
+    let chrome_color = if highlight { NICOTINE_RED } else { CHROME_DARK };
     let chrome_brush = CreateSolidBrush(chrome_color);
     let title_h = px(TITLE_HEIGHT);
     let border_w = px(BORDER_WIDTH);
