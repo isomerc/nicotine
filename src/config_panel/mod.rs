@@ -1,4 +1,4 @@
-use crate::config::{CharacterHotkey, Config, LiveSettings};
+use crate::config::{Config, Hotkey, LiveSettings};
 use iced::{Color, Element, Subscription, Task, Theme};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -129,6 +129,47 @@ impl SliderField {
 /// Keep only ASCII digits — constrains the editable slider readouts.
 fn digits_only(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+/// Render a unified Hotkey as a human label, e.g. "Ctrl+Shift+J",
+/// "Mouse4", "Wheel↑", or "unbound".
+pub(super) fn hotkey_label(hk: &Hotkey) -> String {
+    use crate::config::{TriggerKind, WHEEL_DOWN, WHEEL_UP};
+    if hk.kind == TriggerKind::Key && hk.code == 0 {
+        return "unbound".into();
+    }
+    let mut parts: Vec<String> = hk.mods.iter().map(|&m| code_to_label(m)).collect();
+    parts.push(match hk.kind {
+        TriggerKind::Key => code_to_label(hk.code),
+        TriggerKind::Mouse => format!("Mouse{}", hk.code),
+        TriggerKind::Wheel => match hk.code {
+            WHEEL_UP => "Wheel↑".into(),
+            WHEEL_DOWN => "Wheel↓".into(),
+            _ => "Wheel".into(),
+        },
+    });
+    parts.join("+")
+}
+
+/// Map iced's logical modifier flags to the platform modifier key codes
+/// the runtime listeners track (canonical left-variant codes).
+#[cfg(unix)]
+fn iced_mods_to_codes(m: &iced::keyboard::Modifiers) -> Vec<u16> {
+    let mut v = Vec::new();
+    if m.control() { v.push(29); }   // KEY_LEFTCTRL
+    if m.shift()   { v.push(42); }   // KEY_LEFTSHIFT
+    if m.alt()     { v.push(56); }   // KEY_LEFTALT
+    if m.logo()    { v.push(125); }  // KEY_LEFTMETA
+    v
+}
+#[cfg(windows)]
+fn iced_mods_to_codes(m: &iced::keyboard::Modifiers) -> Vec<u16> {
+    let mut v = Vec::new();
+    if m.control() { v.push(0x11); } // VK_CONTROL
+    if m.shift()   { v.push(0x10); } // VK_SHIFT
+    if m.alt()     { v.push(0x12); } // VK_MENU
+    if m.logo()    { v.push(0x5B); } // VK_LWIN
+    v
 }
 
 /// Aspect ratio (width / height) used to lock the two preview dimensions
@@ -321,7 +362,7 @@ impl Panel {
             return Task::none();
         };
 
-        let Event::KeyPressed { key, .. } = event else {
+        let Event::KeyPressed { key, modifiers, .. } = event else {
             return Task::none();
         };
 
@@ -336,6 +377,17 @@ impl Panel {
         // On Windows, OEM/punctuation VKs are layout-dependent; ask the OS
         // for the actually-held VK first so the captured code matches what
         // RegisterHotKey will see at runtime regardless of keyboard layout.
+        // A modifier key on its own isn't a trigger for a chord-capable
+        // binding: keep listening so the user can hold it and press the real
+        // key. (The dedicated single-modifier bind still records it.)
+        let is_mod_key = matches!(
+            key,
+            Key::Named(Named::Control | Named::Shift | Named::Alt | Named::Super)
+        );
+        if is_mod_key && matches!(target, CaptureTarget::Character(_)) {
+            return Task::none();
+        }
+
         #[cfg(windows)]
         let code = oem_vk_currently_pressed().or_else(|| iced_key_to_code(&key));
         #[cfg(unix)]
@@ -348,14 +400,10 @@ impl Panel {
                 CaptureTarget::ModifierKey => self.config.modifier_key = Some(vk),
                 CaptureTarget::TogglePreviews => self.config.toggle_previews_key = Some(vk),
                 CaptureTarget::Character(name) => {
-                    let modifier = self
-                        .config
-                        .character_hotkeys
-                        .get(name)
-                        .and_then(|h| h.modifier);
+                    let mods = iced_mods_to_codes(&modifiers);
                     self.config
                         .character_hotkeys
-                        .insert(name.clone(), CharacterHotkey { vk, modifier });
+                        .insert(name.clone(), Hotkey::key_with_mods(vk, mods));
                 }
             }
             self.capturing = None;
@@ -392,7 +440,6 @@ pub(super) enum Message {
     RemoveCharacter(usize),
     NewCharacterChanged(String),
     AddCharacter,
-    CharacterModifierChanged(String, ModifierChoice),
     ClearCharacterHotkey(String),
     KeyboardEnabledToggled(bool),
     MouseEnabledToggled(bool),
@@ -477,18 +524,6 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
                 panel.new_character_buffer.clear();
                 panel.touch();
             }
-        }
-        Message::CharacterModifierChanged(name, choice) => {
-            let entry = panel
-                .config
-                .character_hotkeys
-                .entry(name)
-                .or_insert(CharacterHotkey {
-                    vk: 0,
-                    modifier: None,
-                });
-            entry.modifier = choice.code;
-            panel.touch();
         }
         Message::ClearCharacterHotkey(name) => {
             panel.config.character_hotkeys.remove(&name);

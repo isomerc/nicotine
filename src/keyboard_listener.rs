@@ -3,7 +3,7 @@
 //! same shape, same hot-reload contract, plus the character_hotkeys
 //! dispatch path that was missing from Linux entirely until now.
 
-use crate::config::{CharacterHotkey, Config, LiveSettings};
+use crate::config::{Config, Hotkey, LiveSettings, TriggerKind};
 use crate::cycle_state::CycleState;
 use crate::window_manager::WindowManager;
 use anyhow::Result;
@@ -23,7 +23,7 @@ pub struct KeyboardConfig {
     pub modifier_key: Option<u16>,
     pub keyboard_device_path: Option<String>,
     pub minimize_inactive: bool,
-    pub character_hotkeys: HashMap<String, CharacterHotkey>,
+    pub character_hotkeys: HashMap<String, Hotkey>,
     pub toggle_previews_key: Option<u16>,
     pub toggle_previews_modifier: Option<u16>,
 }
@@ -150,7 +150,7 @@ impl KeyboardListener {
             let modifier_codes: HashSet<u16> = std::iter::empty()
                 .chain(snap.modifier_key)
                 .chain(snap.toggle_previews_modifier)
-                .chain(snap.character_hotkeys.values().filter_map(|hk| hk.modifier))
+                .chain(snap.character_hotkeys.values().flat_map(|hk| hk.mods.iter().copied()))
                 .collect();
             // Forget pressed modifiers that are no longer modifiers in
             // any binding — otherwise a key the user un-bound stays
@@ -409,24 +409,18 @@ fn toggle_previews_should_fire(
 fn resolve_character_hotkey(
     code: u16,
     pressed_modifiers: &HashSet<u16>,
-    hotkeys: &HashMap<String, CharacterHotkey>,
+    hotkeys: &HashMap<String, Hotkey>,
 ) -> Option<String> {
-    // First pass: modifier-bearing bindings whose modifier is held.
-    let with_modifier = hotkeys.iter().find(|(_, hk)| {
-        hk.vk != 0
-            && hk.vk == code
-            && match hk.modifier {
-                Some(m) => pressed_modifiers.contains(&m),
-                None => false,
-            }
-    });
-    if let Some((name, _)) = with_modifier {
-        return Some(name.clone());
-    }
-    // Second pass: no-modifier bindings.
+    // Keyboard-triggered bindings only (mouse/wheel are handled by the
+    // mouse listener). Exact-set modifier match, so Ctrl+J never fires a
+    // bare-J bind. Among matches, the one needing the most modifiers wins,
+    // so Ctrl+J beats bare J when Ctrl is held.
     hotkeys
         .iter()
-        .find(|(_, hk)| hk.vk != 0 && hk.vk == code && hk.modifier.is_none())
+        .filter(|(_, hk)| {
+            hk.kind == TriggerKind::Key && hk.code == code && hk.mods_match(pressed_modifiers)
+        })
+        .max_by_key(|(_, hk)| hk.mods.len())
         .map(|(name, _)| name.clone())
 }
 

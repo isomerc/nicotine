@@ -3,14 +3,14 @@
 
 use iced::widget::{
     button, checkbox, column, container, mouse_area, pick_list, radio, row, slider, text,
-    text_input, Space,
+    text_input, tooltip, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, Vector};
 
 use crate::config::DisplayMode;
 
 use super::{
-    code_to_label, CaptureTarget, Message, Panel, SliderField, Tab, CAPTION_SIZE, LOGO_SIZE,
+    code_to_label, hotkey_label, CaptureTarget, Message, Panel, SliderField, Tab, CAPTION_SIZE, LOGO_SIZE,
     MODIFIER_CHOICES, NICOTINE_BLACK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED,
     SECTION_SIZE,
 };
@@ -274,12 +274,40 @@ fn characters_section(panel: &Panel) -> Element<'_, Message> {
     .spacing(8);
 
     for (i, name) in panel.config.characters.iter().enumerate() {
-        let row1 = row![
+        // One compact keybind chip: left-click to record (a key chord, a
+        // mouse button, or a wheel notch), right-click to clear. The tooltip
+        // spells that out.
+        let label = panel
+            .config
+            .character_hotkeys
+            .get(name)
+            .map(hotkey_label)
+            .unwrap_or_else(|| "unbound".into());
+        let keybind = tooltip(
+            mouse_area(bind_button(
+                panel,
+                CaptureTarget::Character(name.clone()),
+                label,
+                130.0,
+            ))
+            .on_right_press(Message::ClearCharacterHotkey(name.clone())),
+            container(
+                text("Left-click: set  ·  Right-click: clear")
+                    .size(CAPTION_SIZE)
+                    .color(NICOTINE_BLACK),
+            )
+            .padding(6)
+            .style(|_| filled(NICOTINE_CREAM)),
+            tooltip::Position::Top,
+        );
+
+        let row = row![
             grip(i),
             text(format!("{}.", i + 1)),
             text_input("character name", name)
                 .on_input(move |s| Message::CharacterNameChanged(i, s))
                 .width(Length::Fill),
+            keybind,
             button(text("↑")).on_press(Message::MoveCharacterUp(i)),
             button(text("↓")).on_press(Message::MoveCharacterDown(i)),
             button(text("✕")).on_press(Message::RemoveCharacter(i)),
@@ -287,51 +315,9 @@ fn characters_section(panel: &Panel) -> Element<'_, Message> {
         .spacing(6)
         .align_y(Alignment::Center);
 
-        let current_mod = panel
-            .config
-            .character_hotkeys
-            .get(name)
-            .and_then(|h| h.modifier);
-        let selected = MODIFIER_CHOICES
-            .iter()
-            .copied()
-            .find(|m| m.code == current_mod);
-        let name_for_mod = name.clone();
-        let modifier_pick = pick_list(MODIFIER_CHOICES, selected, move |c| {
-            Message::CharacterModifierChanged(name_for_mod.clone(), c)
-        })
-        .width(Length::Fixed(80.0));
-
-        let binding_label = panel
-            .config
-            .character_hotkeys
-            .get(name)
-            .filter(|h| h.vk != 0)
-            .map(|h| code_to_label(h.vk))
-            .unwrap_or_else(|| "none".into());
-
-        let mut row2 = row![
-            Space::new().width(Length::Fixed(20.0)),
-            text("Hotkey:"),
-            modifier_pick,
-            bind_button(
-                panel,
-                CaptureTarget::Character(name.clone()),
-                binding_label,
-                110.0
-            ),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
-
-        if panel.config.character_hotkeys.contains_key(name) {
-            let n = name.clone();
-            row2 = row2.push(button(text("✕")).on_press(Message::ClearCharacterHotkey(n)));
-        }
-
         let is_dragged = panel.dragging == Some(i);
         let is_target = panel.dragging.is_some() && panel.drag_hover == Some(i) && !is_dragged;
-        let block = container(column![row1, row2].spacing(2))
+        let block = container(row)
             .padding(6)
             .style(move |_| drag_row_style(is_dragged, is_target));
         col = col.push(

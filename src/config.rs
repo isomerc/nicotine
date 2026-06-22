@@ -234,7 +234,7 @@ pub struct Config {
     /// cycle. Keyed by name so bindings follow reorders and renames
     /// without reassigning keys.
     #[serde(default)]
-    pub character_hotkeys: HashMap<String, CharacterHotkey>,
+    pub character_hotkeys: HashMap<String, Hotkey>,
     /// Config-panel window size in logical pixels. Persisted so a manual
     /// resize of the panel survives restarts; defaults to the original
     /// fixed window size.
