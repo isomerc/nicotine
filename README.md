@@ -25,6 +25,7 @@ High-performance EVE Online multiboxing tool for Linux (X11 & Wayland) and Windo
 - **Drag-to-position with snap-to-dock** on previews and the list window; lockable layout for play
 - **Multi-compositor support** — X11, KDE Plasma (Wayland), Sway, Hyprland, GNOME (Wayland; auto-stack excepted)
 - **Minimize inactive clients** — optional, reduces resource usage when cycling away
+- **Borderless previews** — optional chrome-free mode; the character name sits on a translucent backdrop and turns red when the client is active or hovered
 
 ## Roadmap
 - Comprehensive documentation
@@ -206,6 +207,7 @@ enable_mouse_buttons = true
 forward_button = 276       # Button 9
 backward_button = 275      # Button 8
 minimize_inactive = false  # Minimize clients when cycling away (saves resources)
+borderless = false         # Chrome-free previews (name on backdrop; active/hovered = red)
 ```
 
 Per-character jump hotkeys live under `[character_hotkeys."Name"]` with `vk` and optional `modifier`; the config panel writes them for you.
