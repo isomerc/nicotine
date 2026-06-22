@@ -22,13 +22,13 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
 use super::render::{
-    apply_scale_transform, create_text_pixmap, jetbrains_mono, pick_visual_format, thumbnail_size,
+    apply_scale_transform, create_text_pixmap, jetbrains_mono, pick_visual_format, thumbnail_rect,
     xcolor,
 };
 use super::{
     opacity_to_cardinal, DragState, MutexExt as _, PreviewManager, BORDER_WIDTH, CHROME_DARK,
-    NICOTINE_CREAM, NICOTINE_RED, PREVIEW_HEIGHT, PREVIEW_WIDTH, TITLE_FONT_PX, TITLE_STRIP_HEIGHT,
-    TITLE_TEXT_LEFT_PAD,
+    NAME_BACKDROP_ALPHA, NAME_TOP_PAD, NICOTINE_CREAM, NICOTINE_RED, PREVIEW_HEIGHT, PREVIEW_WIDTH,
+    TITLE_FONT_PX, TITLE_STRIP_HEIGHT, TITLE_TEXT_LEFT_PAD,
 };
 
 /// Owns one preview window's resources. Drop releases everything in
@@ -64,6 +64,11 @@ pub(super) struct OwnedPreview {
     /// baked in. Drop frees this; chrome paint composites it directly.
     pub(super) title_pixmap: u32,
     pub(super) title_picture: u32,
+    /// Second copy of the name text baked in Nicotine red instead of
+    /// cream. Used in borderless mode for the *active* client's name
+    /// (there's no red border to signal active, so the name turns red).
+    pub(super) title_pixmap_active: u32,
+    pub(super) title_picture_active: u32,
     pub(super) title_text_w: u16,
     pub(super) title_text_h: u16,
     /// Current window dimensions. Updated on live-size apply (panel
@@ -83,6 +88,13 @@ pub(super) struct OwnedPreview {
     pub(super) x: i16,
     pub(super) y: i16,
     pub(super) is_active: bool,
+    /// True while the pointer is hovering this preview. Drives the same
+    /// red highlight as `is_active` (red border in bordered mode, red
+    /// name in borderless mode). Only ever set when the window actually
+    /// receives Enter/Leave events — which it does NOT under click-through
+    /// (the input region is empty / WS_EX_TRANSPARENT), so hover is
+    /// naturally disabled there, as required.
+    pub(super) hovered: bool,
     /// True while this preview is unmapped because the "hide active
     /// client's preview" setting is on and this preview's source is the
     /// foreground client. Tracked so the reconcile/active-change passes
@@ -126,6 +138,8 @@ impl Drop for OwnedPreview {
         let _ = self.conn.render_free_picture(self.window_picture);
         let _ = self.conn.render_free_picture(self.title_picture);
         let _ = self.conn.free_pixmap(self.title_pixmap);
+        let _ = self.conn.render_free_picture(self.title_picture_active);
+        let _ = self.conn.free_pixmap(self.title_pixmap_active);
         let _ = self.conn.free_pixmap(self.src_pixmap);
         let _ = self
             .conn
@@ -189,12 +203,13 @@ impl PreviewManager {
         // Initial dimensions come from LiveSettings (so the panel
         // sliders' current value is honored on first spawn) falling
         // back to config and finally to the compile-time defaults.
-        let (init_w, init_h, init_opacity) = {
+        let (init_w, init_h, init_opacity, borderless) = {
             let live = self.live.lock_recover();
             (
                 live.preview_width as u16,
                 live.preview_height as u16,
                 live.preview_opacity,
+                live.borderless,
             )
         };
         let init_w = if init_w == 0 { PREVIEW_WIDTH } else { init_w };
@@ -217,12 +232,18 @@ impl PreviewManager {
         // time the user switched clients. We keep the surface
         // present-driven instead: the render_pixmap is always fully
         // painted before we hand it to Present.
+        // ENTER_WINDOW | LEAVE_WINDOW drive the hover highlight. Under
+        // click-through these never arrive (the input region is empty), so
+        // hover is automatically inert there — which is the desired
+        // behavior: no hover highlight when click-through is on.
         let win_aux = CreateWindowAux::new()
             .event_mask(
                 EventMask::EXPOSURE
                     | EventMask::STRUCTURE_NOTIFY
                     | EventMask::BUTTON_PRESS
-                    | EventMask::BUTTON_RELEASE,
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::ENTER_WINDOW
+                    | EventMask::LEAVE_WINDOW,
             )
             .border_pixel(0)
             .override_redirect(1);
@@ -306,6 +327,17 @@ impl PreviewManager {
             TITLE_FONT_PX,
             self.argb32_format,
         )?;
+        // Red copy of the same name for borderless mode's active client.
+        // Same glyphs/metrics as the cream copy, so we reuse its w/h.
+        let (title_pixmap_active, title_picture_active, _, _) = create_text_pixmap(
+            conn,
+            our_window,
+            title,
+            NICOTINE_RED,
+            jetbrains_mono(),
+            TITLE_FONT_PX,
+            self.argb32_format,
+        )?;
 
         // Build XRender pictures. Source wraps the redirected pixmap
         // (with a downscale transform set below). Render target is an
@@ -331,7 +363,7 @@ impl PreviewManager {
         // Transform: dest coords (within the *thumbnail* area, not the
         // full window) → source coords. Scale factors are >1 because the
         // source is larger than the thumbnail.
-        let (thumb_w, thumb_h) = thumbnail_size(init_w, init_h);
+        let (_, _, thumb_w, thumb_h) = thumbnail_rect(init_w, init_h, borderless);
         apply_scale_transform(conn, src_picture, geom.width, geom.height, thumb_w, thumb_h)?;
 
         let is_active = source_id == self.active_id;
@@ -352,6 +384,8 @@ impl PreviewManager {
             render_picture,
             title_pixmap,
             title_picture,
+            title_pixmap_active,
+            title_picture_active,
             title_text_w,
             title_text_h,
             width: init_w,
@@ -361,6 +395,7 @@ impl PreviewManager {
             x: init_x as i16,
             y: init_y as i16,
             is_active,
+            hovered: false,
             // Created mapped; the reconcile pass right after this unmaps
             // it if the hide-active setting says it should start hidden.
             hidden: false,
@@ -384,8 +419,9 @@ impl PreviewManager {
     /// character-name text on top of the strip.
     pub(super) fn paint_chrome(&self, preview: &OwnedPreview) -> Result<()> {
         let conn = &self.conn;
+        // Red when active OR hovered (hover highlight); dark otherwise.
         let chrome_color = xcolor(
-            if preview.is_active {
+            if preview.is_active || preview.hovered {
                 NICOTINE_RED
             } else {
                 CHROME_DARK
@@ -461,12 +497,12 @@ impl PreviewManager {
             Some(p) => p,
             None => return Ok(()),
         };
-        let (source_id, source_w, source_h, thumb_w, thumb_h, old_picture, old_pixmap) = (
+        let borderless = self.live.lock_recover().borderless;
+        let (_, _, thumb_w, thumb_h) = thumbnail_rect(preview.width, preview.height, borderless);
+        let (source_id, source_w, source_h, old_picture, old_pixmap) = (
             preview.source_id,
             preview.source_w,
             preview.source_h,
-            thumbnail_size(preview.width, preview.height).0,
-            thumbnail_size(preview.width, preview.height).1,
             preview.src_picture,
             preview.src_pixmap,
         );
@@ -533,51 +569,137 @@ impl PreviewManager {
     /// `window_picture` field doc for why).
     pub(super) fn paint_preview_now(&mut self, key: &str) -> Result<()> {
         self.refresh_source_pixmap(key)?;
-        let preview_snapshot = match self.previews.get(key) {
-            Some(p) => p,
+        let borderless = self.live.lock_recover().borderless;
+
+        // Snapshot the copyable handles/dims so the draw calls below don't
+        // pin a borrow of `self.previews` across the `&self` paint_chrome
+        // call or the final `&mut self` dirty-clear.
+        let (
+            render_picture,
+            window_picture,
+            src_picture,
+            win_w,
+            win_h,
+            highlight,
+            title_picture,
+            title_picture_active,
+            title_w,
+            title_h,
+        ) = match self.previews.get(key) {
+            Some(p) => (
+                p.render_picture,
+                p.window_picture,
+                p.src_picture,
+                p.width,
+                p.height,
+                p.is_active || p.hovered,
+                p.title_picture,
+                p.title_picture_active,
+                p.title_text_w,
+                p.title_text_h,
+            ),
             None => return Ok(()),
         };
-        // Borrow-juggling: paint_chrome takes &self, but the second half
-        // of this function takes &mut self via previews.get_mut. We do
-        // the chrome paint here with the immutable borrow, then reacquire
-        // mutably below for the composite/present.
-        self.paint_chrome(preview_snapshot)?;
-        let preview = match self.previews.get_mut(key) {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        let (thumb_w, thumb_h) = thumbnail_size(preview.width, preview.height);
-        self.conn.render_composite(
-            PictOp::SRC,
-            preview.src_picture,
-            x11rb::NONE,
-            preview.render_picture,
-            0,
-            0,
-            0,
-            0,
-            BORDER_WIDTH as i16,
-            TITLE_STRIP_HEIGHT as i16,
-            thumb_w,
-            thumb_h,
-        )?;
+
+        let (tx, ty, thumb_w, thumb_h) = thumbnail_rect(win_w, win_h, borderless);
+
+        if borderless {
+            // Thumbnail fills the whole window. PictOp::SRC overwrites any
+            // chrome pixels left from a previous bordered frame.
+            self.conn.render_composite(
+                PictOp::SRC,
+                src_picture,
+                x11rb::NONE,
+                render_picture,
+                0,
+                0,
+                0,
+                0,
+                tx,
+                ty,
+                thumb_w,
+                thumb_h,
+            )?;
+            // Translucent backdrop behind the name so it stays legible over
+            // bright thumbnails, then the name itself — red when this is the
+            // active client (no border to signal active in this mode), cream
+            // otherwise.
+            let bd_w = title_w
+                .saturating_add(2 * TITLE_TEXT_LEFT_PAD as u16)
+                .min(win_w);
+            let bd_h = title_h.saturating_add(2 * NAME_TOP_PAD as u16).min(win_h);
+            self.conn.render_fill_rectangles(
+                PictOp::OVER,
+                render_picture,
+                xcolor((0, 0, 0), NAME_BACKDROP_ALPHA),
+                &[XRectangle {
+                    x: 0,
+                    y: 0,
+                    width: bd_w,
+                    height: bd_h,
+                }],
+            )?;
+            // Red name when active OR hovered (hover highlight), else cream.
+            let text_picture = if highlight {
+                title_picture_active
+            } else {
+                title_picture
+            };
+            self.conn.render_composite(
+                PictOp::OVER,
+                text_picture,
+                x11rb::NONE,
+                render_picture,
+                0,
+                0,
+                0,
+                0,
+                TITLE_TEXT_LEFT_PAD,
+                NAME_TOP_PAD,
+                title_w,
+                title_h,
+            )?;
+        } else {
+            // Chrome (title strip + colored border + cream name) first, then
+            // the thumbnail inset below the strip / inside the borders.
+            if let Some(p) = self.previews.get(key) {
+                self.paint_chrome(p)?;
+            }
+            self.conn.render_composite(
+                PictOp::SRC,
+                src_picture,
+                x11rb::NONE,
+                render_picture,
+                0,
+                0,
+                0,
+                0,
+                tx,
+                ty,
+                thumb_w,
+                thumb_h,
+            )?;
+        }
+
         // Blit the finished offscreen frame straight onto the window with one
         // composite — no X Present extension (see `window_picture`).
         self.conn.render_composite(
             PictOp::SRC,
-            preview.render_picture,
+            render_picture,
             x11rb::NONE,
-            preview.window_picture,
+            window_picture,
             0,
             0,
             0,
             0,
             0,
             0,
-            preview.width,
-            preview.height,
+            win_w,
+            win_h,
         )?;
-        preview.dirty = false;
+        if let Some(p) = self.previews.get_mut(key) {
+            p.dirty = false;
+        }
         self.conn.flush()?;
         Ok(())
     }

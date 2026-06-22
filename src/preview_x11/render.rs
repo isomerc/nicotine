@@ -74,6 +74,20 @@ pub(super) fn thumbnail_size(window_w: u16, window_h: u16) -> (u16, u16) {
     (w.max(1), h.max(1))
 }
 
+/// (x, y, width, height) of the thumbnail area within a preview window.
+/// In bordered mode the thumbnail is inset by the title strip (top) and
+/// the border (left/right/bottom). In borderless mode it fills the whole
+/// window edge-to-edge — the chrome is gone and the character name is
+/// drawn over the thumbnail on a translucent backdrop instead.
+pub(super) fn thumbnail_rect(window_w: u16, window_h: u16, borderless: bool) -> (i16, i16, u16, u16) {
+    if borderless {
+        (0, 0, window_w.max(1), window_h.max(1))
+    } else {
+        let (w, h) = thumbnail_size(window_w, window_h);
+        (BORDER_WIDTH as i16, TITLE_STRIP_HEIGHT as i16, w, h)
+    }
+}
+
 /// Set the source picture's transform so a thumb_w × thumb_h destination
 /// area samples the full source_w × source_h source. XRender transforms
 /// are inverse-mapping — they map dest coords to source coords — hence

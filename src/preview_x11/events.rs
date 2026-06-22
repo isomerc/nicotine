@@ -6,7 +6,9 @@
 use anyhow::Result;
 
 use x11rb::protocol::damage::ConnectionExt as _;
-use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt as _, EventMask, GrabMode};
+use x11rb::protocol::xproto::{
+    ConfigureWindowAux, ConnectionExt as _, EventMask, GrabMode, NotifyMode,
+};
 use x11rb::protocol::Event;
 
 use crate::preview_common::{snap_position, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX};
@@ -90,6 +92,18 @@ impl PreviewManager {
                     self.paint_list()?;
                 }
             }
+            // Pointer hover: red-highlight the preview under the cursor
+            // (red border in bordered mode, red name in borderless). Filter
+            // to NORMAL crossings so the synthetic Enter/Leave a pointer
+            // grab emits mid-drag don't flicker the highlight. These events
+            // never arrive under click-through (empty input region), so
+            // hover is inert there — as required.
+            Event::EnterNotify(ev) if ev.mode == NotifyMode::NORMAL => {
+                self.set_hover(ev.event, true)?
+            }
+            Event::LeaveNotify(ev) if ev.mode == NotifyMode::NORMAL => {
+                self.set_hover(ev.event, false)?
+            }
             // Drag lifecycle: press → motion → release. Same code paths
             // for previews and the list window — both drag identically.
             Event::ButtonPress(ev) => self.handle_button_press(ev)?,
@@ -103,6 +117,28 @@ impl PreviewManager {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Set the hover highlight on the preview owning `window` and repaint
+    /// if it changed. List window has no hover highlight (no per-row
+    /// concept), so non-preview windows are ignored.
+    fn set_hover(&mut self, window: u32, hovered: bool) -> Result<()> {
+        let key = self
+            .previews
+            .iter()
+            .find(|(_, p)| p.window == window)
+            .map(|(k, _)| k.clone());
+        let Some(key) = key else {
+            return Ok(());
+        };
+        match self.previews.get_mut(&key) {
+            Some(p) if p.hovered != hovered => {
+                p.hovered = hovered;
+                p.dirty = true;
+            }
+            _ => return Ok(()),
+        }
+        self.paint_preview_now(&key)
     }
 
     /// Left-click-drag start. Grab the pointer (unless positions are
