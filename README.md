@@ -208,6 +208,7 @@ forward_button = 276       # Button 9
 backward_button = 275      # Button 8
 minimize_inactive = false  # Minimize clients when cycling away (saves resources)
 smart_hide = false         # Hide the overlay unless an EVE window is mostly visible
+                           # (X11/XWayland windows only; native-Wayland occluders aren't seen)
 ```
 
 Per-character jump hotkeys live under `[character_hotkeys."Name"]` with `vk` and optional `modifier`; the config panel writes them for you.

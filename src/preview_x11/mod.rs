@@ -628,13 +628,23 @@ impl PreviewManager {
     /// windows above it — excluding Nicotine's own windows so the overlay
     /// doesn't occlude itself. Fails *open* (true) if the data is
     /// unavailable, so the overlay never gets stuck hidden.
+    ///
+    /// Limitation: under a Wayland session this only sees X11/XWayland
+    /// windows (EVE runs as XWayland, so EVE-vs-EVE and EVE-vs-other-X11
+    /// occlusion is correct), but a *native* Wayland window covering EVE is
+    /// invisible to this query — Wayland denies clients cross-surface
+    /// geometry. There it errs toward keeping the overlay shown.
     fn any_eve_visible_enough(&self) -> bool {
         let root = self.conn.setup().roots[self.screen_num].root;
         let Some(stacking) = self.read_window_stack(root) else {
             return true;
         };
+        // Fail *open* on an empty/missing stack (a WM can briefly publish an
+        // empty `_NET_CLIENT_LIST_STACKING` during transitions); hiding the
+        // whole overlay on that transient would be jarring, and it matches
+        // the Windows backend's empty-result behavior.
         if stacking.is_empty() {
-            return false;
+            return true;
         }
 
         struct WinInfo {
