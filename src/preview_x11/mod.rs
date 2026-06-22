@@ -249,7 +249,10 @@ fn run_manager(
     // saved choice). The first reconcile spawns the right kind of
     // surface. We start with the same value so the first tick doesn't
     // waste work tearing down a surface we never created.
-    let initial_mode = live.lock_recover().display_mode;
+    let (initial_mode, initial_click_through) = {
+        let l = live.lock_recover();
+        (l.display_mode, l.click_through)
+    };
 
     let mut manager = PreviewManager {
         conn: Arc::clone(&conn),
@@ -268,6 +271,7 @@ fn run_manager(
         positions,
         last_applied_size,
         last_applied_opacity,
+        last_applied_click_through: initial_click_through,
         current_mode: initial_mode,
         list_window: None,
         needs_window_scan: true,
@@ -338,6 +342,10 @@ struct PreviewManager {
     /// against LiveSettings each reconcile so we only re-set the
     /// `_NET_WM_WINDOW_OPACITY` property when the slider actually moved.
     last_applied_opacity: u32,
+    /// Last click-through state we applied to all preview windows. Diffed
+    /// against LiveSettings each reconcile so we only re-shape the input
+    /// region when the toggle actually flipped.
+    last_applied_click_through: bool,
     /// Whether the panel currently wants per-client previews or a
     /// single client-list window. Reconcile detects transitions and
     /// tears down the outgoing mode's surfaces before spawning the
@@ -526,12 +534,56 @@ impl PreviewManager {
         // round-trips here, so safe on every 100ms tick.
         self.apply_live_size();
         self.apply_live_opacity();
+        self.apply_live_click_through();
         // Catches the setting being toggled and previews created since
         // the last tick; the instant per-cycle response comes from the
         // same call at the end of update_active.
         self.apply_active_visibility();
 
         Ok(())
+    }
+
+    /// Set (or clear) input passthrough on a preview window via the X
+    /// SHAPE extension. An *empty* input shape means the window receives
+    /// no pointer events — clicks fall through to whatever is behind it.
+    /// Clearing it (NONE source bitmap) restores the default whole-window
+    /// input region.
+    pub(super) fn set_input_passthrough(&self, window: u32, passthrough: bool) {
+        use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
+        use x11rb::protocol::xproto::ClipOrdering;
+        if passthrough {
+            let _ = self.conn.shape_rectangles(
+                SO::SET,
+                SK::INPUT,
+                ClipOrdering::UNSORTED,
+                window,
+                0,
+                0,
+                &[],
+            );
+        } else {
+            let _ = self
+                .conn
+                .shape_mask(SO::SET, SK::INPUT, window, 0, 0, x11rb::NONE);
+        }
+    }
+
+    /// Read LiveSettings.click_through; if it flipped since the last
+    /// reconcile, re-shape every preview's input region so clicks either
+    /// pass through or are captured again. New previews get the current
+    /// state at creation (see create_preview), so this only handles the
+    /// live toggle.
+    fn apply_live_click_through(&mut self) {
+        let want = self.live.lock_recover().click_through;
+        if want == self.last_applied_click_through {
+            return;
+        }
+        self.last_applied_click_through = want;
+        let windows: Vec<u32> = self.previews.values().map(|p| p.window).collect();
+        for window in windows {
+            self.set_input_passthrough(window, want);
+        }
+        let _ = self.conn.flush();
     }
 
     /// Hide the active client's preview (and reveal everything else) when

@@ -5,11 +5,14 @@
 
 use anyhow::Result;
 
+use x11rb::connection::Connection as _;
 use x11rb::protocol::damage::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt as _, EventMask, GrabMode};
 use x11rb::protocol::Event;
 
-use crate::preview_common::{snap_position, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX};
+use crate::preview_common::{
+    snap_position, snap_to_screen_edges, DragRect, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
+};
 
 use super::{DragTarget, MutexExt as _, PreviewManager};
 
@@ -236,15 +239,29 @@ impl PreviewManager {
         if !crossed_threshold {
             return Ok(());
         }
-        let others = self.collect_other_rects(&target);
-        let (snapped_x, snapped_y) = snap_position(
-            proposed_x,
-            proposed_y,
-            width as i32,
-            height as i32,
-            &others,
-            SNAP_THRESHOLD_PX,
-        );
+        // Snapping (window-to-window + screen edges) is gated by the panel
+        // toggle; when off, the window follows the cursor freely.
+        let (snapped_x, snapped_y) = if self.live.lock_recover().snapping {
+            let others = self.collect_other_rects(&target);
+            let (sx, sy) = snap_position(
+                proposed_x,
+                proposed_y,
+                width as i32,
+                height as i32,
+                &others,
+                SNAP_THRESHOLD_PX,
+            );
+            let root = &self.conn.setup().roots[self.screen_num];
+            let screen = DragRect {
+                left: 0,
+                top: 0,
+                right: root.width_in_pixels as i32,
+                bottom: root.height_in_pixels as i32,
+            };
+            snap_to_screen_edges(sx, sy, width as i32, height as i32, screen, SNAP_THRESHOLD_PX)
+        } else {
+            (proposed_x, proposed_y)
+        };
         let new_x = snapped_x.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         let new_y = snapped_y.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
 

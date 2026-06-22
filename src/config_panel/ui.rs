@@ -450,6 +450,12 @@ fn previews_section(panel: &Panel) -> Element<'_, Message> {
         checkbox(panel.config.hide_active_preview)
             .label("Hide the active client's preview")
             .on_toggle(Message::HideActivePreviewToggled),
+        checkbox(panel.config.click_through)
+            .label("Click-through (overlay ignores the mouse)")
+            .on_toggle(Message::ClickThroughToggled),
+        checkbox(panel.config.snapping)
+            .label("Snap previews to each other and screen edges")
+            .on_toggle(Message::SnappingToggled),
         checkbox(panel.config.constrain_aspect)
             .label("Constrain aspect ratio")
             .on_toggle(Message::ConstrainAspectToggled),

@@ -109,6 +109,38 @@ pub fn snap_position(
     (x, y)
 }
 
+/// Adjust a proposed (x, y) so the dragged window's edges snap to the
+/// edges of the `screen` rect (a monitor / the virtual desktop) when
+/// within `snap_threshold`. Each axis snaps independently and the
+/// outer-edge match (left↔left, right↔right) is checked first. Applied
+/// *after* `snap_position` so window-to-window docking still wins when
+/// both could match the same axis. No-op when `snap_threshold <= 0`.
+pub fn snap_to_screen_edges(
+    proposed_x: i32,
+    proposed_y: i32,
+    width: i32,
+    height: i32,
+    screen: DragRect,
+    snap_threshold: i32,
+) -> (i32, i32) {
+    let mut x = proposed_x;
+    let mut y = proposed_y;
+    let snap = snap_threshold;
+
+    if (proposed_x - screen.left).abs() <= snap {
+        x = screen.left;
+    } else if (proposed_x + width - screen.right).abs() <= snap {
+        x = screen.right - width;
+    }
+    if (proposed_y - screen.top).abs() <= snap {
+        y = screen.top;
+    } else if (proposed_y + height - screen.bottom).abs() <= snap {
+        y = screen.bottom - height;
+    }
+
+    (x, y)
+}
+
 /// Whether a preview window should be hidden right now, given the
 /// "hide active client's preview" setting and whether this preview
 /// mirrors the currently-active EVE client.
@@ -363,6 +395,43 @@ mod tests {
         let others = [neighbor(210, 100)];
         let (x, y) = snap_position(100, 100, DRAG_W, DRAG_H, &others, 0);
         assert_eq!((x, y), (100, 100));
+    }
+
+    // 1920x1080 screen at the origin for the edge-snap tests.
+    fn screen() -> DragRect {
+        DragRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        }
+    }
+
+    #[test]
+    fn edge_snaps_left_and_top() {
+        // 8px from the top-left corner — both axes snap to 0.
+        let (x, y) = snap_to_screen_edges(8, 8, DRAG_W, DRAG_H, screen(), SNAP);
+        assert_eq!((x, y), (0, 0));
+    }
+
+    #[test]
+    fn edge_snaps_right_and_bottom() {
+        // Right edge (x+100) within 12 of 1920; bottom within 12 of 1080.
+        let (x, y) = snap_to_screen_edges(1815, 975, DRAG_W, DRAG_H, screen(), SNAP);
+        assert_eq!((x, y), (1820, 980)); // x = 1920-100, y = 1080-100
+    }
+
+    #[test]
+    fn edge_no_snap_when_centered() {
+        let (x, y) = snap_to_screen_edges(900, 500, DRAG_W, DRAG_H, screen(), SNAP);
+        assert_eq!((x, y), (900, 500));
+    }
+
+    #[test]
+    fn edge_left_preferred_over_right_each_axis_independent() {
+        // Near the left edge on X, near the bottom edge on Y.
+        let (x, y) = snap_to_screen_edges(5, 975, DRAG_W, DRAG_H, screen(), SNAP);
+        assert_eq!((x, y), (0, 980));
     }
 
     #[test]

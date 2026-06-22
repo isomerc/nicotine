@@ -189,12 +189,13 @@ impl PreviewManager {
         // Initial dimensions come from LiveSettings (so the panel
         // sliders' current value is honored on first spawn) falling
         // back to config and finally to the compile-time defaults.
-        let (init_w, init_h, init_opacity) = {
+        let (init_w, init_h, init_opacity, click_through) = {
             let live = self.live.lock_recover();
             (
                 live.preview_width as u16,
                 live.preview_height as u16,
                 live.preview_opacity,
+                live.click_through,
             )
         };
         let init_w = if init_w == 0 { PREVIEW_WIDTH } else { init_w };
@@ -290,6 +291,11 @@ impl PreviewManager {
 
         conn.map_window(our_window)?;
         conn.sync()?;
+
+        // Honor the click-through toggle on first spawn (empty input shape =
+        // pointer events fall through). apply_live_click_through re-applies
+        // this if the toggle flips later.
+        self.set_input_passthrough(our_window, click_through);
 
         // Pre-rasterize the character name into a premultiplied-ARGB32
         // pixmap. The cream text color and per-pixel alpha are baked
