@@ -274,16 +274,23 @@ impl Daemon {
         // when `enable` is false. That way flipping `enable_*` on in
         // the panel after startup actually does something instead of
         // requiring a daemon restart.
+        // Currently-held modifier keys, written by the keyboard listener and
+        // read by the mouse listener so a mouse/wheel hotkey can require a
+        // modifier chord (Ctrl + Mouse4) even though the two listeners poll
+        // different evdev devices.
+        let held_modifiers = Arc::new(Mutex::new(std::collections::HashSet::<u16>::new()));
         MouseListener::spawn(
             Arc::clone(&self.mouse_config),
             Arc::clone(&self.wm),
             Arc::clone(&self.state),
+            Arc::clone(&held_modifiers),
         );
         KeyboardListener::spawn(
             Arc::clone(&self.keyboard_config),
             Arc::clone(&self.wm),
             Arc::clone(&self.state),
             Arc::clone(&self.live),
+            held_modifiers,
         );
         println!("Mouse + keyboard listeners spawned (live config hot-reload enabled)");
 

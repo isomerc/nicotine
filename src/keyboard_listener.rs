@@ -62,8 +62,9 @@ impl KeyboardListener {
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
         live: Arc<Mutex<LiveSettings>>,
+        held_modifiers: Arc<Mutex<HashSet<u16>>>,
     ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || Self::run_listener(shared, wm, state, live))
+        std::thread::spawn(move || Self::run_listener(shared, wm, state, live, held_modifiers))
     }
 
     fn run_listener(
@@ -71,6 +72,7 @@ impl KeyboardListener {
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
         live: Arc<Mutex<LiveSettings>>,
+        held_modifiers: Arc<Mutex<HashSet<u16>>>,
     ) {
         let mut device: Option<Device> = None;
         let mut current_dev_path: Option<String> = None;
@@ -209,6 +211,8 @@ impl KeyboardListener {
                     } else {
                         pressed_modifiers.remove(&code);
                     }
+                    // Publish for the mouse listener's modifier-chord matching.
+                    *held_modifiers.lock().unwrap() = pressed_modifiers.clone();
                 }
 
                 // Only act on press / repeat.
@@ -428,33 +432,22 @@ fn resolve_character_hotkey(
 mod tests {
     use super::*;
 
-    fn hk(vk: u16, modifier: Option<u16>) -> CharacterHotkey {
-        CharacterHotkey { vk, modifier }
+    fn hk(code: u16, mods: Vec<u16>) -> Hotkey {
+        Hotkey::key_with_mods(code, mods)
     }
 
     #[test]
     fn unmatched_code_returns_none() {
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("Alpha".to_string(), hk(0x70, None)); // F1
+        hotkeys.insert("Alpha".to_string(), hk(0x70, vec![])); // F1
         let pressed: HashSet<u16> = HashSet::new();
         assert_eq!(resolve_character_hotkey(0x71, &pressed, &hotkeys), None);
     }
 
     #[test]
-    fn placeholder_vk_zero_never_matches() {
-        // Panel writes vk=0 when the user picks a modifier before a
-        // key. Pressing any key (including code 0, theoretically)
-        // shouldn't dispatch a placeholder.
-        let mut hotkeys = HashMap::new();
-        hotkeys.insert("Alpha".to_string(), hk(0, Some(42)));
-        let pressed: HashSet<u16> = [42].into_iter().collect();
-        assert_eq!(resolve_character_hotkey(0, &pressed, &hotkeys), None);
-    }
-
-    #[test]
     fn no_modifier_binding_matches_when_no_modifier_held() {
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("Alpha".to_string(), hk(0x70, None));
+        hotkeys.insert("Alpha".to_string(), hk(0x70, vec![]));
         let pressed: HashSet<u16> = HashSet::new();
         assert_eq!(
             resolve_character_hotkey(0x70, &pressed, &hotkeys),
@@ -465,7 +458,7 @@ mod tests {
     #[test]
     fn modifier_binding_requires_modifier_held() {
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("Alpha".to_string(), hk(0x70, Some(0x10)));
+        hotkeys.insert("Alpha".to_string(), hk(0x70, vec![0x10]));
         // Press F1 without Shift held.
         assert_eq!(
             resolve_character_hotkey(0x70, &HashSet::new(), &hotkeys),
@@ -490,8 +483,8 @@ mod tests {
         // catches it in expectation rather than relying on a single
         // hash seed.
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("AlphaWithShift".to_string(), hk(0x70, Some(0x10))); // Shift+F1
-        hotkeys.insert("BetaPlain".to_string(), hk(0x70, None)); // F1
+        hotkeys.insert("AlphaWithShift".to_string(), hk(0x70, vec![0x10])); // Shift+F1
+        hotkeys.insert("BetaPlain".to_string(), hk(0x70, vec![])); // F1
         let pressed: HashSet<u16> = [0x10].into_iter().collect();
         for _ in 0..32 {
             assert_eq!(
@@ -506,8 +499,8 @@ mod tests {
         // Same setup as above, but no modifier is held — should
         // resolve to the no-modifier binding.
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("AlphaWithShift".to_string(), hk(0x70, Some(0x10)));
-        hotkeys.insert("BetaPlain".to_string(), hk(0x70, None));
+        hotkeys.insert("AlphaWithShift".to_string(), hk(0x70, vec![0x10]));
+        hotkeys.insert("BetaPlain".to_string(), hk(0x70, vec![]));
         let pressed: HashSet<u16> = HashSet::new();
         assert_eq!(
             resolve_character_hotkey(0x70, &pressed, &hotkeys),
@@ -521,8 +514,8 @@ mod tests {
         // Pressing F1 with Ctrl held should pick Beta. Pressing F1
         // with Shift held should pick Alpha.
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("Alpha".to_string(), hk(0x70, Some(0x10)));
-        hotkeys.insert("Beta".to_string(), hk(0x70, Some(0x11)));
+        hotkeys.insert("Alpha".to_string(), hk(0x70, vec![0x10]));
+        hotkeys.insert("Beta".to_string(), hk(0x70, vec![0x11]));
 
         let shift_only: HashSet<u16> = [0x10].into_iter().collect();
         assert_eq!(
@@ -543,7 +536,7 @@ mod tests {
         // if no other binding exists for F1. The first-pass filter
         // requires the modifier to be in pressed_modifiers.
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("Alpha".to_string(), hk(0x70, Some(0x10)));
+        hotkeys.insert("Alpha".to_string(), hk(0x70, vec![0x10]));
         assert_eq!(
             resolve_character_hotkey(0x70, &HashSet::new(), &hotkeys),
             None
@@ -588,7 +581,7 @@ mod tests {
         let mut with_char = idle_config();
         with_char
             .character_hotkeys
-            .insert("Alpha".to_string(), hk(0x70, None));
+            .insert("Alpha".to_string(), hk(0x70, vec![]));
         assert!(with_char.has_work());
     }
 

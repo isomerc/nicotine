@@ -1,4 +1,4 @@
-use crate::config::{Config, Hotkey, LiveSettings};
+use crate::config::{Config, Hotkey, LiveSettings, TriggerKind, WHEEL_DOWN, WHEEL_UP};
 use iced::{Color, Element, Subscription, Task, Theme};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -172,6 +172,34 @@ fn iced_mods_to_codes(m: &iced::keyboard::Modifiers) -> Vec<u16> {
     v
 }
 
+/// Map an iced mouse button to the code the runtime listener matches.
+/// Linux uses evdev BTN_* codes; Windows uses the XBUTTON numbering the
+/// low-level mouse hook reports (back=1, forward=2). Left/Right/Middle on
+/// Windows aren't delivered by that hook, so binding them there is inert.
+#[cfg(unix)]
+fn iced_button_to_code(b: iced::mouse::Button) -> Option<u16> {
+    use iced::mouse::Button;
+    Some(match b {
+        Button::Left => 0x110,    // BTN_LEFT (272)
+        Button::Right => 0x111,   // BTN_RIGHT (273)
+        Button::Middle => 0x112,  // BTN_MIDDLE (274)
+        Button::Back => 0x113,    // BTN_SIDE (275)
+        Button::Forward => 0x114, // BTN_EXTRA (276)
+        Button::Other(n) => n,
+    })
+}
+#[cfg(windows)]
+fn iced_button_to_code(b: iced::mouse::Button) -> Option<u16> {
+    use iced::mouse::Button;
+    match b {
+        Button::Back => Some(1),     // XBUTTON1
+        Button::Forward => Some(2),  // XBUTTON2
+        Button::Other(n) => Some(n),
+        // Not reported by the WM_XBUTTON low-level hook; not bindable.
+        Button::Left | Button::Right | Button::Middle => None,
+    }
+}
+
 /// Aspect ratio (width / height) used to lock the two preview dimensions
 /// together when "Constrain aspect ratio" is on. Guards a zero/empty
 /// dimension (only reachable via a hand-edited config) by falling back to
@@ -272,6 +300,9 @@ pub(super) struct Panel {
     pub new_character_buffer: String,
     /// When `Some(..)`, the next keypress binds to this field.
     pub capturing: Option<CaptureTarget>,
+    /// Modifiers held during an in-progress capture, so a mouse/wheel
+    /// trigger captured next can include the chord.
+    pub capture_mods: iced::keyboard::Modifiers,
     /// Timestamp of the last edit; the debounce subscription flushes to
     /// disk once this is older than `AUTOSAVE_DEBOUNCE`.
     pub last_change: Option<Instant>,
@@ -340,6 +371,7 @@ impl Panel {
             restack_supported,
             new_character_buffer: String::new(),
             capturing: None,
+            capture_mods: iced::keyboard::Modifiers::empty(),
             last_change: None,
             active_tab: Tab::Display,
             dragging: None,
@@ -354,6 +386,27 @@ impl Panel {
         self.last_change = Some(Instant::now());
     }
 
+    /// Commit a mouse-button / wheel trigger (with any held modifiers) to
+    /// the bind site currently capturing. Other (single-key) sites ignore
+    /// mouse/wheel until they're migrated to the unified Hotkey.
+    fn bind_captured_trigger(&mut self, kind: TriggerKind, code: u16) {
+        let Some(target) = self.capturing.clone() else {
+            return;
+        };
+        let mut mods = iced_mods_to_codes(&self.capture_mods);
+        mods.sort_unstable();
+        mods.dedup();
+        let hk = Hotkey { mods, kind, code };
+        if let CaptureTarget::Character(name) = &target {
+            self.config.character_hotkeys.insert(name.clone(), hk);
+            self.capturing = None;
+            self.capture_mods = iced::keyboard::Modifiers::empty();
+            self.touch();
+            #[cfg(windows)]
+            self.end_windows_capture();
+        }
+    }
+
     fn handle_capture_key(&mut self, event: iced::keyboard::Event) -> Task<Message> {
         use iced::keyboard::key::Named;
         use iced::keyboard::{Event, Key};
@@ -362,9 +415,17 @@ impl Panel {
             return Task::none();
         };
 
+        // Track held modifiers so a mouse/wheel trigger captured next can
+        // include the chord (ModifiersChanged carries no key to bind).
+        if let Event::ModifiersChanged(m) = event {
+            self.capture_mods = m;
+            return Task::none();
+        }
+
         let Event::KeyPressed { key, modifiers, .. } = event else {
             return Task::none();
         };
+        self.capture_mods = modifiers;
 
         // Escape cancels capture without binding.
         if matches!(key, Key::Named(Named::Escape)) {
@@ -453,6 +514,8 @@ pub(super) enum Message {
     UnhoverRow(usize),
     DropRow,
     KeyEvent(iced::keyboard::Event),
+    CaptureMouse(u16),
+    CaptureWheel(bool),
     ShowPreviewsToggled(bool),
     HideActivePreviewToggled(bool),
     ConstrainAspectToggled(bool),
@@ -593,6 +656,12 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             }
             panel.dragging = None;
             panel.drag_hover = None;
+        }
+        Message::CaptureMouse(code) => {
+            panel.bind_captured_trigger(TriggerKind::Mouse, code);
+        }
+        Message::CaptureWheel(up) => {
+            panel.bind_captured_trigger(TriggerKind::Wheel, if up { WHEEL_UP } else { WHEEL_DOWN });
         }
         Message::KeyEvent(event) => {
             return panel.handle_capture_key(event);
@@ -781,7 +850,26 @@ fn subscription(panel: &Panel) -> Subscription<Message> {
     let mut subs = Vec::new();
     // Only listen for raw key events while a bind button is armed.
     if panel.capturing.is_some() {
-        subs.push(iced::keyboard::listen().map(Message::KeyEvent));
+        subs.push(iced::event::listen_with(|event, _status, _window| match event {
+            iced::Event::Keyboard(k) => Some(Message::KeyEvent(k)),
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(b)) => {
+                iced_button_to_code(b).map(Message::CaptureMouse)
+            }
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => {
+                let y = match delta {
+                    iced::mouse::ScrollDelta::Lines { y, .. } => y,
+                    iced::mouse::ScrollDelta::Pixels { y, .. } => y,
+                };
+                if y > 0.0 {
+                    Some(Message::CaptureWheel(true))
+                } else if y < 0.0 {
+                    Some(Message::CaptureWheel(false))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }));
     }
     // Poll only while a save is pending so the debounce fires even with
     // no further input; stops once flushed.
