@@ -25,6 +25,7 @@ High-performance EVE Online multiboxing tool for Linux (X11 & Wayland) and Windo
 - **Drag-to-position with snap-to-dock** on previews and the list window; lockable layout for play
 - **Multi-compositor support** — X11, KDE Plasma (Wayland), Sway, Hyprland, GNOME (Wayland; auto-stack excepted)
 - **Minimize inactive clients** — optional, reduces resource usage when cycling away
+- **Instant overlay toggle** — bind a key to hide/show the entire overlay in place, positions preserved
 
 ## Roadmap
 - Comprehensive documentation

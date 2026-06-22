@@ -364,12 +364,28 @@ impl PreviewManager {
     }
 
     fn reconcile_list(&mut self) {
+        // The overlay toggle hides the list-view window too (apply_active_
+        // visibility only runs in Previews mode, so gate here for List mode).
+        if self.live.lock().unwrap().overlay_hidden {
+            if let Some(list) = &self.list {
+                unsafe {
+                    let _ = ShowWindow(list.hwnd, SW_HIDE);
+                }
+            }
+            return;
+        }
         // Spawn the list window on first entry into this mode, or if it
         // was torn down somehow.
         if self.list.is_none() {
             if let Err(e) = self.create_list_window() {
                 eprintln!("Failed to create list window: {}", e);
                 return;
+            }
+        }
+        // Re-show in case a prior overlay-hide hid it.
+        if let Some(list) = &self.list {
+            unsafe {
+                let _ = ShowWindow(list.hwnd, SW_SHOWNOACTIVATE);
             }
         }
 
@@ -554,9 +570,14 @@ impl PreviewManager {
     /// re-running this hides the newly-active preview and reshows the one
     /// cycled away from.
     fn apply_active_visibility(&mut self) {
-        let hide_active = self.live.lock().unwrap().hide_active_preview;
+        let (hide_active, overlay_hidden) = {
+            let live = self.live.lock().unwrap();
+            (live.hide_active_preview, live.overlay_hidden)
+        };
         for preview in self.previews.values_mut() {
-            let want_hidden = preview_should_hide(hide_active, preview.is_active);
+            // The master overlay toggle hides everything; otherwise fall
+            // back to the per-client "hide active" rule.
+            let want_hidden = overlay_hidden || preview_should_hide(hide_active, preview.is_active);
             if want_hidden == preview.hidden {
                 continue;
             }
@@ -570,6 +591,18 @@ impl PreviewManager {
             };
             unsafe {
                 let _ = ShowWindow(preview.hwnd, cmd);
+            }
+        }
+        // List-view window: the master toggle hides/shows it too. ShowWindow
+        // with the same state is a cheap no-op, so calling each tick is fine.
+        if let Some(list) = &self.list {
+            let cmd = if overlay_hidden {
+                SW_HIDE
+            } else {
+                SW_SHOWNOACTIVATE
+            };
+            unsafe {
+                let _ = ShowWindow(list.hwnd, cmd);
             }
         }
     }

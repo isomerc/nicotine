@@ -564,7 +564,14 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         }
         Message::ShowPreviewsToggled(v) => {
             panel.config.show_previews = v;
-            panel.live.lock().unwrap().show_previews = v;
+            let mut live = panel.live.lock().unwrap();
+            live.show_previews = v;
+            // Re-enabling the master gate clears a stale runtime overlay-hide,
+            // so previews actually reappear instead of staying hidden.
+            if v {
+                live.overlay_hidden = false;
+            }
+            drop(live);
             panel.touch();
         }
         Message::HideActivePreviewToggled(v) => {
