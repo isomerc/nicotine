@@ -54,6 +54,14 @@ pub struct LiveSettings {
     /// away from reappears. Read live so the toggle takes effect without
     /// a restart.
     pub hide_active_preview: bool,
+    /// When true, previews drop the chrome (title strip + colored
+    /// border) and render the thumbnail edge-to-edge. The character
+    /// name is still drawn over the top-left corner on a translucent
+    /// backdrop so it stays readable; the *active* client's name is
+    /// drawn in Nicotine red (the color the active border uses in
+    /// bordered mode) instead of cream. Read live so the toggle takes
+    /// effect without a restart.
+    pub borderless: bool,
 }
 
 impl LiveSettings {
@@ -66,6 +74,7 @@ impl LiveSettings {
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
             hide_active_preview: config.hide_active_preview,
+            borderless: config.borderless,
         }))
     }
 }
@@ -120,6 +129,12 @@ pub struct Config {
     /// client.
     #[serde(default = "default_hide_active_preview")]
     pub hide_active_preview: bool,
+    /// When true, previews render borderless (no title strip / colored
+    /// border) with the name overlaid on a translucent backdrop. Default
+    /// off. See the `LiveSettings::borderless` doc for the rendering
+    /// details.
+    #[serde(default = "default_borderless")]
+    pub borderless: bool,
     /// When true, the config panel locks preview width and height to a
     /// single aspect ratio and offers one "size" slider instead of
     /// separate width/height sliders. Purely a panel-side concern — the
@@ -271,6 +286,10 @@ fn default_hide_active_preview() -> bool {
     false
 }
 
+fn default_borderless() -> bool {
+    false
+}
+
 fn default_constrain_aspect() -> bool {
     false
 }
@@ -388,6 +407,7 @@ impl Config {
             preview_opacity: default_preview_opacity(),
             show_previews: default_show_previews(),
             hide_active_preview: default_hide_active_preview(),
+            borderless: default_borderless(),
             constrain_aspect: default_constrain_aspect(),
             toggle_previews_key: None,
             toggle_previews_modifier: None,
@@ -474,6 +494,7 @@ mod tests {
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
+            borderless: false,
             constrain_aspect: false,
             toggle_previews_key: None,
             toggle_previews_modifier: None,
@@ -513,6 +534,7 @@ mod tests {
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
+            borderless: false,
             constrain_aspect: false,
             toggle_previews_key: None,
             toggle_previews_modifier: None,
@@ -551,6 +573,7 @@ mod tests {
             preview_opacity: 55,
             show_previews: true,
             hide_active_preview: true,
+            borderless: true,
             constrain_aspect: true,
             toggle_previews_key: Some(67),
             toggle_previews_modifier: Some(42),
@@ -576,6 +599,10 @@ mod tests {
         assert!(
             deserialized.constrain_aspect,
             "constrain_aspect must survive a save/load round-trip"
+        );
+        assert!(
+            deserialized.borderless,
+            "borderless must survive a save/load round-trip"
         );
         assert_eq!(
             deserialized.toggle_previews_key,

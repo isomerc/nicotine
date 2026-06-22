@@ -450,6 +450,9 @@ fn previews_section(panel: &Panel) -> Element<'_, Message> {
         checkbox(panel.config.hide_active_preview)
             .label("Hide the active client's preview")
             .on_toggle(Message::HideActivePreviewToggled),
+        checkbox(panel.config.borderless)
+            .label("Borderless previews (name on backdrop, active in red)")
+            .on_toggle(Message::BorderlessToggled),
         checkbox(panel.config.constrain_aspect)
             .label("Constrain aspect ratio")
             .on_toggle(Message::ConstrainAspectToggled),

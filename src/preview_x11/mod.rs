@@ -96,6 +96,12 @@ const BORDER_WIDTH: u16 = 3;
 const TITLE_FONT_PX: f32 = 14.0;
 const TITLE_TEXT_LEFT_PAD: i16 = 10;
 
+// Borderless mode: the name is drawn over the thumbnail (no title strip),
+// so it gets a translucent black backdrop to stay legible over bright
+// content. ~60% alpha (0x9999 of 0xffff); top padding above the glyphs.
+const NAME_BACKDROP_ALPHA: u16 = 0x9999;
+const NAME_TOP_PAD: i16 = 6;
+
 // Drag / snap thresholds (DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX) live
 // in `preview_common` since both the X11 and Windows managers use
 // them. Imported above.
@@ -245,11 +251,14 @@ fn run_manager(
     // 10..=100), so the first reconcile always pushes the real value.
     let last_applied_opacity = 0u32;
 
-    // Initial display mode comes from LiveSettings (the panel's last
-    // saved choice). The first reconcile spawns the right kind of
-    // surface. We start with the same value so the first tick doesn't
-    // waste work tearing down a surface we never created.
-    let initial_mode = live.lock_recover().display_mode;
+    // Initial display mode + borderless come from LiveSettings (the
+    // panel's last saved choice). Previews are created reading the same
+    // live value, so we seed `last_applied_borderless` to match and the
+    // first reconcile doesn't do spurious relayout work.
+    let (initial_mode, initial_borderless) = {
+        let l = live.lock_recover();
+        (l.display_mode, l.borderless)
+    };
 
     let mut manager = PreviewManager {
         conn: Arc::clone(&conn),
@@ -268,6 +277,7 @@ fn run_manager(
         positions,
         last_applied_size,
         last_applied_opacity,
+        last_applied_borderless: initial_borderless,
         current_mode: initial_mode,
         list_window: None,
         needs_window_scan: true,
@@ -338,6 +348,10 @@ struct PreviewManager {
     /// against LiveSettings each reconcile so we only re-set the
     /// `_NET_WM_WINDOW_OPACITY` property when the slider actually moved.
     last_applied_opacity: u32,
+    /// Last borderless state we laid previews out for. Diffed against
+    /// LiveSettings each reconcile; on a flip we rebuild every preview's
+    /// downscale transform (the thumbnail rect changes) and repaint.
+    last_applied_borderless: bool,
     /// Whether the panel currently wants per-client previews or a
     /// single client-list window. Reconcile detects transitions and
     /// tears down the outgoing mode's surfaces before spawning the
@@ -526,6 +540,7 @@ impl PreviewManager {
         // round-trips here, so safe on every 100ms tick.
         self.apply_live_size();
         self.apply_live_opacity();
+        self.apply_live_borderless();
         // Catches the setting being toggled and previews created since
         // the last tick; the instant per-cycle response comes from the
         // same call at the end of update_active.
@@ -579,6 +594,35 @@ impl PreviewManager {
                 AtomEnum::CARDINAL,
                 &[cardinal],
             );
+        }
+    }
+
+    /// Read LiveSettings.borderless; if it flipped since the last
+    /// reconcile, rebuild each preview's downscale transform for the new
+    /// thumbnail rect (full-window vs. inset) and force a full repaint so
+    /// the chrome appears/disappears live without a daemon restart.
+    fn apply_live_borderless(&mut self) {
+        let want = self.live.lock_recover().borderless;
+        if want == self.last_applied_borderless {
+            return;
+        }
+        self.last_applied_borderless = want;
+
+        let keys: Vec<String> = self.previews.keys().cloned().collect();
+        for name in keys {
+            let (src_picture, source_w, source_h, w, h) = {
+                let Some(p) = self.previews.get(&name) else {
+                    continue;
+                };
+                (p.src_picture, p.source_w, p.source_h, p.width, p.height)
+            };
+            let (_, _, thumb_w, thumb_h) = thumbnail_rect(w, h, want);
+            let _ =
+                apply_scale_transform(&self.conn, src_picture, source_w, source_h, thumb_w, thumb_h);
+            if let Some(p) = self.previews.get_mut(&name) {
+                p.dirty = true;
+            }
+            let _ = self.paint_preview_now(&name);
         }
     }
 

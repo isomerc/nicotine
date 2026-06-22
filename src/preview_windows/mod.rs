@@ -179,6 +179,10 @@ struct PreviewWindowState {
     /// window. Read from WM_PAINT to choose border color. Updated by
     /// reconcile via the GWLP_USERDATA pointer.
     is_active: bool,
+    /// Mirror of `LiveSettings.borderless`. Read from WM_PAINT to pick the
+    /// borderless (name-bar only) vs. bordered (chrome + frame) layout.
+    /// Updated by reconcile via the GWLP_USERDATA pointer.
+    borderless: bool,
 }
 
 /// One owned preview window. Drop unregisters the DWM thumbnail.
@@ -320,6 +324,7 @@ impl PreviewManager {
         // windows resize in real time.
         self.apply_live_size();
         self.apply_live_opacity();
+        self.apply_live_borderless();
         // Catches the setting being toggled and previews created since the
         // last tick; the instant per-cycle response comes from the same
         // call at the end of update_active.
@@ -523,7 +528,7 @@ impl PreviewManager {
                 let ptr =
                     GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
                 if !ptr.is_null() {
-                    update_thumbnail_rect((*ptr).thumbnail, w, h);
+                    update_thumbnail_rect((*ptr).thumbnail, w, h, (*ptr).borderless);
                 }
                 // Repaint title strip + border at the new dimensions.
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
@@ -544,6 +549,31 @@ impl PreviewManager {
         self.config.preview_opacity = want;
         for preview in self.previews.values() {
             apply_window_opacity(preview.hwnd, want);
+        }
+    }
+
+    /// Read LiveSettings.borderless; if it flipped since the last reconcile,
+    /// re-register every preview's DWM thumbnail destination (full-window vs.
+    /// inset) and repaint so the frame appears/disappears live. Caches the
+    /// applied value in `self.config.borderless`, mirroring apply_live_size.
+    fn apply_live_borderless(&mut self) {
+        let want = self.live.lock().unwrap().borderless;
+        if want == self.config.borderless {
+            return;
+        }
+        self.config.borderless = want;
+        let w = self.config.preview_width as i32;
+        let h = self.config.preview_height as i32;
+        for preview in self.previews.values() {
+            unsafe {
+                let ptr =
+                    GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *mut PreviewWindowState;
+                if !ptr.is_null() {
+                    (*ptr).borderless = want;
+                    update_thumbnail_rect((*ptr).thumbnail, w, h, want);
+                }
+                let _ = InvalidateRect(Some(preview.hwnd), None, true);
+            }
         }
     }
 
@@ -698,7 +728,8 @@ impl PreviewManager {
             DwmRegisterThumbnail(hwnd, id_to_hwnd(window.id))
                 .context("DwmRegisterThumbnail failed")?
         };
-        update_thumbnail_rect(thumbnail, width, height);
+        let borderless = self.config.borderless;
+        update_thumbnail_rect(thumbnail, width, height, borderless);
 
         let per_window = Box::new(PreviewWindowState {
             source_id: window.id,
@@ -708,6 +739,7 @@ impl PreviewManager {
             positions: Arc::clone(&self.positions),
             drag: DragState::default(),
             is_active: false,
+            borderless,
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(per_window) as isize);
@@ -755,9 +787,29 @@ impl PreviewManager {
 /// mirror the whole source window (including any title bar/border) — EVE's
 /// client area definition reportedly hides the actual game render surface,
 /// so SOURCECLIENTAREAONLY gives a blank preview.
-fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
+fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32, borderless: bool) {
     let border = px(BORDER_WIDTH);
     let title = px(TITLE_HEIGHT);
+    // Borderless: no frame — the thumbnail fills the window edge-to-edge
+    // except a slim name bar at the top. DWM thumbnails always composite
+    // ON TOP of the host window's own painting, so (unlike the X11 backend)
+    // we can't float the name over the thumbnail; we reserve a thin bar for
+    // it instead. Bordered: inset by the title strip + 3px frame.
+    let rc_destination = if borderless {
+        RECT {
+            left: 0,
+            top: title,
+            right: width,
+            bottom: height,
+        }
+    } else {
+        RECT {
+            left: border,
+            top: title,
+            right: width - border,
+            bottom: height - border,
+        }
+    };
     // The thumbnail is always pushed fully opaque (255). User-facing
     // translucency is applied to the host window via apply_window_opacity;
     // scaling the thumbnail opacity instead would blend the mirror against
@@ -765,12 +817,7 @@ fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
     // rather than revealing the desktop behind.
     let props = DWM_THUMBNAIL_PROPERTIES {
         dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
-        rcDestination: RECT {
-            left: border,
-            top: title,
-            right: width - border,
-            bottom: height - border,
-        },
+        rcDestination: rc_destination,
         rcSource: RECT::default(),
         opacity: 255,
         fVisible: true.into(),
@@ -817,7 +864,12 @@ unsafe extern "system" fn preview_wnd_proc(
 
     match msg {
         WM_PAINT => {
-            paint_chrome(hwnd, &state.character_name, state.is_active);
+            paint_chrome(
+                hwnd,
+                &state.character_name,
+                state.is_active,
+                state.borderless,
+            );
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -990,7 +1042,7 @@ fn nicotine_logo_font() -> HFONT {
 /// area. Border color is Nicotine red when this client is the system
 /// foreground window, otherwise the same dark color as the title strip
 /// (so it blends seamlessly).
-unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
+unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool, borderless: bool) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
 
@@ -998,6 +1050,48 @@ unsafe fn paint_chrome(hwnd: HWND, character_name: &str, is_active: bool) {
     let _ = GetWindowRect(hwnd, &mut rect);
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
+
+    if borderless {
+        // No frame: just a translucent name bar at the top (whole-window
+        // alpha makes it see-through). The name turns Nicotine red when this
+        // is the active client — replacing the active border as the focus
+        // cue — and is left-aligned with a small pad to match the X11 look.
+        let title_h = px(TITLE_HEIGHT);
+        let backdrop = CreateSolidBrush(CHROME_DARK);
+        let bar = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: title_h,
+        };
+        FillRect(hdc, &bar, backdrop);
+        let _ = DeleteObject(backdrop.into());
+
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(
+            hdc,
+            if is_active {
+                NICOTINE_RED
+            } else {
+                COLORREF(0x00FF_FFFF)
+            },
+        );
+        let body_font = nicotine_body_font();
+        let prev_font = SelectObject(hdc, body_font.into());
+        let mut text: Vec<u16> = character_name.encode_utf16().collect();
+        // Omitting DT_CENTER left-aligns; pad the left edge by 8px.
+        let mut text_rect = RECT {
+            left: px(8),
+            top: 0,
+            right: width,
+            bottom: title_h,
+        };
+        let _ = DrawTextW(hdc, &mut text, &mut text_rect, DT_VCENTER | DT_SINGLELINE);
+        SelectObject(hdc, prev_font);
+
+        let _ = EndPaint(hwnd, &ps);
+        return;
+    }
 
     let chrome_color = if is_active { NICOTINE_RED } else { CHROME_DARK };
     let chrome_brush = CreateSolidBrush(chrome_color);
