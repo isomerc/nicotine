@@ -23,6 +23,7 @@ pub struct KeyboardConfig {
     pub modifier_key: Option<u16>,
     pub keyboard_device_path: Option<String>,
     pub minimize_inactive: bool,
+    pub cycle_requires_eve_focus: bool,
     pub character_hotkeys: HashMap<String, CharacterHotkey>,
     pub toggle_previews_key: Option<u16>,
     pub toggle_previews_modifier: Option<u16>,
@@ -37,6 +38,7 @@ impl KeyboardConfig {
             modifier_key: c.modifier_key,
             keyboard_device_path: c.keyboard_device_path.clone(),
             minimize_inactive: c.minimize_inactive,
+            cycle_requires_eve_focus: c.cycle_requires_eve_focus,
             character_hotkeys: c.character_hotkeys.clone(),
             toggle_previews_key: c.toggle_previews_key,
             toggle_previews_modifier: c.toggle_previews_modifier,
@@ -237,6 +239,26 @@ impl KeyboardListener {
                     continue;
                 }
 
+                // Resolve a possible per-character target up front (cheap
+                // hashmap lookup) so the focus gate can cover both cycling
+                // and character switching with a single check.
+                let char_target =
+                    resolve_character_hotkey(code, &pressed_modifiers, &snap.character_hotkeys);
+                let is_cycle_key =
+                    snap.enable && (code == snap.forward_key || code == snap.backward_key);
+
+                // Cycling + character hotkeys only act while an EVE client is
+                // focused (unless the user turned the gate off), so they don't
+                // grab inputs meant for other applications. Query focus only
+                // when the key is actually one of ours — avoids a window
+                // round-trip on every keystroke.
+                if (is_cycle_key || char_target.is_some())
+                    && snap.cycle_requires_eve_focus
+                    && !wm.focus_is_eve()
+                {
+                    continue;
+                }
+
                 // Modifier+backward must be checked first so the
                 // same-key (Tab + Shift+Tab) pattern works. Skip the
                 // whole cycling block when the user has cycling
@@ -267,9 +289,7 @@ impl KeyboardListener {
                     }
                 }
 
-                let target =
-                    resolve_character_hotkey(code, &pressed_modifiers, &snap.character_hotkeys);
-                if let Some(name) = target {
+                if let Some(name) = char_target {
                     if let Err(e) =
                         Self::switch_to_character(&name, &wm, &state, snap.minimize_inactive)
                     {
@@ -564,6 +584,7 @@ mod tests {
             modifier_key: None,
             keyboard_device_path: None,
             minimize_inactive: false,
+            cycle_requires_eve_focus: true,
             character_hotkeys: HashMap::new(),
             toggle_previews_key: None,
             toggle_previews_modifier: None,
