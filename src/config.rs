@@ -15,6 +15,84 @@ pub struct CharacterHotkey {
     pub modifier: Option<u16>,
 }
 
+/// What kind of input triggers a [`Hotkey`]: a keyboard key, a mouse
+/// button, or a scroll-wheel notch. The `code` is interpreted per-kind —
+/// an evdev key/button code on Linux, a Win32 VK / XBUTTON on Windows; for
+/// `Wheel` it's [`WHEEL_UP`] / [`WHEEL_DOWN`].
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriggerKind {
+    #[default]
+    Key,
+    Mouse,
+    Wheel,
+}
+
+/// Wheel-direction sentinels, used as [`Hotkey::code`] when the kind is
+/// `Wheel`. Small constants that never collide with real key/button codes.
+pub const WHEEL_UP: u16 = 1;
+pub const WHEEL_DOWN: u16 = 2;
+
+/// A unified input binding: a trigger (key, mouse button, or wheel notch)
+/// plus the set of modifier keys that must be held. Replaces the old
+/// single-key + optional-single-modifier shape so chords (Ctrl+Shift+J) and
+/// mouse / wheel bindings are all expressible, and the same widget can drive
+/// every bind site.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct Hotkey {
+    /// Modifier codes (Ctrl/Shift/Alt as platform codes) that must be held.
+    /// Empty = bare trigger. Compared as a set at match time; kept sorted
+    /// for stable serialization.
+    #[serde(default)]
+    pub mods: Vec<u16>,
+    /// Whether `code` names a key, a mouse button, or a wheel direction.
+    #[serde(default)]
+    pub kind: TriggerKind,
+    /// The trigger code, interpreted per `kind`.
+    pub code: u16,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // wired into the bind sites in following commits
+impl Hotkey {
+    /// A bare keyboard-key binding (no modifiers).
+    pub fn key(code: u16) -> Self {
+        Self {
+            mods: Vec::new(),
+            kind: TriggerKind::Key,
+            code,
+        }
+    }
+
+    /// A keyboard binding with held modifiers. The modifier list is sorted
+    /// and de-duplicated so equal chords compare equal regardless of the
+    /// order the user pressed them.
+    pub fn key_with_mods(code: u16, mut mods: Vec<u16>) -> Self {
+        mods.sort_unstable();
+        mods.dedup();
+        Self {
+            mods,
+            kind: TriggerKind::Key,
+            code,
+        }
+    }
+
+    /// True when the currently-held modifier set is exactly this binding's
+    /// modifiers — no more, no fewer (so Ctrl+J doesn't fire a bare-J bind,
+    /// and vice-versa).
+    pub fn mods_match(&self, held: &std::collections::HashSet<u16>) -> bool {
+        self.mods.len() == held.len() && self.mods.iter().all(|m| held.contains(m))
+    }
+
+    /// True if `code`/`kind` and modifiers all match the given event.
+    pub fn matches(
+        &self,
+        kind: TriggerKind,
+        code: u16,
+        held: &std::collections::HashSet<u16>,
+    ) -> bool {
+        self.kind == kind && self.code == code && self.mods_match(held)
+    }
+}
+
 /// How the visible-at-a-glance view of clients is rendered.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
@@ -447,6 +525,47 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn hotkey_mods_sorted_and_deduped() {
+        let hk = Hotkey::key_with_mods(30, vec![56, 29, 29, 42]);
+        assert_eq!(hk.mods, vec![29, 42, 56]); // sorted, deduped
+        assert_eq!(hk.kind, TriggerKind::Key);
+    }
+
+    #[test]
+    fn hotkey_mods_match_is_exact() {
+        let hk = Hotkey::key_with_mods(30, vec![29, 42]); // Ctrl+Shift+X
+        let exact: HashSet<u16> = [29, 42].into_iter().collect();
+        let subset: HashSet<u16> = [29].into_iter().collect();
+        let superset: HashSet<u16> = [29, 42, 56].into_iter().collect();
+        assert!(hk.mods_match(&exact));
+        assert!(!hk.mods_match(&subset), "missing a required modifier");
+        assert!(!hk.mods_match(&superset), "extra modifier held");
+    }
+
+    #[test]
+    fn bare_key_requires_no_modifiers() {
+        let hk = Hotkey::key(30);
+        let none: HashSet<u16> = HashSet::new();
+        let ctrl: HashSet<u16> = [29].into_iter().collect();
+        assert!(hk.matches(TriggerKind::Key, 30, &none));
+        assert!(!hk.matches(TriggerKind::Key, 30, &ctrl), "Ctrl held but bare bind");
+        assert!(!hk.matches(TriggerKind::Mouse, 30, &none), "wrong kind");
+    }
+
+    #[test]
+    fn hotkey_round_trips_through_toml() {
+        let hk = Hotkey {
+            mods: vec![29, 42],
+            kind: TriggerKind::Wheel,
+            code: WHEEL_UP,
+        };
+        let s = toml::to_string(&hk).unwrap();
+        let back: Hotkey = toml::from_str(&s).unwrap();
+        assert_eq!(hk, back);
+    }
 
     #[test]
     fn test_eve_height_adjusted_with_panel() {
