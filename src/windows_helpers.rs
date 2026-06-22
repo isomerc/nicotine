@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use crate::config::{Hotkey, TriggerKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Direction of a cycle action. Used by `classify_xbutton` and by the
 /// Windows input listener's internal message dispatch. Cross-platform
@@ -166,9 +166,58 @@ pub fn plan_character_hotkeys(
     out
 }
 
+/// What a mouse-button / wheel trigger maps to, resolved from the configured
+/// bindings. `SwitchCharacter` carries the index into the `characters` slice
+/// so the (Win32-side) caller can pass it through a thread message without
+/// allocating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MouseHotkeyAction {
+    CycleForward,
+    CycleBackward,
+    ToggleOverlay,
+    SwitchCharacter(usize),
+}
+
+/// Resolve a mouse/wheel trigger (button or wheel code + held modifiers) to an
+/// action, mirroring the Linux mouse listener's priority: toggle, then
+/// backward, then forward, then per-character (most-specific chord wins). Only
+/// `TriggerKind::Mouse` / `TriggerKind::Wheel` bindings can match here; key
+/// bindings go through RegisterHotKey.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_mouse_action(
+    kind: TriggerKind,
+    code: u16,
+    held: &HashSet<u16>,
+    forward: &Hotkey,
+    backward: &Hotkey,
+    toggle: &Hotkey,
+    characters: &[String],
+    character_hotkeys: &HashMap<String, Hotkey>,
+) -> Option<MouseHotkeyAction> {
+    if toggle.matches(kind, code, held) {
+        return Some(MouseHotkeyAction::ToggleOverlay);
+    }
+    if backward.matches(kind, code, held) {
+        return Some(MouseHotkeyAction::CycleBackward);
+    }
+    if forward.matches(kind, code, held) {
+        return Some(MouseHotkeyAction::CycleForward);
+    }
+    let mut best: Option<(usize, usize)> = None; // (character index, mods len)
+    for (i, name) in characters.iter().enumerate() {
+        if let Some(hk) = character_hotkeys.get(name) {
+            if hk.matches(kind, code, held) && best.is_none_or(|(_, b)| hk.mods.len() > b) {
+                best = Some((i, hk.mods.len()));
+            }
+        }
+    }
+    best.map(|(i, _)| MouseHotkeyAction::SwitchCharacter(i))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WHEEL_UP;
 
     // ---- modifier_kind --------------------------------------------------
 
@@ -359,5 +408,74 @@ mod tests {
         hotkeys.insert("Alpha".to_string(), hk(0x70, vec![0x41])); // 'A' isn't a modifier
         let plans = plan_character_hotkeys(&characters, &hotkeys, 2000);
         assert_eq!(plans[0].modifiers, vec![]);
+    }
+
+    // ---- resolve_mouse_action ------------------------------------------
+
+    fn mouse(code: u16, mods: Vec<u16>) -> Hotkey {
+        Hotkey { mods, kind: TriggerKind::Mouse, code }
+    }
+
+    #[test]
+    fn resolve_mouse_action_prioritises_toggle_then_cycle() {
+        let none = HashSet::new();
+        let fwd = mouse(1, vec![]);
+        let back = mouse(2, vec![]);
+        let toggle = mouse(3, vec![]);
+        let chars: Vec<String> = vec![];
+        let map = HashMap::new();
+        assert_eq!(
+            resolve_mouse_action(TriggerKind::Mouse, 3, &none, &fwd, &back, &toggle, &chars, &map),
+            Some(MouseHotkeyAction::ToggleOverlay)
+        );
+        assert_eq!(
+            resolve_mouse_action(TriggerKind::Mouse, 2, &none, &fwd, &back, &toggle, &chars, &map),
+            Some(MouseHotkeyAction::CycleBackward)
+        );
+        assert_eq!(
+            resolve_mouse_action(TriggerKind::Mouse, 1, &none, &fwd, &back, &toggle, &chars, &map),
+            Some(MouseHotkeyAction::CycleForward)
+        );
+    }
+
+    #[test]
+    fn resolve_mouse_action_matches_wheel_and_character_index() {
+        let none = HashSet::new();
+        let unbound = Hotkey::default();
+        let chars = vec!["Alpha".to_string(), "Bravo".to_string()];
+        let mut map = HashMap::new();
+        map.insert("Bravo".to_string(), Hotkey { mods: vec![], kind: TriggerKind::Wheel, code: WHEEL_UP });
+        assert_eq!(
+            resolve_mouse_action(
+                TriggerKind::Wheel, WHEEL_UP, &none, &unbound, &unbound, &unbound, &chars, &map,
+            ),
+            Some(MouseHotkeyAction::SwitchCharacter(1))
+        );
+        // Wrong kind (a key) never matches a mouse/wheel resolve.
+        assert_eq!(
+            resolve_mouse_action(
+                TriggerKind::Key, WHEEL_UP, &none, &unbound, &unbound, &unbound, &chars, &map,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_mouse_action_requires_modifier_chord() {
+        let unbound = Hotkey::default();
+        let chars: Vec<String> = vec![];
+        let map = HashMap::new();
+        // Ctrl(0x11)+Mouse4 backward.
+        let back = mouse(4, vec![0x11]);
+        let none = HashSet::new();
+        assert_eq!(
+            resolve_mouse_action(TriggerKind::Mouse, 4, &none, &unbound, &back, &unbound, &chars, &map),
+            None
+        );
+        let ctrl: HashSet<u16> = [0x11].into_iter().collect();
+        assert_eq!(
+            resolve_mouse_action(TriggerKind::Mouse, 4, &ctrl, &unbound, &back, &unbound, &chars, &map),
+            Some(MouseHotkeyAction::CycleBackward)
+        );
     }
 }
