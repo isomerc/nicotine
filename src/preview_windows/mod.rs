@@ -554,9 +554,14 @@ impl PreviewManager {
     /// re-running this hides the newly-active preview and reshows the one
     /// cycled away from.
     fn apply_active_visibility(&mut self) {
-        let hide_active = self.live.lock().unwrap().hide_active_preview;
+        let (hide_active, bossed) = {
+            let live = self.live.lock().unwrap();
+            (live.hide_active_preview, live.bossed)
+        };
+        // The boss key hides the whole overlay; otherwise fall back to the
+        // per-client "hide active" rule.
         for preview in self.previews.values_mut() {
-            let want_hidden = preview_should_hide(hide_active, preview.is_active);
+            let want_hidden = bossed || preview_should_hide(hide_active, preview.is_active);
             if want_hidden == preview.hidden {
                 continue;
             }
@@ -570,6 +575,13 @@ impl PreviewManager {
             };
             unsafe {
                 let _ = ShowWindow(preview.hwnd, cmd);
+            }
+        }
+        // Boss key hides the list-view window too.
+        if let Some(list) = &self.list {
+            let cmd = if bossed { SW_HIDE } else { SW_SHOWNOACTIVATE };
+            unsafe {
+                let _ = ShowWindow(list.hwnd, cmd);
             }
         }
     }

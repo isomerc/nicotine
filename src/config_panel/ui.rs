@@ -412,6 +412,59 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
             toggle_previews.push(button(text("Clear")).on_press(Message::ClearTogglePreviews));
     }
 
+    // Boss keys — hide+mute toggle and kill-all.
+    let boss_hide_label = match panel.config.boss_hide_key {
+        Some(vk) => code_to_label(vk),
+        None => "None".to_string(),
+    };
+    let boss_hide_mod_selected = MODIFIER_CHOICES
+        .iter()
+        .copied()
+        .find(|m| m.code == panel.config.boss_hide_modifier);
+    let mut boss_hide = bind_row(
+        panel,
+        "Boss key (hide+mute):",
+        CaptureTarget::BossHide,
+        boss_hide_label,
+    );
+    boss_hide = boss_hide.push(
+        pick_list(
+            MODIFIER_CHOICES,
+            boss_hide_mod_selected,
+            Message::BossHideModifierChanged,
+        )
+        .width(Length::Fixed(80.0)),
+    );
+    if panel.config.boss_hide_key.is_some() {
+        boss_hide = boss_hide.push(button(text("Clear")).on_press(Message::ClearBossHide));
+    }
+
+    let boss_kill_label = match panel.config.boss_kill_key {
+        Some(vk) => code_to_label(vk),
+        None => "None".to_string(),
+    };
+    let boss_kill_mod_selected = MODIFIER_CHOICES
+        .iter()
+        .copied()
+        .find(|m| m.code == panel.config.boss_kill_modifier);
+    let mut boss_kill = bind_row(
+        panel,
+        "Boss key (kill all):",
+        CaptureTarget::BossKill,
+        boss_kill_label,
+    );
+    boss_kill = boss_kill.push(
+        pick_list(
+            MODIFIER_CHOICES,
+            boss_kill_mod_selected,
+            Message::BossKillModifierChanged,
+        )
+        .width(Length::Fixed(80.0)),
+    );
+    if panel.config.boss_kill_key.is_some() {
+        boss_kill = boss_kill.push(button(text("Clear")).on_press(Message::ClearBossKill));
+    }
+
     column![
         section_header("Keyboard Hotkeys"),
         checkbox(panel.config.enable_keyboard_buttons)
@@ -428,6 +481,12 @@ fn hotkeys_section(panel: &Panel) -> Element<'_, Message> {
         caption(
             "Toggle previews shows/hides all preview windows with one key — independent of \
              keyboard cycling. Leave unbound if you don't want it."
+        ),
+        boss_hide,
+        boss_kill,
+        caption(
+            "Boss keys: hide+mute minimizes and mutes every EVE client and hides the overlay \
+             (press again to restore); kill all force-quits every EVE client and Nicotine itself."
         ),
         checkbox(panel.config.enable_mouse_buttons)
             .label("Cycle on mouse side buttons (XBUTTON1/XBUTTON2)")
