@@ -147,23 +147,19 @@ impl Daemon {
         #[cfg(windows)]
         type HotkeySig = (
             bool,
-            u16,
-            u16,
-            Option<u16>,
-            std::collections::HashMap<String, crate::config::CharacterHotkey>,
-            Option<u16>,
-            Option<u16>,
+            crate::config::Hotkey,
+            crate::config::Hotkey,
+            std::collections::HashMap<String, crate::config::Hotkey>,
+            crate::config::Hotkey,
         );
         #[cfg(windows)]
         fn hotkey_sig(c: &Config) -> HotkeySig {
             (
                 c.enable_keyboard_buttons,
-                c.forward_key,
-                c.backward_key,
-                c.modifier_key,
+                c.forward_key.clone(),
+                c.backward_key.clone(),
                 c.character_hotkeys.clone(),
-                c.toggle_previews_key,
-                c.toggle_previews_modifier,
+                c.toggle_previews_key.clone(),
             )
         }
         #[cfg(windows)]

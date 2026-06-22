@@ -1,4 +1,4 @@
-use crate::config::{Config, LiveSettings};
+use crate::config::{Config, LiveSettings, TriggerKind};
 use crate::cycle_state::CycleState;
 use crate::window_manager::WindowManager;
 use crate::windows_helpers::{
@@ -14,7 +14,7 @@ use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, HHOOK, MSG, MSLLHOOKSTRUCT,
@@ -177,13 +177,17 @@ fn debug_input(args: std::fmt::Arguments) {
 /// HOT_KEY_MODIFIERS bitmask RegisterHotKey expects. The planner is
 /// kept platform-independent (see `windows_helpers`) so this thin
 /// adapter is the only place that knows about MOD_SHIFT/etc.
-fn modifier_to_winapi(kind: Option<ModifierKind>) -> HOT_KEY_MODIFIERS {
-    match kind {
-        Some(ModifierKind::Shift) => MOD_SHIFT,
-        Some(ModifierKind::Ctrl) => MOD_CONTROL,
-        Some(ModifierKind::Alt) => MOD_ALT,
-        None => HOT_KEY_MODIFIERS(0),
+fn modifier_to_winapi(kinds: &[ModifierKind]) -> HOT_KEY_MODIFIERS {
+    let mut bits = 0u32;
+    for k in kinds {
+        bits |= match k {
+            ModifierKind::Shift => MOD_SHIFT.0,
+            ModifierKind::Ctrl => MOD_CONTROL.0,
+            ModifierKind::Alt => MOD_ALT.0,
+            ModifierKind::Win => MOD_WIN.0,
+        };
     }
+    HOT_KEY_MODIFIERS(bits)
 }
 
 /// Spawn the Windows input listener thread. The thread installs a low-level
@@ -351,30 +355,31 @@ fn run_listener(
 unsafe fn do_register_hotkeys(config: &Config) {
     for plan in plan_cycle_hotkeys(
         config.enable_keyboard_buttons,
-        config.forward_key,
-        config.backward_key,
-        config.modifier_key,
+        &config.forward_key,
+        &config.backward_key,
         HOTKEY_FORWARD_ID,
         HOTKEY_BACKWARD_ID,
     ) {
         let _ = RegisterHotKey(
             None,
             plan.id,
-            modifier_to_winapi(plan.modifier),
+            modifier_to_winapi(&plan.modifiers),
             plan.vk as u32,
         );
     }
 
-    // Preview-visibility toggle, with optional modifier. Independent of
-    // enable_keyboard_buttons — it flips show_previews regardless of
-    // whether cycling is on.
-    if let Some(vk) = config.toggle_previews_key {
-        let modifier = config.toggle_previews_modifier.and_then(modifier_kind);
+    // Preview-visibility toggle. Only key-triggered toggles are
+    // RegisterHotKey-able (a mouse/wheel toggle would run through the mouse
+    // hook). Independent of enable_keyboard_buttons.
+    let toggle = &config.toggle_previews_key;
+    if toggle.kind == TriggerKind::Key && toggle.code != 0 {
+        let mods: Vec<ModifierKind> =
+            toggle.mods.iter().filter_map(|&m| modifier_kind(m)).collect();
         let _ = RegisterHotKey(
             None,
             HOTKEY_TOGGLE_PREVIEWS_ID,
-            modifier_to_winapi(modifier),
-            vk as u32,
+            modifier_to_winapi(&mods),
+            toggle.code as u32,
         );
     }
 
@@ -385,7 +390,7 @@ unsafe fn do_register_hotkeys(config: &Config) {
         &config.character_hotkeys,
         HOTKEY_CHARACTER_BASE,
     ) {
-        let modifier = modifier_to_winapi(plan.modifier);
+        let modifier = modifier_to_winapi(&plan.modifiers);
         if RegisterHotKey(None, plan.id, modifier, plan.vk as u32).is_ok() {
             lookup.insert(plan.id, plan.character_name);
         } else {

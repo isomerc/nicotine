@@ -5,16 +5,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// A single per-character hotkey binding. `vk` is a Win32 Virtual-Key
-/// code (or evdev code on Linux); `modifier` is an optional second VK
-/// that must be held down (typically Shift/Ctrl/Alt).
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct CharacterHotkey {
-    pub vk: u16,
-    #[serde(default)]
-    pub modifier: Option<u16>,
-}
-
 /// What kind of input triggers a [`Hotkey`]: a keyboard key, a mouse
 /// button, or a scroll-wheel notch. The `code` is interpreted per-kind —
 /// an evdev key/button code on Linux, a Win32 VK / XBUTTON on Windows; for
