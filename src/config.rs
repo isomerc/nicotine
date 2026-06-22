@@ -5,14 +5,87 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// A single per-character hotkey binding. `vk` is a Win32 Virtual-Key
-/// code (or evdev code on Linux); `modifier` is an optional second VK
-/// that must be held down (typically Shift/Ctrl/Alt).
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct CharacterHotkey {
-    pub vk: u16,
+/// What kind of input triggers a [`Hotkey`]: a keyboard key, a mouse
+/// button, or a scroll-wheel notch. The `code` is interpreted per-kind —
+/// an evdev key/button code on Linux, a Win32 VK / XBUTTON on Windows; for
+/// `Wheel` it's [`WHEEL_UP`] / [`WHEEL_DOWN`].
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriggerKind {
+    #[default]
+    Key,
+    Mouse,
+    Wheel,
+}
+
+/// Wheel-direction sentinels, used as [`Hotkey::code`] when the kind is
+/// `Wheel`. Small constants that never collide with real key/button codes.
+pub const WHEEL_UP: u16 = 1;
+pub const WHEEL_DOWN: u16 = 2;
+
+/// A unified input binding: a trigger (key, mouse button, or wheel notch)
+/// plus the set of modifier keys that must be held. Replaces the old
+/// single-key + optional-single-modifier shape so chords (Ctrl+Shift+J) and
+/// mouse / wheel bindings are all expressible, and the same widget can drive
+/// every bind site.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct Hotkey {
+    /// Modifier codes (Ctrl/Shift/Alt as platform codes) that must be held.
+    /// Empty = bare trigger. Compared as a set at match time; kept sorted
+    /// for stable serialization.
     #[serde(default)]
-    pub modifier: Option<u16>,
+    pub mods: Vec<u16>,
+    /// Whether `code` names a key, a mouse button, or a wheel direction.
+    #[serde(default)]
+    pub kind: TriggerKind,
+    /// The trigger code, interpreted per `kind`.
+    pub code: u16,
+}
+
+impl Hotkey {
+    /// A bare keyboard-key binding (no modifiers).
+    pub fn key(code: u16) -> Self {
+        Self {
+            mods: Vec::new(),
+            kind: TriggerKind::Key,
+            code,
+        }
+    }
+
+    /// A keyboard binding with held modifiers. The modifier list is sorted
+    /// and de-duplicated so equal chords compare equal regardless of the
+    /// order the user pressed them.
+    pub fn key_with_mods(code: u16, mut mods: Vec<u16>) -> Self {
+        mods.sort_unstable();
+        mods.dedup();
+        Self {
+            mods,
+            kind: TriggerKind::Key,
+            code,
+        }
+    }
+
+    /// True when the currently-held modifier set is exactly this binding's
+    /// modifiers — no more, no fewer (so Ctrl+J doesn't fire a bare-J bind,
+    /// and vice-versa).
+    pub fn mods_match(&self, held: &std::collections::HashSet<u16>) -> bool {
+        self.mods.len() == held.len() && self.mods.iter().all(|m| held.contains(m))
+    }
+
+    /// Whether anything is bound. Unbound = the default (a key trigger with
+    /// code 0).
+    pub fn is_bound(&self) -> bool {
+        !(self.kind == TriggerKind::Key && self.code == 0)
+    }
+
+    /// True if `code`/`kind` and modifiers all match the given event.
+    pub fn matches(
+        &self,
+        kind: TriggerKind,
+        code: u16,
+        held: &std::collections::HashSet<u16>,
+    ) -> bool {
+        self.kind == kind && self.code == code && self.mods_match(held)
+    }
 }
 
 /// How the visible-at-a-glance view of clients is rendered.
@@ -85,10 +158,13 @@ pub struct Config {
     pub backward_button: u16, // BTN_EXTRA (mouse button 8)
     #[serde(default = "default_enable_keyboard")]
     pub enable_keyboard_buttons: bool,
-    #[serde(default = "default_forward_key")]
-    pub forward_key: u16, // KEY_TAB (15) - Tab for forward, Shift+Tab for backward
-    #[serde(default = "default_backward_key")]
-    pub backward_key: u16, // KEY_TAB (15) - Track SHIFT modifier internally
+    /// Forward-cycle binding (key chord, mouse button, or wheel).
+    #[serde(default = "default_forward_key", deserialize_with = "de_hotkey")]
+    pub forward_key: Hotkey,
+    /// Backward-cycle binding. Default is Shift+forward as a normal chord
+    /// (no separate "modifier key" field any more).
+    #[serde(default = "default_backward_key", deserialize_with = "de_hotkey")]
+    pub backward_key: Hotkey,
     #[serde(default = "default_mouse_device_name")]
     pub mouse_device_name: Option<String>,
     #[serde(default = "default_mouse_device_path")]
@@ -97,8 +173,6 @@ pub struct Config {
     pub minimize_inactive: bool,
     #[serde(default = "default_keyboard_device_path")]
     pub keyboard_device_path: Option<String>,
-    #[serde(default = "default_modifier_key")]
-    pub modifier_key: Option<u16>,
     /// Width of preview windows in pixels (Windows only). Single global value
     /// — every preview gets the same size. Aspect ratio is preserved on the
     /// thumbnail; the window is sized exactly as configured.
@@ -126,17 +200,10 @@ pub struct Config {
     /// preview managers still just read `preview_width`/`preview_height`.
     #[serde(default = "default_constrain_aspect")]
     pub constrain_aspect: bool,
-    /// Optional global hotkey (platform key code — evdev on Linux, Win32
-    /// VK on Windows) that toggles preview-window visibility, i.e. flips
-    /// `show_previews`. `None` = unbound. Bound via the panel's Hotkeys
-    /// tab just like the cycle keys.
-    #[serde(default)]
-    pub toggle_previews_key: Option<u16>,
-    /// Optional modifier (Shift/Ctrl/Alt, as a platform key code) that
-    /// must be held with `toggle_previews_key` for the toggle to fire.
-    /// `None` = no modifier (the bare key toggles).
-    #[serde(default)]
-    pub toggle_previews_modifier: Option<u16>,
+    /// Binding that toggles overlay visibility. Default unbound
+    /// (`Hotkey::default()`, code 0). Bound via the panel like the cycle keys.
+    #[serde(default, deserialize_with = "de_hotkey")]
+    pub toggle_previews_key: Hotkey,
     /// Ordered list of EVE character names. Forward/backward cycling
     /// traverses this order; `switch N` maps target N to entry N-1.
     /// Empty list = cycle through whatever order the window manager
@@ -156,7 +223,7 @@ pub struct Config {
     /// cycle. Keyed by name so bindings follow reorders and renames
     /// without reassigning keys.
     #[serde(default)]
-    pub character_hotkeys: HashMap<String, CharacterHotkey>,
+    pub character_hotkeys: HashMap<String, Hotkey>,
     /// Config-panel window size in logical pixels. Persisted so a manual
     /// resize of the panel survives restarts; defaults to the original
     /// fixed window size.
@@ -211,24 +278,43 @@ fn default_enable_keyboard() -> bool {
     true // F10/F11 are uncommon enough to enable by default for cycling
 }
 
+/// Deserialize a [`Hotkey`] from either the current table form or a legacy
+/// bare integer key code. Pre-unification configs stored `forward_key = 15`;
+/// this keeps those loading instead of erroring out on upgrade.
+fn de_hotkey<'de, D>(d: D) -> Result<Hotkey, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Compat {
+        Legacy(u16),
+        Full(Hotkey),
+    }
+    Ok(match Compat::deserialize(d)? {
+        Compat::Legacy(code) => Hotkey::key(code),
+        Compat::Full(hk) => hk,
+    })
+}
+
 #[cfg(unix)]
-fn default_forward_key() -> u16 {
-    15 // KEY_TAB — evdev code
+fn default_forward_key() -> Hotkey {
+    Hotkey::key(15) // Tab
 }
 
 #[cfg(windows)]
-fn default_forward_key() -> u16 {
-    0x7A // VK_F11
+fn default_forward_key() -> Hotkey {
+    Hotkey::key(0x7A) // F11
 }
 
 #[cfg(unix)]
-fn default_backward_key() -> u16 {
-    15 // KEY_TAB (Modifier applied if set) — evdev code
+fn default_backward_key() -> Hotkey {
+    Hotkey::key_with_mods(15, vec![42]) // Shift+Tab
 }
 
 #[cfg(windows)]
-fn default_backward_key() -> u16 {
-    0x79 // VK_F10
+fn default_backward_key() -> Hotkey {
+    Hotkey::key(0x79) // F10
 }
 
 fn default_mouse_device_name() -> Option<String> {
@@ -245,10 +331,6 @@ fn default_minimize_inactive() -> bool {
 
 fn default_keyboard_device_path() -> Option<String> {
     None
-}
-
-fn default_modifier_key() -> Option<u16> {
-    None // No modifier for backward shifting by default
 }
 
 fn default_preview_width() -> u32 {
@@ -382,15 +464,13 @@ impl Config {
             mouse_device_path: default_mouse_device_path(),
             minimize_inactive: default_minimize_inactive(),
             keyboard_device_path: default_keyboard_device_path(),
-            modifier_key: default_modifier_key(),
             preview_width: default_preview_width(),
             preview_height: default_preview_height(),
             preview_opacity: default_preview_opacity(),
             show_previews: default_show_previews(),
             hide_active_preview: default_hide_active_preview(),
             constrain_aspect: default_constrain_aspect(),
-            toggle_previews_key: None,
-            toggle_previews_modifier: None,
+            toggle_previews_key: Hotkey::default(),
             characters: Vec::new(),
             display_mode: default_display_mode(),
             positions_locked: false,
@@ -449,6 +529,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_integer_hotkey_deserializes_and_table_form_too() {
+        #[derive(Deserialize)]
+        struct W {
+            #[serde(deserialize_with = "de_hotkey")]
+            k: Hotkey,
+        }
+        // Legacy bare integer.
+        let w: W = toml::from_str("k = 15").unwrap();
+        assert_eq!(w.k, Hotkey::key(15));
+        // Current table form with a chord.
+        let w2: W = toml::from_str("[k]\nmods = [42]\nkind = \"Key\"\ncode = 15").unwrap();
+        assert_eq!(w2.k, Hotkey::key_with_mods(15, vec![42]));
+    }
+    use std::collections::HashSet;
+
+    #[test]
+    fn hotkey_mods_sorted_and_deduped() {
+        let hk = Hotkey::key_with_mods(30, vec![56, 29, 29, 42]);
+        assert_eq!(hk.mods, vec![29, 42, 56]); // sorted, deduped
+        assert_eq!(hk.kind, TriggerKind::Key);
+    }
+
+    #[test]
+    fn hotkey_mods_match_is_exact() {
+        let hk = Hotkey::key_with_mods(30, vec![29, 42]); // Ctrl+Shift+X
+        let exact: HashSet<u16> = [29, 42].into_iter().collect();
+        let subset: HashSet<u16> = [29].into_iter().collect();
+        let superset: HashSet<u16> = [29, 42, 56].into_iter().collect();
+        assert!(hk.mods_match(&exact));
+        assert!(!hk.mods_match(&subset), "missing a required modifier");
+        assert!(!hk.mods_match(&superset), "extra modifier held");
+    }
+
+    #[test]
+    fn bare_key_requires_no_modifiers() {
+        let hk = Hotkey::key(30);
+        let none: HashSet<u16> = HashSet::new();
+        let ctrl: HashSet<u16> = [29].into_iter().collect();
+        assert!(hk.matches(TriggerKind::Key, 30, &none));
+        assert!(!hk.matches(TriggerKind::Key, 30, &ctrl), "Ctrl held but bare bind");
+        assert!(!hk.matches(TriggerKind::Mouse, 30, &none), "wrong kind");
+    }
+
+    #[test]
+    fn hotkey_round_trips_through_toml() {
+        let hk = Hotkey {
+            mods: vec![29, 42],
+            kind: TriggerKind::Wheel,
+            code: WHEEL_UP,
+        };
+        let s = toml::to_string(&hk).unwrap();
+        let back: Hotkey = toml::from_str(&s).unwrap();
+        assert_eq!(hk, back);
+    }
+
+    #[test]
     fn test_eve_height_adjusted_with_panel() {
         let config = Config {
             display_width: 1920,
@@ -462,21 +598,19 @@ mod tests {
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
-            forward_key: 15,
-            backward_key: 15,
+            forward_key: Hotkey::key(15),
+            backward_key: Hotkey::key(15),
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
             keyboard_device_path: None,
-            modifier_key: None,
             preview_width: 320,
             preview_height: 180,
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
             constrain_aspect: false,
-            toggle_previews_key: None,
-            toggle_previews_modifier: None,
+            toggle_previews_key: Hotkey::default(),
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -501,21 +635,19 @@ mod tests {
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
-            forward_key: 15,
-            backward_key: 15,
+            forward_key: Hotkey::key(15),
+            backward_key: Hotkey::key(15),
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
             keyboard_device_path: None,
-            modifier_key: None,
             preview_width: 320,
             preview_height: 180,
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
             constrain_aspect: false,
-            toggle_previews_key: None,
-            toggle_previews_modifier: None,
+            toggle_previews_key: Hotkey::default(),
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -539,21 +671,19 @@ mod tests {
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
-            forward_key: 15,
-            backward_key: 15,
+            forward_key: Hotkey::key(15),
+            backward_key: Hotkey::key(15),
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
             keyboard_device_path: None,
-            modifier_key: None,
             preview_width: 320,
             preview_height: 180,
             preview_opacity: 55,
             show_previews: true,
             hide_active_preview: true,
             constrain_aspect: true,
-            toggle_previews_key: Some(67),
-            toggle_previews_modifier: Some(42),
+            toggle_previews_key: Hotkey::key_with_mods(67, vec![42]),
             characters: Vec::new(),
             display_mode: DisplayMode::Previews,
             positions_locked: false,
@@ -579,13 +709,8 @@ mod tests {
         );
         assert_eq!(
             deserialized.toggle_previews_key,
-            Some(67),
-            "toggle_previews_key binding must survive a save/load round-trip"
-        );
-        assert_eq!(
-            deserialized.toggle_previews_modifier,
-            Some(42),
-            "toggle_previews_modifier must survive a save/load round-trip"
+            Hotkey::key_with_mods(67, vec![42]),
+            "toggle_previews_key binding (chord) must survive a save/load round-trip"
         );
         assert_eq!(
             deserialized.window_width, 900,

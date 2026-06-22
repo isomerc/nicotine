@@ -11,8 +11,8 @@
 //! still exercise every item below.
 #![allow(dead_code)]
 
-use crate::config::CharacterHotkey;
-use std::collections::HashMap;
+use crate::config::{Hotkey, TriggerKind};
+use std::collections::{HashMap, HashSet};
 
 /// Direction of a cycle action. Used by `classify_xbutton` and by the
 /// Windows input listener's internal message dispatch. Cross-platform
@@ -32,6 +32,7 @@ pub enum ModifierKind {
     Shift,
     Ctrl,
     Alt,
+    Win,
 }
 
 /// Map a Win32 VK code to the modifier it represents, or None if the
@@ -49,6 +50,7 @@ pub fn modifier_kind(vk: u16) -> Option<ModifierKind> {
         0x10 | 0xA0 | 0xA1 => Some(ModifierKind::Shift),
         0x11 | 0xA2 | 0xA3 => Some(ModifierKind::Ctrl),
         0x12 | 0xA4 | 0xA5 => Some(ModifierKind::Alt),
+        0x5B | 0x5C => Some(ModifierKind::Win),
         _ => None,
     }
 }
@@ -84,57 +86,45 @@ pub fn should_attach_thread_input(thread: u32, current: u32, exclude: &[u32]) ->
     thread != 0 && thread != current && !exclude.contains(&thread)
 }
 
+/// Map a Hotkey's modifier codes to RegisterHotKey modifier kinds, dropping
+/// any code that isn't a recognized modifier.
+fn mods_to_kinds(mods: &[u16]) -> Vec<ModifierKind> {
+    mods.iter().filter_map(|&m| modifier_kind(m)).collect()
+}
+
 /// A planned cycle (forward/backward) hotkey registration. Output of
 /// `plan_cycle_hotkeys`; the Windows consumer turns each entry into a
-/// `RegisterHotKey` call.
+/// `RegisterHotKey` call (its modifiers OR'd into the fsModifiers mask).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CycleHotkeyPlan {
     pub id: i32,
-    pub modifier: Option<ModifierKind>,
+    pub modifiers: Vec<ModifierKind>,
     pub vk: u16,
 }
 
-/// Plan which cycle hotkeys to register given the user's config.
-///
-/// Three relevant shapes:
-/// * Cycle hotkeys disabled → no entries.
-/// * Forward == Backward key, no modifier configured → forward only,
-///   no modifier (the backward registration is unreachable so we skip
-///   it; the modifier-bearing match in the modifier-key gating path
-///   below is what makes shift-tab work).
-/// * Forward == Backward key, modifier configured → forward (no mod)
-///   AND backward (with modifier).
-/// * Forward != Backward → both registered, neither with a modifier.
-///   The `modifier_key` setting is intentionally ignored in this case;
-///   it's only meaningful when forward/backward overlap.
+/// Plan which cycle hotkeys to register. Only key-triggered bindings are
+/// RegisterHotKey-able; mouse/wheel cycle bindings are dispatched by the
+/// low-level mouse hook, so they're skipped here. Each emitted plan carries
+/// the binding's full modifier chord (e.g. Shift+Tab for backward).
 pub fn plan_cycle_hotkeys(
     enable: bool,
-    forward_vk: u16,
-    backward_vk: u16,
-    modifier_vk: Option<u16>,
+    forward: &Hotkey,
+    backward: &Hotkey,
     forward_id: i32,
     backward_id: i32,
 ) -> Vec<CycleHotkeyPlan> {
     if !enable {
         return Vec::new();
     }
-    let mut plans = vec![CycleHotkeyPlan {
-        id: forward_id,
-        modifier: None,
-        vk: forward_vk,
-    }];
-    let same_key = forward_vk == backward_vk;
-    let backward_modifier = if same_key {
-        modifier_vk.and_then(modifier_kind)
-    } else {
-        None
-    };
-    if !same_key || backward_modifier.is_some() {
-        plans.push(CycleHotkeyPlan {
-            id: backward_id,
-            modifier: backward_modifier,
-            vk: backward_vk,
-        });
+    let mut plans = Vec::new();
+    for (hk, id) in [(forward, forward_id), (backward, backward_id)] {
+        if hk.kind == TriggerKind::Key && hk.code != 0 {
+            plans.push(CycleHotkeyPlan {
+                id,
+                modifiers: mods_to_kinds(&hk.mods),
+                vk: hk.code,
+            });
+        }
     }
     plans
 }
@@ -144,19 +134,16 @@ pub fn plan_cycle_hotkeys(
 pub struct CharacterHotkeyPlan {
     pub id: i32,
     pub character_name: String,
-    pub modifier: Option<ModifierKind>,
+    pub modifiers: Vec<ModifierKind>,
     pub vk: u16,
 }
 
-/// Plan per-character hotkey registrations in the user-configured
-/// character order. Skips characters that have no hotkey entry or
-/// whose VK is the placeholder 0 (the user picked a modifier but
-/// hasn't captured a key yet). IDs start at `base_id` and advance by
-/// one for every emitted plan — entries that are skipped don't burn an
-/// ID, so the ID sequence is dense.
+/// Plan per-character key hotkeys in the user-configured character order.
+/// Skips characters with no entry, unbound entries (key code 0), and
+/// mouse/wheel entries (the mouse hook handles those). IDs are dense.
 pub fn plan_character_hotkeys(
     characters: &[String],
-    character_hotkeys: &HashMap<String, CharacterHotkey>,
+    character_hotkeys: &HashMap<String, Hotkey>,
     base_id: i32,
 ) -> Vec<CharacterHotkeyPlan> {
     let mut out = Vec::new();
@@ -165,23 +152,72 @@ pub fn plan_character_hotkeys(
         let Some(hk) = character_hotkeys.get(name) else {
             continue;
         };
-        if hk.vk == 0 {
+        if hk.kind != TriggerKind::Key || hk.code == 0 {
             continue;
         }
         out.push(CharacterHotkeyPlan {
             id: next_id,
             character_name: name.clone(),
-            modifier: hk.modifier.and_then(modifier_kind),
-            vk: hk.vk,
+            modifiers: mods_to_kinds(&hk.mods),
+            vk: hk.code,
         });
         next_id += 1;
     }
     out
 }
 
+/// What a mouse-button / wheel trigger maps to, resolved from the configured
+/// bindings. `SwitchCharacter` carries the index into the `characters` slice
+/// so the (Win32-side) caller can pass it through a thread message without
+/// allocating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MouseHotkeyAction {
+    CycleForward,
+    CycleBackward,
+    ToggleOverlay,
+    SwitchCharacter(usize),
+}
+
+/// Resolve a mouse/wheel trigger (button or wheel code + held modifiers) to an
+/// action, mirroring the Linux mouse listener's priority: toggle, then
+/// backward, then forward, then per-character (most-specific chord wins). Only
+/// `TriggerKind::Mouse` / `TriggerKind::Wheel` bindings can match here; key
+/// bindings go through RegisterHotKey.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_mouse_action(
+    kind: TriggerKind,
+    code: u16,
+    held: &HashSet<u16>,
+    forward: &Hotkey,
+    backward: &Hotkey,
+    toggle: &Hotkey,
+    characters: &[String],
+    character_hotkeys: &HashMap<String, Hotkey>,
+) -> Option<MouseHotkeyAction> {
+    if toggle.matches(kind, code, held) {
+        return Some(MouseHotkeyAction::ToggleOverlay);
+    }
+    if backward.matches(kind, code, held) {
+        return Some(MouseHotkeyAction::CycleBackward);
+    }
+    if forward.matches(kind, code, held) {
+        return Some(MouseHotkeyAction::CycleForward);
+    }
+    let mut best: Option<(usize, usize)> = None; // (character index, mods len)
+    for (i, name) in characters.iter().enumerate() {
+        if let Some(hk) = character_hotkeys.get(name) {
+            if hk.matches(kind, code, held) && best.is_none_or(|(_, b)| hk.mods.len() > b) {
+                best = Some((i, hk.mods.len()));
+            }
+        }
+    }
+    best.map(|(i, _)| MouseHotkeyAction::SwitchCharacter(i))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WHEEL_UP;
 
     // ---- modifier_kind --------------------------------------------------
 
@@ -262,78 +298,59 @@ mod tests {
 
     #[test]
     fn plan_cycle_hotkeys_returns_empty_when_disabled() {
-        let plans = plan_cycle_hotkeys(false, 0x70, 0x70, Some(0x10), 1, 2);
+        let plans = plan_cycle_hotkeys(false, &Hotkey::key(0x70), &Hotkey::key(0x71), 1, 2);
         assert!(plans.is_empty());
     }
 
     #[test]
-    fn plan_cycle_hotkeys_emits_forward_and_backward_when_keys_differ() {
-        let plans = plan_cycle_hotkeys(true, 0x70, 0x71, None, 1, 2);
+    fn plan_cycle_hotkeys_emits_both_when_key_bound() {
+        let plans = plan_cycle_hotkeys(true, &Hotkey::key(0x70), &Hotkey::key(0x71), 1, 2);
         assert_eq!(
             plans,
             vec![
-                CycleHotkeyPlan {
-                    id: 1,
-                    modifier: None,
-                    vk: 0x70
-                },
-                CycleHotkeyPlan {
-                    id: 2,
-                    modifier: None,
-                    vk: 0x71
-                },
+                CycleHotkeyPlan { id: 1, modifiers: vec![], vk: 0x70 },
+                CycleHotkeyPlan { id: 2, modifiers: vec![], vk: 0x71 },
             ]
         );
     }
 
     #[test]
-    fn plan_cycle_hotkeys_ignores_modifier_when_keys_differ() {
-        // The modifier_key field is only meaningful when forward and
-        // backward share a VK. With distinct keys, modifier must NOT
-        // apply to the backward entry — matches the original
-        // do_register_hotkeys behavior.
-        let plans = plan_cycle_hotkeys(true, 0x70, 0x71, Some(0x10), 1, 2);
-        assert_eq!(plans[1].modifier, None);
-    }
-
-    #[test]
-    fn plan_cycle_hotkeys_drops_backward_when_same_key_and_no_modifier() {
-        let plans = plan_cycle_hotkeys(true, 0x09, 0x09, None, 1, 2);
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].id, 1);
-    }
-
-    #[test]
-    fn plan_cycle_hotkeys_uses_modifier_on_backward_when_keys_match() {
-        // The classic "Tab forward, Shift+Tab backward" config.
-        let plans = plan_cycle_hotkeys(true, 0x09, 0x09, Some(0x10), 1, 2);
+    fn plan_cycle_hotkeys_carries_backward_chord() {
+        // Classic Tab forward, Shift+Tab backward.
+        let plans = plan_cycle_hotkeys(
+            true,
+            &Hotkey::key(0x09),
+            &Hotkey::key_with_mods(0x09, vec![0x10]),
+            1,
+            2,
+        );
         assert_eq!(plans.len(), 2);
-        assert_eq!(plans[0].modifier, None);
-        assert_eq!(plans[1].modifier, Some(ModifierKind::Shift));
+        assert_eq!(plans[0].modifiers, vec![]);
+        assert_eq!(plans[1].modifiers, vec![ModifierKind::Shift]);
         assert_eq!(plans[1].vk, 0x09);
     }
 
     #[test]
-    fn plan_cycle_hotkeys_drops_backward_when_modifier_vk_isnt_a_modifier() {
-        // Defensive: if Config somehow stores a non-modifier VK as the
-        // modifier_key, the plan treats it as no modifier — same key +
-        // no modifier ⇒ skip backward.
-        let plans = plan_cycle_hotkeys(true, 0x09, 0x09, Some(0x41), 1, 2); // 'A'
-        assert_eq!(plans.len(), 1);
+    fn plan_cycle_hotkeys_skips_unbound_and_mouse_bindings() {
+        // Forward unbound; backward bound to a mouse button — neither is
+        // RegisterHotKey-able, so nothing is planned.
+        let mouse = Hotkey { mods: vec![], kind: TriggerKind::Mouse, code: 5 };
+        let plans = plan_cycle_hotkeys(true, &Hotkey::default(), &mouse, 1, 2);
+        assert!(plans.is_empty());
     }
 
     // ---- plan_character_hotkeys ----------------------------------------
 
-    fn hk(vk: u16, modifier: Option<u16>) -> CharacterHotkey {
-        CharacterHotkey { vk, modifier }
+    fn hk(vk: u16, mods: Vec<u16>) -> Hotkey {
+        Hotkey::key_with_mods(vk, mods)
     }
 
     #[test]
     fn plan_character_hotkeys_emits_entries_in_character_order() {
         let characters = vec!["Beta".to_string(), "Alpha".to_string()];
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("Alpha".to_string(), hk(0x70, None));
-        hotkeys.insert("Beta".to_string(), hk(0x71, None));
+        hotkeys.insert("Alpha".to_string(), hk(0x70, vec![]));
+        hotkeys.insert("Beta".to_string(), hk(0x71, vec![]));
         let plans = plan_character_hotkeys(&characters, &hotkeys, 2000);
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0].character_name, "Beta");
@@ -346,38 +363,119 @@ mod tests {
     fn plan_character_hotkeys_skips_characters_without_a_binding() {
         let characters = vec!["Alpha".to_string(), "Beta".to_string()];
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("Beta".to_string(), hk(0x71, None));
+        hotkeys.insert("Beta".to_string(), hk(0x71, vec![]));
         let plans = plan_character_hotkeys(&characters, &hotkeys, 2000);
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].character_name, "Beta");
-        // No ID burned for the skipped character.
         assert_eq!(plans[0].id, 2000);
     }
 
     #[test]
-    fn plan_character_hotkeys_skips_placeholder_vk_zero() {
+    fn plan_character_hotkeys_skips_unbound_key() {
         let characters = vec!["Alpha".to_string()];
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("Alpha".to_string(), hk(0, Some(0x10)));
+        hotkeys.insert("Alpha".to_string(), hk(0, vec![0x10]));
         let plans = plan_character_hotkeys(&characters, &hotkeys, 2000);
         assert!(plans.is_empty());
     }
 
     #[test]
-    fn plan_character_hotkeys_translates_modifier_vk_into_modifier_kind() {
+    fn plan_character_hotkeys_skips_mouse_bindings() {
         let characters = vec!["Alpha".to_string()];
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("Alpha".to_string(), hk(0x70, Some(0x11))); // Ctrl
+        hotkeys.insert(
+            "Alpha".to_string(),
+            Hotkey { mods: vec![], kind: TriggerKind::Mouse, code: 5 },
+        );
         let plans = plan_character_hotkeys(&characters, &hotkeys, 2000);
-        assert_eq!(plans[0].modifier, Some(ModifierKind::Ctrl));
+        assert!(plans.is_empty());
     }
 
     #[test]
-    fn plan_character_hotkeys_treats_non_modifier_vk_as_no_modifier() {
+    fn plan_character_hotkeys_translates_modifier_chord() {
         let characters = vec!["Alpha".to_string()];
         let mut hotkeys = HashMap::new();
-        hotkeys.insert("Alpha".to_string(), hk(0x70, Some(0x41))); // 'A' isn't a modifier
+        hotkeys.insert("Alpha".to_string(), hk(0x70, vec![0x11, 0x10])); // Ctrl+Shift
         let plans = plan_character_hotkeys(&characters, &hotkeys, 2000);
-        assert_eq!(plans[0].modifier, None);
+        // key_with_mods sorts by code: 0x10 (Shift) before 0x11 (Ctrl).
+        assert_eq!(plans[0].modifiers, vec![ModifierKind::Shift, ModifierKind::Ctrl]);
+    }
+
+    #[test]
+    fn plan_character_hotkeys_drops_non_modifier_codes() {
+        let characters = vec!["Alpha".to_string()];
+        let mut hotkeys = HashMap::new();
+        hotkeys.insert("Alpha".to_string(), hk(0x70, vec![0x41])); // 'A' isn't a modifier
+        let plans = plan_character_hotkeys(&characters, &hotkeys, 2000);
+        assert_eq!(plans[0].modifiers, vec![]);
+    }
+
+    // ---- resolve_mouse_action ------------------------------------------
+
+    fn mouse(code: u16, mods: Vec<u16>) -> Hotkey {
+        Hotkey { mods, kind: TriggerKind::Mouse, code }
+    }
+
+    #[test]
+    fn resolve_mouse_action_prioritises_toggle_then_cycle() {
+        let none = HashSet::new();
+        let fwd = mouse(1, vec![]);
+        let back = mouse(2, vec![]);
+        let toggle = mouse(3, vec![]);
+        let chars: Vec<String> = vec![];
+        let map = HashMap::new();
+        assert_eq!(
+            resolve_mouse_action(TriggerKind::Mouse, 3, &none, &fwd, &back, &toggle, &chars, &map),
+            Some(MouseHotkeyAction::ToggleOverlay)
+        );
+        assert_eq!(
+            resolve_mouse_action(TriggerKind::Mouse, 2, &none, &fwd, &back, &toggle, &chars, &map),
+            Some(MouseHotkeyAction::CycleBackward)
+        );
+        assert_eq!(
+            resolve_mouse_action(TriggerKind::Mouse, 1, &none, &fwd, &back, &toggle, &chars, &map),
+            Some(MouseHotkeyAction::CycleForward)
+        );
+    }
+
+    #[test]
+    fn resolve_mouse_action_matches_wheel_and_character_index() {
+        let none = HashSet::new();
+        let unbound = Hotkey::default();
+        let chars = vec!["Alpha".to_string(), "Bravo".to_string()];
+        let mut map = HashMap::new();
+        map.insert("Bravo".to_string(), Hotkey { mods: vec![], kind: TriggerKind::Wheel, code: WHEEL_UP });
+        assert_eq!(
+            resolve_mouse_action(
+                TriggerKind::Wheel, WHEEL_UP, &none, &unbound, &unbound, &unbound, &chars, &map,
+            ),
+            Some(MouseHotkeyAction::SwitchCharacter(1))
+        );
+        // Wrong kind (a key) never matches a mouse/wheel resolve.
+        assert_eq!(
+            resolve_mouse_action(
+                TriggerKind::Key, WHEEL_UP, &none, &unbound, &unbound, &unbound, &chars, &map,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_mouse_action_requires_modifier_chord() {
+        let unbound = Hotkey::default();
+        let chars: Vec<String> = vec![];
+        let map = HashMap::new();
+        // Ctrl(0x11)+Mouse4 backward.
+        let back = mouse(4, vec![0x11]);
+        let none = HashSet::new();
+        assert_eq!(
+            resolve_mouse_action(TriggerKind::Mouse, 4, &none, &unbound, &back, &unbound, &chars, &map),
+            None
+        );
+        let ctrl: HashSet<u16> = [0x11].into_iter().collect();
+        assert_eq!(
+            resolve_mouse_action(TriggerKind::Mouse, 4, &ctrl, &unbound, &back, &unbound, &chars, &map),
+            Some(MouseHotkeyAction::CycleBackward)
+        );
     }
 }

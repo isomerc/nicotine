@@ -147,23 +147,19 @@ impl Daemon {
         #[cfg(windows)]
         type HotkeySig = (
             bool,
-            u16,
-            u16,
-            Option<u16>,
-            std::collections::HashMap<String, crate::config::CharacterHotkey>,
-            Option<u16>,
-            Option<u16>,
+            crate::config::Hotkey,
+            crate::config::Hotkey,
+            std::collections::HashMap<String, crate::config::Hotkey>,
+            crate::config::Hotkey,
         );
         #[cfg(windows)]
         fn hotkey_sig(c: &Config) -> HotkeySig {
             (
                 c.enable_keyboard_buttons,
-                c.forward_key,
-                c.backward_key,
-                c.modifier_key,
+                c.forward_key.clone(),
+                c.backward_key.clone(),
                 c.character_hotkeys.clone(),
-                c.toggle_previews_key,
-                c.toggle_previews_modifier,
+                c.toggle_previews_key.clone(),
             )
         }
         #[cfg(windows)]
@@ -274,16 +270,24 @@ impl Daemon {
         // when `enable` is false. That way flipping `enable_*` on in
         // the panel after startup actually does something instead of
         // requiring a daemon restart.
+        // Currently-held modifier keys, written by the keyboard listener and
+        // read by the mouse listener so a mouse/wheel hotkey can require a
+        // modifier chord (Ctrl + Mouse4) even though the two listeners poll
+        // different evdev devices.
+        let held_modifiers = Arc::new(Mutex::new(std::collections::HashSet::<u16>::new()));
         MouseListener::spawn(
             Arc::clone(&self.mouse_config),
             Arc::clone(&self.wm),
             Arc::clone(&self.state),
+            Arc::clone(&held_modifiers),
+            Arc::clone(&self.live),
         );
         KeyboardListener::spawn(
             Arc::clone(&self.keyboard_config),
             Arc::clone(&self.wm),
             Arc::clone(&self.state),
             Arc::clone(&self.live),
+            held_modifiers,
         );
         println!("Mouse + keyboard listeners spawned (live config hot-reload enabled)");
 

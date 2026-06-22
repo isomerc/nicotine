@@ -16,14 +16,15 @@
 //! 200 ms poll timeout caps the worst-case latency for panel-driven
 //! changes to take effect.
 
-use crate::config::Config;
+use crate::config::{Config, Hotkey, LiveSettings, TriggerKind, WHEEL_DOWN, WHEEL_UP};
 use crate::cycle_state::CycleState;
 use crate::window_manager::WindowManager;
 use anyhow::Result;
-use evdev::{Device, InputEventKind, Key};
+use evdev::{Device, InputEventKind, Key, RelativeAxisType};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::Path;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,14 @@ pub struct MouseConfig {
     pub mouse_device_name: Option<String>,
     pub mouse_device_path: Option<String>,
     pub minimize_inactive: bool,
+    /// Per-character hotkeys whose trigger is a mouse button or wheel notch.
+    /// (Key-triggered character hotkeys are handled by the keyboard listener.)
+    pub character_hotkeys: HashMap<String, Hotkey>,
+    /// Cycle / toggle bindings — fired here when bound to a mouse button or
+    /// wheel notch (key triggers go through the keyboard listener).
+    pub forward_key: Hotkey,
+    pub backward_key: Hotkey,
+    pub toggle_previews_key: Hotkey,
 }
 
 impl MouseConfig {
@@ -46,7 +55,21 @@ impl MouseConfig {
             mouse_device_name: c.mouse_device_name.clone(),
             mouse_device_path: c.mouse_device_path.clone(),
             minimize_inactive: c.minimize_inactive,
+            character_hotkeys: c.character_hotkeys.clone(),
+            forward_key: c.forward_key.clone(),
+            backward_key: c.backward_key.clone(),
+            toggle_previews_key: c.toggle_previews_key.clone(),
         }
+    }
+
+    /// Whether any character hotkey is bound to a mouse button or wheel —
+    /// reason to keep the listener attached even when cycling is disabled.
+    fn has_mouse_hotkeys(&self) -> bool {
+        let is_mouse = |hk: &Hotkey| matches!(hk.kind, TriggerKind::Mouse | TriggerKind::Wheel);
+        self.character_hotkeys.values().any(is_mouse)
+            || is_mouse(&self.forward_key)
+            || is_mouse(&self.backward_key)
+            || is_mouse(&self.toggle_previews_key)
     }
 }
 
@@ -69,14 +92,18 @@ impl MouseListener {
         shared: Arc<Mutex<MouseConfig>>,
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
+        held_modifiers: Arc<Mutex<HashSet<u16>>>,
+        live: Arc<Mutex<LiveSettings>>,
     ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || Self::run_listener(shared, wm, state))
+        std::thread::spawn(move || Self::run_listener(shared, wm, state, held_modifiers, live))
     }
 
     fn run_listener(
         shared: Arc<Mutex<MouseConfig>>,
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
+        held_modifiers: Arc<Mutex<HashSet<u16>>>,
+        live: Arc<Mutex<LiveSettings>>,
     ) {
         // Every side-button-capable device we're currently listening on.
         // Empty between scans (e.g. all devices unplugged) or while
@@ -94,9 +121,12 @@ impl MouseListener {
         loop {
             let snap = shared.lock().unwrap().clone();
 
-            if !snap.enable {
+            if !snap.enable && !snap.has_mouse_hotkeys() {
                 if !announced_idle {
-                    println!("Mouse listener idle (enable_mouse_buttons = false)");
+                    println!(
+                        "Mouse listener idle (enable_mouse_buttons = false, \
+                         no mouse/wheel character hotkeys)"
+                    );
                     announced_idle = true;
                     announced_listening = false;
                 }
@@ -221,29 +251,69 @@ impl MouseListener {
                     }
                 };
                 for event in events {
-                    if let InputEventKind::Key(key) = event.kind() {
-                        if event.value() != 1 {
-                            continue;
-                        }
-                        let code = key.code();
-                        let is_cycle = code == snap.forward_button || code == snap.backward_button;
-                        if is_cycle {
-                            // Drop a duplicate press echoed by a second device
-                            // node within the debounce window.
-                            let now = Instant::now();
-                            if last_cycle.is_some_and(|t| now.duration_since(t) < CYCLE_DEBOUNCE) {
+                    // De-dup presses echoed across a mouse's multiple event
+                    // nodes (see CYCLE_DEBOUNCE).
+                    let recent =
+                        |t: &Option<Instant>| t.is_some_and(|t| t.elapsed() < CYCLE_DEBOUNCE);
+                    match event.kind() {
+                        InputEventKind::Key(key) if event.value() == 1 => {
+                            let code = key.code();
+                            // Cycle side buttons (only when cycling is enabled).
+                            if snap.enable
+                                && (code == snap.forward_button || code == snap.backward_button)
+                            {
+                                if recent(&last_cycle) {
+                                    continue;
+                                }
+                                last_cycle = Some(Instant::now());
+                                let result = if code == snap.forward_button {
+                                    Self::cycle_forward(&wm, &state, snap.minimize_inactive)
+                                } else {
+                                    Self::cycle_backward(&wm, &state, snap.minimize_inactive)
+                                };
+                                if let Err(e) = result {
+                                    eprintln!("Failed to cycle: {}", e);
+                                }
                                 continue;
                             }
-                            last_cycle = Some(now);
-                            let result = if code == snap.forward_button {
-                                Self::cycle_forward(&wm, &state, snap.minimize_inactive)
-                            } else {
-                                Self::cycle_backward(&wm, &state, snap.minimize_inactive)
-                            };
-                            if let Err(e) = result {
-                                eprintln!("Failed to cycle: {}", e);
+                            // Mouse-bound cycle / toggle / character hotkeys.
+                            if recent(&last_cycle) {
+                                continue;
+                            }
+                            let held = held_modifiers.lock().unwrap().clone();
+                            if Self::dispatch_mouse_hotkey(
+                                TriggerKind::Mouse,
+                                code,
+                                &held,
+                                &snap,
+                                &wm,
+                                &state,
+                                &live,
+                            ) {
+                                last_cycle = Some(Instant::now());
                             }
                         }
+                        InputEventKind::RelAxis(axis)
+                            if axis == RelativeAxisType::REL_WHEEL && event.value() != 0 =>
+                        {
+                            if recent(&last_cycle) {
+                                continue;
+                            }
+                            let dir = if event.value() > 0 { WHEEL_UP } else { WHEEL_DOWN };
+                            let held = held_modifiers.lock().unwrap().clone();
+                            if Self::dispatch_mouse_hotkey(
+                                TriggerKind::Wheel,
+                                dir,
+                                &held,
+                                &snap,
+                                &wm,
+                                &state,
+                                &live,
+                            ) {
+                                last_cycle = Some(Instant::now());
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -357,6 +427,80 @@ impl MouseListener {
         }
 
         Ok(found)
+    }
+
+    /// Dispatch a mouse/wheel trigger: toggle overlay, cycle backward/forward,
+    /// or activate a character — whichever binding matches the trigger + held
+    /// modifiers. Returns whether anything fired.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_mouse_hotkey(
+        kind: TriggerKind,
+        code: u16,
+        held: &HashSet<u16>,
+        snap: &MouseConfig,
+        wm: &Arc<dyn WindowManager>,
+        state: &Arc<Mutex<CycleState>>,
+        live: &Arc<Mutex<LiveSettings>>,
+    ) -> bool {
+        if snap.toggle_previews_key.matches(kind, code, held) {
+            let mut live = live.lock().unwrap();
+            live.show_previews = !live.show_previews;
+            println!(
+                "Preview windows toggled {} via mouse hotkey",
+                if live.show_previews { "on" } else { "off" }
+            );
+            return true;
+        }
+        if snap.backward_key.matches(kind, code, held) {
+            if let Err(e) = Self::cycle_backward(wm, state, snap.minimize_inactive) {
+                eprintln!("Failed to cycle backward: {}", e);
+            }
+            return true;
+        }
+        if snap.forward_key.matches(kind, code, held) {
+            if let Err(e) = Self::cycle_forward(wm, state, snap.minimize_inactive) {
+                eprintln!("Failed to cycle forward: {}", e);
+            }
+            return true;
+        }
+        if let Some(name) = Self::resolve_mouse_hotkey(kind, code, held, &snap.character_hotkeys) {
+            if let Err(e) = Self::switch_to_character(&name, wm, state, snap.minimize_inactive) {
+                eprintln!("Failed to switch to {}: {}", name, e);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Activate a specific character (mouse/wheel hotkey target), mirroring
+    /// the keyboard listener's switch path.
+    fn switch_to_character(
+        name: &str,
+        wm: &Arc<dyn WindowManager>,
+        state: &Arc<Mutex<CycleState>>,
+        minimize_inactive: bool,
+    ) -> Result<()> {
+        let mut state = state.lock().unwrap();
+        if let Ok(active) = wm.get_active_window() {
+            state.sync_with_active(active);
+        }
+        state.switch_to_character(name, &**wm, minimize_inactive)?;
+        Ok(())
+    }
+
+    /// Find the character hotkey matching this mouse/wheel trigger + held
+    /// modifiers (exact-set match; most-specific chord wins).
+    fn resolve_mouse_hotkey(
+        kind: TriggerKind,
+        code: u16,
+        held: &HashSet<u16>,
+        hotkeys: &HashMap<String, Hotkey>,
+    ) -> Option<String> {
+        hotkeys
+            .iter()
+            .filter(|(_, hk)| hk.kind == kind && hk.code == code && hk.mods_match(held))
+            .max_by_key(|(_, hk)| hk.mods.len())
+            .map(|(name, _)| name.clone())
     }
 
     fn cycle_forward(

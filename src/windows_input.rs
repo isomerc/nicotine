@@ -1,12 +1,12 @@
-use crate::config::{Config, LiveSettings};
+use crate::config::{Config, Hotkey, LiveSettings, TriggerKind, WHEEL_DOWN, WHEEL_UP};
 use crate::cycle_state::CycleState;
 use crate::window_manager::WindowManager;
 use crate::windows_helpers::{
-    classify_xbutton, modifier_kind, plan_character_hotkeys, plan_cycle_hotkeys, CycleDirection,
-    ModifierKind,
+    classify_xbutton, modifier_kind, plan_character_hotkeys, plan_cycle_hotkeys, resolve_mouse_action,
+    CycleDirection, ModifierKind, MouseHotkeyAction,
 };
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -14,11 +14,12 @@ use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+    MOD_SHIFT, MOD_WIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, HHOOK, MSG, MSLLHOOKSTRUCT,
-    WH_MOUSE_LL, WM_HOTKEY, WM_USER, WM_XBUTTONDOWN,
+    WH_MOUSE_LL, WM_HOTKEY, WM_MOUSEWHEEL, WM_USER, WM_XBUTTONDOWN,
 };
 
 const HOTKEY_FORWARD_ID: i32 = 1001;
@@ -40,10 +41,41 @@ fn character_lookup() -> &'static Mutex<HashMap<i32, String>> {
     CHARACTER_HOTKEY_LOOKUP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Mouse/wheel-relevant bindings the low-level hook needs to match a click or
+/// wheel notch. Refreshed on every (re)register so panel edits take effect
+/// without a daemon restart. The hook callback can't capture, so this lives
+/// in a global.
+struct MouseHotkeyState {
+    forward: Hotkey,
+    backward: Hotkey,
+    toggle: Hotkey,
+    characters: Vec<String>,
+    character_hotkeys: HashMap<String, Hotkey>,
+}
+
+static MOUSE_HOTKEYS: OnceLock<Mutex<MouseHotkeyState>> = OnceLock::new();
+
+fn mouse_hotkeys() -> &'static Mutex<MouseHotkeyState> {
+    MOUSE_HOTKEYS.get_or_init(|| {
+        Mutex::new(MouseHotkeyState {
+            forward: Hotkey::default(),
+            backward: Hotkey::default(),
+            toggle: Hotkey::default(),
+            characters: Vec::new(),
+            character_hotkeys: HashMap::new(),
+        })
+    })
+}
+
 const WM_USER_FORWARD: u32 = WM_USER + 1;
 const WM_USER_BACKWARD: u32 = WM_USER + 2;
 const WM_USER_PAUSE: u32 = WM_USER + 3;
 const WM_USER_RESUME: u32 = WM_USER + 4;
+/// Posted by the mouse hook when a mouse/wheel binding maps to overlay-toggle.
+const WM_USER_TOGGLE: u32 = WM_USER + 5;
+/// Posted by the mouse hook for a mouse/wheel per-character switch; wParam is
+/// the character's index into the config order.
+const WM_USER_CHARACTER: u32 = WM_USER + 6;
 
 /// Thread ID of the running input listener, exposed so the config
 /// panel can PostThreadMessage pause/resume signals when the user is
@@ -111,53 +143,96 @@ struct HookContext {
 static HOOK_CTX: OnceLock<HookContext> = OnceLock::new();
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && wparam.0 as u32 == WM_XBUTTONDOWN {
+    if code >= 0 {
+        let message = wparam.0 as u32;
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        // High word of mouseData identifies the X button: 1 = XBUTTON1 (back),
-        // 2 = XBUTTON2 (forward).
-        let xbutton = ((info.mouseData >> 16) & 0xFFFF) as u16;
-        debug_input(format_args!(
-            "mouse_hook_proc: WM_XBUTTONDOWN raw={:#010x} xbutton={} flags={:#x}",
-            info.mouseData, xbutton, info.flags
-        ));
-
-        // Pass-through when cycling is disabled (user set
-        // enable_mouse_buttons = false in config).
-        if !MOUSE_CYCLE_ENABLED.load(Ordering::Acquire) {
-            debug_input(format_args!(
-                "mouse_hook_proc: MOUSE_CYCLE_ENABLED=false, pass-through"
-            ));
-            return CallNextHookEx(None, code, wparam, lparam);
-        }
-
-        if let Some(ctx) = HOOK_CTX.get() {
-            let post =
-                classify_xbutton(xbutton, ctx.forward_button, ctx.backward_button).map(|dir| {
-                    match dir {
-                        CycleDirection::Forward => WM_USER_FORWARD,
-                        CycleDirection::Backward => WM_USER_BACKWARD,
-                    }
-                });
-            debug_input(format_args!(
-                "mouse_hook_proc: classify xbutton={} fwd={} back={} -> post={:?}",
-                xbutton, ctx.forward_button, ctx.backward_button, post
-            ));
-
-            if let Some(msg) = post {
-                // PostThreadMessageW returns Err if the thread queue is
-                // unavailable (e.g. listener has exited). Best-effort.
-                let result = PostThreadMessageW(ctx.listener_thread_id, msg, WPARAM(0), LPARAM(0));
-                debug_input(format_args!(
-                    "mouse_hook_proc: PostThreadMessageW tid={} msg={:#x} result={:?}",
-                    ctx.listener_thread_id, msg, result
-                ));
+        // Map the raw event to a (kind, code) trigger: x-buttons → Mouse
+        // (1 = XBUTTON1, 2 = XBUTTON2); wheel notches → Wheel up/down.
+        let trigger = match message {
+            WM_XBUTTONDOWN => Some((TriggerKind::Mouse, ((info.mouseData >> 16) & 0xFFFF) as u16)),
+            WM_MOUSEWHEEL => {
+                let delta = ((info.mouseData >> 16) & 0xFFFF) as i16;
+                if delta > 0 {
+                    Some((TriggerKind::Wheel, WHEEL_UP))
+                } else if delta < 0 {
+                    Some((TriggerKind::Wheel, WHEEL_DOWN))
+                } else {
+                    None
+                }
             }
-        } else {
-            debug_input(format_args!("mouse_hook_proc: HOOK_CTX unset"));
+            _ => None,
+        };
+
+        if let (Some((kind, tcode)), Some(ctx)) = (trigger, HOOK_CTX.get()) {
+            let held = held_modifiers();
+            let action = {
+                let st = mouse_hotkeys().lock().unwrap();
+                resolve_mouse_action(
+                    kind,
+                    tcode,
+                    &held,
+                    &st.forward,
+                    &st.backward,
+                    &st.toggle,
+                    &st.characters,
+                    &st.character_hotkeys,
+                )
+            };
+            debug_input(format_args!(
+                "mouse_hook_proc: kind={:?} code={} -> {:?}",
+                kind, tcode, action
+            ));
+            let post: Option<(u32, usize)> = match action {
+                Some(MouseHotkeyAction::CycleForward) => Some((WM_USER_FORWARD, 0)),
+                Some(MouseHotkeyAction::CycleBackward) => Some((WM_USER_BACKWARD, 0)),
+                Some(MouseHotkeyAction::ToggleOverlay) => Some((WM_USER_TOGGLE, 0)),
+                Some(MouseHotkeyAction::SwitchCharacter(i)) => Some((WM_USER_CHARACTER, i)),
+                // No explicit binding: fall back to the legacy side-button
+                // cycle (forward_button/backward_button), gated by the
+                // enable_mouse_buttons toggle.
+                None if message == WM_XBUTTONDOWN
+                    && MOUSE_CYCLE_ENABLED.load(Ordering::Acquire) =>
+                {
+                    classify_xbutton(tcode, ctx.forward_button, ctx.backward_button).map(|dir| {
+                        let m = match dir {
+                            CycleDirection::Forward => WM_USER_FORWARD,
+                            CycleDirection::Backward => WM_USER_BACKWARD,
+                        };
+                        (m, 0usize)
+                    })
+                }
+                None => None,
+            };
+            if let Some((m, w)) = post {
+                let _ = PostThreadMessageW(ctx.listener_thread_id, m, WPARAM(w), LPARAM(0));
+            }
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
 }
+
+/// Snapshot the currently-held modifier keys as the same VK codes the panel
+/// records, so a mouse/wheel chord captured in the panel matches at runtime.
+fn held_modifiers() -> HashSet<u16> {
+    let mut held = HashSet::new();
+    // A closure does not inherit the unsafe context of an enclosing unsafe
+    // fn, so the FFI call needs its own unsafe block regardless.
+    let down = |vk: i32| (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0;
+    if down(0x11) {
+        held.insert(0x11); // VK_CONTROL
+    }
+    if down(0x10) {
+        held.insert(0x10); // VK_SHIFT
+    }
+    if down(0x12) {
+        held.insert(0x12); // VK_MENU (Alt)
+    }
+    if down(0x5B) {
+        held.insert(0x5B); // VK_LWIN
+    }
+    held
+}
+
 
 /// Diagnostic logging gated by `NICOTINE_DEBUG_INPUT`. Used by
 /// integration tests to instrument the mouse-hook -> listener ->
@@ -177,13 +252,17 @@ fn debug_input(args: std::fmt::Arguments) {
 /// HOT_KEY_MODIFIERS bitmask RegisterHotKey expects. The planner is
 /// kept platform-independent (see `windows_helpers`) so this thin
 /// adapter is the only place that knows about MOD_SHIFT/etc.
-fn modifier_to_winapi(kind: Option<ModifierKind>) -> HOT_KEY_MODIFIERS {
-    match kind {
-        Some(ModifierKind::Shift) => MOD_SHIFT,
-        Some(ModifierKind::Ctrl) => MOD_CONTROL,
-        Some(ModifierKind::Alt) => MOD_ALT,
-        None => HOT_KEY_MODIFIERS(0),
+fn modifier_to_winapi(kinds: &[ModifierKind]) -> HOT_KEY_MODIFIERS {
+    let mut bits = 0u32;
+    for k in kinds {
+        bits |= match k {
+            ModifierKind::Shift => MOD_SHIFT.0,
+            ModifierKind::Ctrl => MOD_CONTROL.0,
+            ModifierKind::Alt => MOD_ALT.0,
+            ModifierKind::Win => MOD_WIN.0,
+        };
     }
+    HOT_KEY_MODIFIERS(bits)
 }
 
 /// Spawn the Windows input listener thread. The thread installs a low-level
@@ -302,7 +381,9 @@ fn run_listener(
         // Preview-visibility toggle hotkey? Flip the shared LiveSettings
         // flag the preview manager watches; it shows/hides on the next
         // reconcile tick, same as the panel checkbox.
-        if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_TOGGLE_PREVIEWS_ID {
+        if msg.message == WM_USER_TOGGLE
+            || (msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_TOGGLE_PREVIEWS_ID)
+        {
             let mut live_guard = live.lock().unwrap();
             live_guard.show_previews = !live_guard.show_previews;
             println!(
@@ -313,6 +394,24 @@ fn run_listener(
                     "off"
                 }
             );
+            continue;
+        }
+
+        // Mouse/wheel-bound character switch (hook posts the character's
+        // config index in wParam).
+        if msg.message == WM_USER_CHARACTER {
+            let idx = msg.wParam.0;
+            let name = mouse_hotkeys().lock().unwrap().characters.get(idx).cloned();
+            if let Some(name) = name {
+                let minimize_inactive = minimize_inactive_lookup();
+                let mut state_guard = state.lock().unwrap();
+                if let Ok(active) = wm.get_active_window() {
+                    state_guard.sync_with_active(active);
+                }
+                if let Err(e) = state_guard.switch_to_character(&name, &*wm, minimize_inactive) {
+                    eprintln!("Character switch failed: {}", e);
+                }
+            }
             continue;
         }
 
@@ -351,30 +450,31 @@ fn run_listener(
 unsafe fn do_register_hotkeys(config: &Config) {
     for plan in plan_cycle_hotkeys(
         config.enable_keyboard_buttons,
-        config.forward_key,
-        config.backward_key,
-        config.modifier_key,
+        &config.forward_key,
+        &config.backward_key,
         HOTKEY_FORWARD_ID,
         HOTKEY_BACKWARD_ID,
     ) {
         let _ = RegisterHotKey(
             None,
             plan.id,
-            modifier_to_winapi(plan.modifier),
+            modifier_to_winapi(&plan.modifiers),
             plan.vk as u32,
         );
     }
 
-    // Preview-visibility toggle, with optional modifier. Independent of
-    // enable_keyboard_buttons — it flips show_previews regardless of
-    // whether cycling is on.
-    if let Some(vk) = config.toggle_previews_key {
-        let modifier = config.toggle_previews_modifier.and_then(modifier_kind);
+    // Preview-visibility toggle. Only key-triggered toggles are
+    // RegisterHotKey-able (a mouse/wheel toggle would run through the mouse
+    // hook). Independent of enable_keyboard_buttons.
+    let toggle = &config.toggle_previews_key;
+    if toggle.kind == TriggerKind::Key && toggle.code != 0 {
+        let mods: Vec<ModifierKind> =
+            toggle.mods.iter().filter_map(|&m| modifier_kind(m)).collect();
         let _ = RegisterHotKey(
             None,
             HOTKEY_TOGGLE_PREVIEWS_ID,
-            modifier_to_winapi(modifier),
-            vk as u32,
+            modifier_to_winapi(&mods),
+            toggle.code as u32,
         );
     }
 
@@ -385,7 +485,7 @@ unsafe fn do_register_hotkeys(config: &Config) {
         &config.character_hotkeys,
         HOTKEY_CHARACTER_BASE,
     ) {
-        let modifier = modifier_to_winapi(plan.modifier);
+        let modifier = modifier_to_winapi(&plan.modifiers);
         if RegisterHotKey(None, plan.id, modifier, plan.vk as u32).is_ok() {
             lookup.insert(plan.id, plan.character_name);
         } else {
@@ -395,6 +495,15 @@ unsafe fn do_register_hotkeys(config: &Config) {
             );
         }
     }
+
+    // Refresh the mouse hook's view of the mouse/wheel-triggered bindings.
+    *mouse_hotkeys().lock().unwrap() = MouseHotkeyState {
+        forward: config.forward_key.clone(),
+        backward: config.backward_key.clone(),
+        toggle: config.toggle_previews_key.clone(),
+        characters: config.characters.clone(),
+        character_hotkeys: config.character_hotkeys.clone(),
+    };
 }
 
 fn register_hotkeys(config: &Config) {

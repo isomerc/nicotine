@@ -1,4 +1,4 @@
-use crate::config::{CharacterHotkey, Config, LiveSettings};
+use crate::config::{Config, Hotkey, LiveSettings, TriggerKind, WHEEL_DOWN, WHEEL_UP};
 use iced::{Color, Element, Subscription, Task, Theme};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -58,7 +58,6 @@ pub(super) const LOGO_SIZE: f32 = 44.0;
 pub(super) enum CaptureTarget {
     ForwardKey,
     BackwardKey,
-    ModifierKey,
     TogglePreviews,
     Character(String),
 }
@@ -131,6 +130,75 @@ fn digits_only(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
+/// Render a unified Hotkey as a human label, e.g. "Ctrl+Shift+J",
+/// "Mouse4", "Wheel↑", or "unbound".
+pub(super) fn hotkey_label(hk: &Hotkey) -> String {
+    use crate::config::{TriggerKind, WHEEL_DOWN, WHEEL_UP};
+    if hk.kind == TriggerKind::Key && hk.code == 0 {
+        return "unbound".into();
+    }
+    let mut parts: Vec<String> = hk.mods.iter().map(|&m| code_to_label(m)).collect();
+    parts.push(match hk.kind {
+        TriggerKind::Key => code_to_label(hk.code),
+        TriggerKind::Mouse => format!("Mouse{}", hk.code),
+        TriggerKind::Wheel => match hk.code {
+            WHEEL_UP => "Wheel↑".into(),
+            WHEEL_DOWN => "Wheel↓".into(),
+            _ => "Wheel".into(),
+        },
+    });
+    parts.join("+")
+}
+
+/// Map iced's logical modifier flags to the platform modifier key codes
+/// the runtime listeners track (canonical left-variant codes).
+#[cfg(unix)]
+fn iced_mods_to_codes(m: &iced::keyboard::Modifiers) -> Vec<u16> {
+    let mut v = Vec::new();
+    if m.control() { v.push(29); }   // KEY_LEFTCTRL
+    if m.shift()   { v.push(42); }   // KEY_LEFTSHIFT
+    if m.alt()     { v.push(56); }   // KEY_LEFTALT
+    if m.logo()    { v.push(125); }  // KEY_LEFTMETA
+    v
+}
+#[cfg(windows)]
+fn iced_mods_to_codes(m: &iced::keyboard::Modifiers) -> Vec<u16> {
+    let mut v = Vec::new();
+    if m.control() { v.push(0x11); } // VK_CONTROL
+    if m.shift()   { v.push(0x10); } // VK_SHIFT
+    if m.alt()     { v.push(0x12); } // VK_MENU
+    if m.logo()    { v.push(0x5B); } // VK_LWIN
+    v
+}
+
+/// Map an iced mouse button to the code the runtime listener matches.
+/// Linux uses evdev BTN_* codes; Windows uses the XBUTTON numbering the
+/// low-level mouse hook reports (back=1, forward=2). Left/Right/Middle on
+/// Windows aren't delivered by that hook, so binding them there is inert.
+#[cfg(unix)]
+fn iced_button_to_code(b: iced::mouse::Button) -> Option<u16> {
+    use iced::mouse::Button;
+    Some(match b {
+        Button::Left => 0x110,    // BTN_LEFT (272)
+        Button::Right => 0x111,   // BTN_RIGHT (273)
+        Button::Middle => 0x112,  // BTN_MIDDLE (274)
+        Button::Back => 0x113,    // BTN_SIDE (275)
+        Button::Forward => 0x114, // BTN_EXTRA (276)
+        Button::Other(n) => n,
+    })
+}
+#[cfg(windows)]
+fn iced_button_to_code(b: iced::mouse::Button) -> Option<u16> {
+    use iced::mouse::Button;
+    match b {
+        Button::Back => Some(1),     // XBUTTON1
+        Button::Forward => Some(2),  // XBUTTON2
+        Button::Other(n) => Some(n),
+        // Not reported by the WM_XBUTTON low-level hook; not bindable.
+        Button::Left | Button::Right | Button::Middle => None,
+    }
+}
+
 /// Aspect ratio (width / height) used to lock the two preview dimensions
 /// together when "Constrain aspect ratio" is on. Guards a zero/empty
 /// dimension (only reachable via a hand-edited config) by falling back to
@@ -167,60 +235,6 @@ fn constrain_dimensions(target_width: u32, ratio: f64) -> (u32, u32) {
     }
 }
 
-/// One entry in the modifier dropdown. Codes are platform-specific:
-/// Win32 VK on Windows, Linux evdev keycodes on Linux.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ModifierChoice {
-    pub code: Option<u16>,
-    pub label: &'static str,
-}
-
-impl std::fmt::Display for ModifierChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.label)
-    }
-}
-
-#[cfg(windows)]
-pub(super) const MODIFIER_CHOICES: &[ModifierChoice] = &[
-    ModifierChoice {
-        code: None,
-        label: "None",
-    },
-    ModifierChoice {
-        code: Some(0x10),
-        label: "Shift",
-    },
-    ModifierChoice {
-        code: Some(0x11),
-        label: "Ctrl",
-    },
-    ModifierChoice {
-        code: Some(0x12),
-        label: "Alt",
-    },
-];
-
-#[cfg(unix)]
-pub(super) const MODIFIER_CHOICES: &[ModifierChoice] = &[
-    ModifierChoice {
-        code: None,
-        label: "None",
-    },
-    ModifierChoice {
-        code: Some(42),
-        label: "Shift",
-    }, // KEY_LEFTSHIFT
-    ModifierChoice {
-        code: Some(29),
-        label: "Ctrl",
-    }, // KEY_LEFTCTRL
-    ModifierChoice {
-        code: Some(56),
-        label: "Alt",
-    }, // KEY_LEFTALT
-];
-
 pub(super) struct Panel {
     pub config: Config,
     /// Shared settings watched by the preview manager for live updates.
@@ -231,6 +245,9 @@ pub(super) struct Panel {
     pub new_character_buffer: String,
     /// When `Some(..)`, the next keypress binds to this field.
     pub capturing: Option<CaptureTarget>,
+    /// Modifiers held during an in-progress capture, so a mouse/wheel
+    /// trigger captured next can include the chord.
+    pub capture_mods: iced::keyboard::Modifiers,
     /// Timestamp of the last edit; the debounce subscription flushes to
     /// disk once this is older than `AUTOSAVE_DEBOUNCE`.
     pub last_change: Option<Instant>,
@@ -299,6 +316,7 @@ impl Panel {
             restack_supported,
             new_character_buffer: String::new(),
             capturing: None,
+            capture_mods: iced::keyboard::Modifiers::empty(),
             last_change: None,
             active_tab: Tab::Display,
             dragging: None,
@@ -313,6 +331,32 @@ impl Panel {
         self.last_change = Some(Instant::now());
     }
 
+    /// Commit a mouse-button / wheel trigger (with any held modifiers) to
+    /// the bind site currently capturing. Other (single-key) sites ignore
+    /// mouse/wheel until they're migrated to the unified Hotkey.
+    fn bind_captured_trigger(&mut self, kind: TriggerKind, code: u16) {
+        let Some(target) = self.capturing.clone() else {
+            return;
+        };
+        let mut mods = iced_mods_to_codes(&self.capture_mods);
+        mods.sort_unstable();
+        mods.dedup();
+        let hk = Hotkey { mods, kind, code };
+        match &target {
+            CaptureTarget::ForwardKey => self.config.forward_key = hk,
+            CaptureTarget::BackwardKey => self.config.backward_key = hk,
+            CaptureTarget::TogglePreviews => self.config.toggle_previews_key = hk,
+            CaptureTarget::Character(name) => {
+                self.config.character_hotkeys.insert(name.clone(), hk);
+            }
+        }
+        self.capturing = None;
+        self.capture_mods = iced::keyboard::Modifiers::empty();
+        self.touch();
+        #[cfg(windows)]
+        self.end_windows_capture();
+    }
+
     fn handle_capture_key(&mut self, event: iced::keyboard::Event) -> Task<Message> {
         use iced::keyboard::key::Named;
         use iced::keyboard::{Event, Key};
@@ -321,9 +365,17 @@ impl Panel {
             return Task::none();
         };
 
-        let Event::KeyPressed { key, .. } = event else {
+        // Track held modifiers so a mouse/wheel trigger captured next can
+        // include the chord (ModifiersChanged carries no key to bind).
+        if let Event::ModifiersChanged(m) = event {
+            self.capture_mods = m;
+            return Task::none();
+        }
+
+        let Event::KeyPressed { key, modifiers, .. } = event else {
             return Task::none();
         };
+        self.capture_mods = modifiers;
 
         // Escape cancels capture without binding.
         if matches!(key, Key::Named(Named::Escape)) {
@@ -336,26 +388,30 @@ impl Panel {
         // On Windows, OEM/punctuation VKs are layout-dependent; ask the OS
         // for the actually-held VK first so the captured code matches what
         // RegisterHotKey will see at runtime regardless of keyboard layout.
+        // A modifier key on its own isn't a trigger for a chord-capable
+        // binding: keep listening so the user can hold it and press the real
+        // key. (The dedicated single-modifier bind still records it.)
+        let is_mod_key = matches!(
+            key,
+            Key::Named(Named::Control | Named::Shift | Named::Alt | Named::Super)
+        );
+        if is_mod_key {
+            return Task::none();
+        }
+
         #[cfg(windows)]
         let code = oem_vk_currently_pressed().or_else(|| iced_key_to_code(&key));
         #[cfg(unix)]
         let code = iced_key_to_code(&key);
 
         if let Some(vk) = code {
+            let hk = Hotkey::key_with_mods(vk, iced_mods_to_codes(&modifiers));
             match &target {
-                CaptureTarget::ForwardKey => self.config.forward_key = vk,
-                CaptureTarget::BackwardKey => self.config.backward_key = vk,
-                CaptureTarget::ModifierKey => self.config.modifier_key = Some(vk),
-                CaptureTarget::TogglePreviews => self.config.toggle_previews_key = Some(vk),
+                CaptureTarget::ForwardKey => self.config.forward_key = hk,
+                CaptureTarget::BackwardKey => self.config.backward_key = hk,
+                CaptureTarget::TogglePreviews => self.config.toggle_previews_key = hk,
                 CaptureTarget::Character(name) => {
-                    let modifier = self
-                        .config
-                        .character_hotkeys
-                        .get(name)
-                        .and_then(|h| h.modifier);
-                    self.config
-                        .character_hotkeys
-                        .insert(name.clone(), CharacterHotkey { vk, modifier });
+                    self.config.character_hotkeys.insert(name.clone(), hk);
                 }
             }
             self.capturing = None;
@@ -392,13 +448,9 @@ pub(super) enum Message {
     RemoveCharacter(usize),
     NewCharacterChanged(String),
     AddCharacter,
-    CharacterModifierChanged(String, ModifierChoice),
-    ClearCharacterHotkey(String),
     KeyboardEnabledToggled(bool),
     MouseEnabledToggled(bool),
-    ClearModifier,
-    ClearTogglePreviews,
-    TogglePreviewsModifierChanged(ModifierChoice),
+    ClearBinding(CaptureTarget),
     StartCapture(CaptureTarget),
     TabSelected(Tab),
     GrabRow(usize),
@@ -406,6 +458,8 @@ pub(super) enum Message {
     UnhoverRow(usize),
     DropRow,
     KeyEvent(iced::keyboard::Event),
+    CaptureMouse(u16),
+    CaptureWheel(bool),
     ShowPreviewsToggled(bool),
     HideActivePreviewToggled(bool),
     ConstrainAspectToggled(bool),
@@ -478,22 +532,6 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
                 panel.touch();
             }
         }
-        Message::CharacterModifierChanged(name, choice) => {
-            let entry = panel
-                .config
-                .character_hotkeys
-                .entry(name)
-                .or_insert(CharacterHotkey {
-                    vk: 0,
-                    modifier: None,
-                });
-            entry.modifier = choice.code;
-            panel.touch();
-        }
-        Message::ClearCharacterHotkey(name) => {
-            panel.config.character_hotkeys.remove(&name);
-            panel.touch();
-        }
         Message::KeyboardEnabledToggled(v) => {
             panel.config.enable_keyboard_buttons = v;
             panel.touch();
@@ -502,17 +540,17 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             panel.config.enable_mouse_buttons = v;
             panel.touch();
         }
-        Message::ClearModifier => {
-            panel.config.modifier_key = None;
-            panel.touch();
-        }
-        Message::ClearTogglePreviews => {
-            panel.config.toggle_previews_key = None;
-            panel.config.toggle_previews_modifier = None;
-            panel.touch();
-        }
-        Message::TogglePreviewsModifierChanged(choice) => {
-            panel.config.toggle_previews_modifier = choice.code;
+        Message::ClearBinding(target) => {
+            match target {
+                CaptureTarget::ForwardKey => panel.config.forward_key = Hotkey::default(),
+                CaptureTarget::BackwardKey => panel.config.backward_key = Hotkey::default(),
+                CaptureTarget::TogglePreviews => {
+                    panel.config.toggle_previews_key = Hotkey::default()
+                }
+                CaptureTarget::Character(name) => {
+                    panel.config.character_hotkeys.remove(&name);
+                }
+            }
             panel.touch();
         }
         Message::StartCapture(target) => {
@@ -558,6 +596,12 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             }
             panel.dragging = None;
             panel.drag_hover = None;
+        }
+        Message::CaptureMouse(code) => {
+            panel.bind_captured_trigger(TriggerKind::Mouse, code);
+        }
+        Message::CaptureWheel(up) => {
+            panel.bind_captured_trigger(TriggerKind::Wheel, if up { WHEEL_UP } else { WHEEL_DOWN });
         }
         Message::KeyEvent(event) => {
             return panel.handle_capture_key(event);
@@ -746,7 +790,26 @@ fn subscription(panel: &Panel) -> Subscription<Message> {
     let mut subs = Vec::new();
     // Only listen for raw key events while a bind button is armed.
     if panel.capturing.is_some() {
-        subs.push(iced::keyboard::listen().map(Message::KeyEvent));
+        subs.push(iced::event::listen_with(|event, _status, _window| match event {
+            iced::Event::Keyboard(k) => Some(Message::KeyEvent(k)),
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(b)) => {
+                iced_button_to_code(b).map(Message::CaptureMouse)
+            }
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => {
+                let y = match delta {
+                    iced::mouse::ScrollDelta::Lines { y, .. } => y,
+                    iced::mouse::ScrollDelta::Pixels { y, .. } => y,
+                };
+                if y > 0.0 {
+                    Some(Message::CaptureWheel(true))
+                } else if y < 0.0 {
+                    Some(Message::CaptureWheel(false))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }));
     }
     // Poll only while a save is pending so the debounce fires even with
     // no further input; stops once flushed.
