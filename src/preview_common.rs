@@ -109,6 +109,82 @@ pub fn snap_position(
     (x, y)
 }
 
+/// Fraction (0.0–1.0) of `target`'s area that is NOT covered by the union
+/// of `occluders`. Occluders are clipped to `target`, then their union area
+/// is computed exactly by coordinate compression (x-sweep + y-interval
+/// merge). A zero-area target counts as fully visible (1.0).
+///
+/// Used by "smart hide": the overlay only shows when some EVE window is at
+/// least ~90% visible, i.e. `visible_fraction(eve, occluders) >= 0.90`.
+pub fn visible_fraction(target: DragRect, occluders: &[DragRect]) -> f64 {
+    let tw = (target.right - target.left).max(0) as i64;
+    let th = (target.bottom - target.top).max(0) as i64;
+    let area = tw * th;
+    if area == 0 {
+        return 1.0;
+    }
+
+    // Clip each occluder to the target; drop non-overlapping ones.
+    let clipped: Vec<DragRect> = occluders
+        .iter()
+        .filter_map(|o| {
+            let left = o.left.max(target.left);
+            let top = o.top.max(target.top);
+            let right = o.right.min(target.right);
+            let bottom = o.bottom.min(target.bottom);
+            (right > left && bottom > top).then_some(DragRect {
+                left,
+                top,
+                right,
+                bottom,
+            })
+        })
+        .collect();
+    if clipped.is_empty() {
+        return 1.0;
+    }
+
+    // Unique x boundaries split the target into vertical strips; within each
+    // strip the covering rectangles are constant in x, so the covered height
+    // is the merged length of their y-intervals.
+    let mut xs: Vec<i32> = clipped.iter().flat_map(|r| [r.left, r.right]).collect();
+    xs.sort_unstable();
+    xs.dedup();
+
+    let mut covered: i64 = 0;
+    for win in xs.windows(2) {
+        let (x0, x1) = (win[0], win[1]);
+        let strip_w = (x1 - x0) as i64;
+        if strip_w == 0 {
+            continue;
+        }
+        let mut ys: Vec<(i32, i32)> = clipped
+            .iter()
+            .filter(|r| r.left <= x0 && r.right >= x1)
+            .map(|r| (r.top, r.bottom))
+            .collect();
+        if ys.is_empty() {
+            continue;
+        }
+        ys.sort_unstable();
+        let mut merged: i64 = 0;
+        let (mut cur_top, mut cur_bot) = ys[0];
+        for &(t, b) in &ys[1..] {
+            if t > cur_bot {
+                merged += (cur_bot - cur_top) as i64;
+                cur_top = t;
+                cur_bot = b;
+            } else if b > cur_bot {
+                cur_bot = b;
+            }
+        }
+        merged += (cur_bot - cur_top) as i64;
+        covered += merged * strip_w;
+    }
+
+    ((area - covered) as f64 / area as f64).clamp(0.0, 1.0)
+}
+
 /// Whether a preview window should be hidden right now, given the
 /// "hide active client's preview" setting and whether this preview
 /// mirrors the currently-active EVE client.
@@ -363,6 +439,64 @@ mod tests {
         let others = [neighbor(210, 100)];
         let (x, y) = snap_position(100, 100, DRAG_W, DRAG_H, &others, 0);
         assert_eq!((x, y), (100, 100));
+    }
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> DragRect {
+        DragRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn fully_visible_with_no_occluders() {
+        let t = rect(0, 0, 100, 100);
+        assert_eq!(visible_fraction(t, &[]), 1.0);
+    }
+
+    #[test]
+    fn fully_visible_when_occluder_does_not_overlap() {
+        let t = rect(0, 0, 100, 100);
+        assert_eq!(visible_fraction(t, &[rect(200, 200, 300, 300)]), 1.0);
+    }
+
+    #[test]
+    fn half_covered_is_half_visible() {
+        let t = rect(0, 0, 100, 100);
+        // Covers the right half (x 50..100).
+        assert!((visible_fraction(t, &[rect(50, 0, 100, 100)]) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fully_covered_is_zero_visible() {
+        let t = rect(0, 0, 100, 100);
+        assert_eq!(visible_fraction(t, &[rect(-10, -10, 200, 200)]), 0.0);
+    }
+
+    #[test]
+    fn overlapping_occluders_not_double_counted() {
+        let t = rect(0, 0, 100, 100);
+        // Two occluders that overlap each other; union covers x 0..60 (60%).
+        let occ = [rect(0, 0, 40, 100), rect(20, 0, 60, 100)];
+        assert!((visible_fraction(t, &occ) - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn small_corner_occluder_keeps_mostly_visible() {
+        let t = rect(0, 0, 100, 100);
+        // 10x10 corner = 1% covered → 99% visible (above the 90% threshold).
+        let v = visible_fraction(t, &[rect(0, 0, 10, 10)]);
+        assert!(v > 0.9, "expected >0.9, got {v}");
+    }
+
+    #[test]
+    fn occluder_clipped_to_target_before_counting() {
+        let t = rect(0, 0, 100, 100);
+        // Occluder extends well beyond target but only covers its top 10px.
+        let v = visible_fraction(t, &[rect(-50, -50, 150, 10)]);
+        assert!((v - 0.9).abs() < 1e-9, "expected 0.9, got {v}");
     }
 
     #[test]

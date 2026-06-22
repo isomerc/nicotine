@@ -54,6 +54,10 @@ pub struct LiveSettings {
     /// away from reappears. Read live so the toggle takes effect without
     /// a restart.
     pub hide_active_preview: bool,
+    /// Mirror of `config.smart_hide`. When true the overlay only shows
+    /// while some EVE window is ≥90% visible (not buried behind other
+    /// apps); read live by the preview managers' occlusion check.
+    pub smart_hide: bool,
 }
 
 impl LiveSettings {
@@ -66,6 +70,7 @@ impl LiveSettings {
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
             hide_active_preview: config.hide_active_preview,
+            smart_hide: config.smart_hide,
         }))
     }
 }
@@ -120,6 +125,12 @@ pub struct Config {
     /// client.
     #[serde(default = "default_hide_active_preview")]
     pub hide_active_preview: bool,
+    /// When true, the overlay is shown only while at least one EVE window
+    /// is ≥90% visible (occlusion detection): if every EVE client is buried
+    /// behind other applications, the previews hide themselves. Default off.
+    /// Includes the pre-login EVE window (no character name yet). Live.
+    #[serde(default)]
+    pub smart_hide: bool,
     /// When true, the config panel locks preview width and height to a
     /// single aspect ratio and offers one "size" slider instead of
     /// separate width/height sliders. Purely a panel-side concern — the
@@ -388,6 +399,7 @@ impl Config {
             preview_opacity: default_preview_opacity(),
             show_previews: default_show_previews(),
             hide_active_preview: default_hide_active_preview(),
+            smart_hide: false,
             constrain_aspect: default_constrain_aspect(),
             toggle_previews_key: None,
             toggle_previews_modifier: None,
@@ -474,6 +486,7 @@ mod tests {
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
+            smart_hide: false,
             constrain_aspect: false,
             toggle_previews_key: None,
             toggle_previews_modifier: None,
@@ -513,6 +526,7 @@ mod tests {
             preview_opacity: 100,
             show_previews: true,
             hide_active_preview: false,
+            smart_hide: false,
             constrain_aspect: false,
             toggle_previews_key: None,
             toggle_previews_modifier: None,
@@ -551,6 +565,7 @@ mod tests {
             preview_opacity: 55,
             show_previews: true,
             hide_active_preview: true,
+            smart_hide: true,
             constrain_aspect: true,
             toggle_previews_key: Some(67),
             toggle_previews_modifier: Some(42),
@@ -572,6 +587,10 @@ mod tests {
         assert!(
             deserialized.hide_active_preview,
             "hide_active_preview must survive a save/load round-trip"
+        );
+        assert!(
+            deserialized.smart_hide,
+            "smart_hide must survive a save/load round-trip"
         );
         assert!(
             deserialized.constrain_aspect,

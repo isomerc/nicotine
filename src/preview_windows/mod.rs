@@ -1,7 +1,8 @@
 use crate::config::{Config, LiveSettings};
 use crate::cycle_state::CycleState;
 use crate::preview_common::{
-    preview_should_hide, snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
+    preview_should_hide, snap_position, visible_fraction, DragRect, DragState, DRAG_THRESHOLD_PX,
+    SNAP_THRESHOLD_PX,
 };
 use crate::window_manager::WindowManager;
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
@@ -10,9 +11,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    COLORREF, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    BOOL, COLORREF, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
@@ -30,8 +32,9 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVE
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetMessageW,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, KillTimer, LoadCursorW, RegisterClassExW,
     SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST,
     IDC_ARROW, LWA_ALPHA, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
@@ -126,6 +129,105 @@ fn px(n: i32) -> i32 {
     (n as f32 * dpi_scale()).round() as i32
 }
 
+/// Whether `pid` is a Nicotine process (the daemon or the config panel).
+/// Used by smart-hide to exclude our own windows from the occluder set.
+/// Mirrors `eve_match::pid_is_eve_client` but matches `nicotine.exe`.
+fn pid_is_nicotine(pid: u32) -> bool {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        )
+        .is_ok();
+        let _ = CloseHandle(handle);
+        if !ok {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        path.rsplit(['\\', '/'])
+            .next()
+            .map(|name| name.eq_ignore_ascii_case("nicotine.exe"))
+            .unwrap_or(false)
+    }
+}
+
+/// One top-level window's smart-hide inputs, collected by EnumWindows.
+struct OcclusionWin {
+    rect: DragRect,
+    visible: bool,
+    is_eve: bool,
+    is_nicotine: bool,
+}
+
+/// EnumWindows callback: append each top-level window's occlusion info.
+/// `lparam` points at a `Vec<OcclusionWin>`. EnumWindows enumerates in
+/// Z-order, topmost first, so earlier entries are "above" later ones.
+unsafe extern "system" fn enum_collect_occlusion(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let infos = &mut *(lparam.0 as *mut Vec<OcclusionWin>);
+    let visible = IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool();
+    let mut rect = RECT::default();
+    let has_rect = GetWindowRect(hwnd, &mut rect).is_ok();
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    infos.push(OcclusionWin {
+        rect: DragRect {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        },
+        visible: visible && has_rect,
+        is_eve: pid != 0 && crate::eve_match::pid_is_eve_client(pid),
+        is_nicotine: pid != 0 && pid_is_nicotine(pid),
+    });
+    TRUE
+}
+
+/// Smart-hide occlusion check (Windows): is at least one EVE window
+/// (including the pre-login window) ≥`SMART_HIDE_THRESHOLD` visible? Walks
+/// all top-level windows top-to-bottom and, for each EVE window, measures
+/// the fraction not covered by the visible non-Nicotine windows above it.
+/// Fails *open* (true) if EnumWindows yields nothing.
+fn any_eve_visible_enough() -> bool {
+    let mut infos: Vec<OcclusionWin> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_collect_occlusion),
+            LPARAM(&mut infos as *mut _ as isize),
+        );
+    }
+    if infos.is_empty() {
+        return true;
+    }
+    for (i, info) in infos.iter().enumerate() {
+        if !info.visible || !info.is_eve {
+            continue;
+        }
+        let occluders: Vec<DragRect> = infos[..i]
+            .iter()
+            .filter(|o| o.visible && !o.is_nicotine)
+            .map(|o| o.rect)
+            .collect();
+        if visible_fraction(info.rect, &occluders) >= SMART_HIDE_THRESHOLD {
+            return true;
+        }
+    }
+    false
+}
+
 const PREVIEW_CLASS: &str = "NicotinePreviewWnd\0";
 const CONTROL_CLASS: &str = "NicotinePreviewCtrl\0";
 const LIST_CLASS: &str = "NicotineListWnd\0";
@@ -145,6 +247,14 @@ const RECONCILE_TIMER_ID: usize = 1;
 const RECONCILE_INTERVAL_MS: u32 = 100;
 const TITLE_HEIGHT: i32 = 24;
 const BORDER_WIDTH: i32 = 3;
+
+/// Smart-hide: an EVE window counts as "visible enough" to keep the overlay
+/// shown when at least this fraction of its area is unoccluded. Matches the
+/// X11 backend's threshold.
+const SMART_HIDE_THRESHOLD: f64 = 0.90;
+/// Throttle for the smart-hide EnumWindows occlusion sweep — too heavy to
+/// run on every 100ms reconcile tick.
+const SMART_HIDE_INTERVAL: Duration = Duration::from_millis(400);
 
 // DRAG_THRESHOLD_PX and SNAP_THRESHOLD_PX live in `preview_common`
 // since both managers use them. Imported above.
@@ -239,6 +349,12 @@ struct PreviewManager {
     /// InvalidateRect every 100ms otherwise produces a visible flicker
     /// and feels sluggish.
     list_last_names: Vec<String>,
+    /// Cached smart-hide occlusion result: is at least one EVE window ≥90%
+    /// visible? Recomputed on a throttle (the EnumWindows sweep is too heavy
+    /// per reconcile tick). True when smart-hide is off.
+    smart_hide_visible: bool,
+    /// Wall time of the last smart-hide occlusion check.
+    last_smart_hide_check: Instant,
 }
 
 /// Drop-guard for the list window — destroys the Win32 window and the
@@ -320,6 +436,7 @@ impl PreviewManager {
         // windows resize in real time.
         self.apply_live_size();
         self.apply_live_opacity();
+        self.refresh_smart_hide();
         // Catches the setting being toggled and previews created since the
         // last tick; the instant per-cycle response comes from the same
         // call at the end of update_active.
@@ -555,8 +672,11 @@ impl PreviewManager {
     /// cycled away from.
     fn apply_active_visibility(&mut self) {
         let hide_active = self.live.lock().unwrap().hide_active_preview;
+        // Smart-hide gate: when no EVE window is visible enough, hide the
+        // whole overlay (`smart_hide_visible` is always true when off).
+        let smart_hidden = !self.smart_hide_visible;
         for preview in self.previews.values_mut() {
-            let want_hidden = preview_should_hide(hide_active, preview.is_active);
+            let want_hidden = smart_hidden || preview_should_hide(hide_active, preview.is_active);
             if want_hidden == preview.hidden {
                 continue;
             }
@@ -571,6 +691,30 @@ impl PreviewManager {
             unsafe {
                 let _ = ShowWindow(preview.hwnd, cmd);
             }
+        }
+        // Smart-hide also gates the list-view window.
+        if let Some(list) = &self.list {
+            let cmd = if smart_hidden {
+                SW_HIDE
+            } else {
+                SW_SHOWNOACTIVATE
+            };
+            unsafe {
+                let _ = ShowWindow(list.hwnd, cmd);
+            }
+        }
+    }
+
+    /// Recompute the cached smart-hide visibility on its throttle. No-op
+    /// (resets to "visible") when smart-hide is off.
+    fn refresh_smart_hide(&mut self) {
+        if !self.live.lock().unwrap().smart_hide {
+            self.smart_hide_visible = true;
+            return;
+        }
+        if self.last_smart_hide_check.elapsed() >= SMART_HIDE_INTERVAL {
+            self.smart_hide_visible = any_eve_visible_enough();
+            self.last_smart_hide_check = Instant::now();
         }
     }
 
@@ -1412,6 +1556,8 @@ fn run_manager(
         list: None,
         active_id: 0,
         list_last_names: Vec::new(),
+        smart_hide_visible: true,
+        last_smart_hide_check: Instant::now(),
     });
     let manager_ptr = Box::into_raw(manager);
     MANAGER_PTR.store(manager_ptr as usize, Ordering::Release);

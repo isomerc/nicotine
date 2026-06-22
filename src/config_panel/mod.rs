@@ -408,6 +408,7 @@ pub(super) enum Message {
     KeyEvent(iced::keyboard::Event),
     ShowPreviewsToggled(bool),
     HideActivePreviewToggled(bool),
+    SmartHideToggled(bool),
     ConstrainAspectToggled(bool),
     PreviewWidthChanged(u32),
     PreviewHeightChanged(u32),
@@ -570,6 +571,11 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         Message::HideActivePreviewToggled(v) => {
             panel.config.hide_active_preview = v;
             panel.live.lock().unwrap().hide_active_preview = v;
+            panel.touch();
+        }
+        Message::SmartHideToggled(v) => {
+            panel.config.smart_hide = v;
+            panel.live.lock().unwrap().smart_hide = v;
             panel.touch();
         }
         Message::ConstrainAspectToggled(v) => {
