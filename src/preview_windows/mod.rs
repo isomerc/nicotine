@@ -481,12 +481,31 @@ impl PreviewManager {
     }
 
     fn reconcile_list(&mut self) {
+        // Smart-hide gates the list window too. Refresh here (it only runs
+        // from reconcile_previews otherwise, so it'd go stale in List mode)
+        // and hide when no EVE window is visible enough. `smart_hide_visible`
+        // is always true when the feature is off.
+        self.refresh_smart_hide();
+        if !self.smart_hide_visible {
+            if let Some(list) = &self.list {
+                unsafe {
+                    let _ = ShowWindow(list.hwnd, SW_HIDE);
+                }
+            }
+            return;
+        }
         // Spawn the list window on first entry into this mode, or if it
         // was torn down somehow.
         if self.list.is_none() {
             if let Err(e) = self.create_list_window() {
                 eprintln!("Failed to create list window: {}", e);
                 return;
+            }
+        }
+        // Re-show in case a prior smart-hide hid it.
+        if let Some(list) = &self.list {
+            unsafe {
+                let _ = ShowWindow(list.hwnd, SW_SHOWNOACTIVATE);
             }
         }
 
