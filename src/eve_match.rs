@@ -28,14 +28,40 @@ pub fn path_basename_is_eve_exe(path: &str) -> bool {
 /// `comm` is the in-kernel short name of the executable (truncated to
 /// 15 chars but `exefile.exe` is 11). Wine/Proton preserves the comm
 /// name from the EXE it's running, so EVE under Steam-Proton ends up
-/// with comm = `exefile.exe` exactly. Returns false for missing or
-/// unreadable /proc entries — defensive against the source window
-/// disappearing between enumeration and the comm read.
+/// with comm = `exefile.exe` exactly.
+///
+/// Falls back to scanning all of `/proc` for a process named
+/// `exefile.exe` when `/proc/<pid>` doesn't exist at all (as opposed
+/// to existing but naming something else). Steam installed as a
+/// Flatpak runs Proton inside a bwrap sandbox with its own PID
+/// namespace, so the `_NET_WM_PID` a window reports is a
+/// container-local PID with no corresponding entry in the host's
+/// `/proc` — the direct lookup always misses even though EVE is
+/// genuinely running. A title-matched window plus *any* real
+/// `exefile.exe` process on the host is the best signal available in
+/// that case.
 #[cfg(unix)]
 pub fn pid_is_eve_client(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{}/comm", pid))
-        .map(|s| s.trim() == "exefile.exe")
-        .unwrap_or(false)
+    match std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
+        Ok(s) => s.trim() == "exefile.exe",
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => any_exefile_process_running(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+fn any_exefile_process_running() -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+            && std::fs::read_to_string(entry.path().join("comm"))
+                .is_ok_and(|s| s.trim() == "exefile.exe")
+    })
 }
 
 /// Windows: returns true if the process backing `pid` is the EVE
