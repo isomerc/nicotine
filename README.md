@@ -155,7 +155,7 @@ Edit `~/.config/nicotine/config.toml` to customize:
 enable_keyboard_buttons = true
 forward_key = 15  # TAB Key
 backward_key = 15  # TAB Key - modifier_key applied if set in config
-keyboard_device_path = None # Device path /dev/input/eventX (OPTIONAL but you may need to set this if keybinds don't work)
+keyboard_device_path = # "/dev/input/eventX" (OPTIONAL but you may need to set this if keybinds don't work)
 modifier_key = None # You will have to add this if you want a modifier key for backward cycling
 ```
 
