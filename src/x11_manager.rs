@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::eve_match::pid_is_eve_client;
-use crate::window_manager::{EveWindow, WindowManager};
+use crate::window_manager::{EveWindow, WindowId, WindowManager};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,6 +23,10 @@ pub struct X11Manager {
 }
 
 impl X11Manager {
+    fn x11_id(window_id: WindowId) -> Result<u32> {
+        u32::try_from(window_id).context("Window ID exceeds the X11 32-bit range")
+    }
+
     pub fn new() -> Result<Self> {
         let (conn, screen_num) =
             RustConnection::connect(None).context("Failed to connect to X11 server")?;
@@ -123,7 +127,7 @@ impl X11Manager {
                 continue;
             }
             eve_windows.push(EveWindow {
-                id: window,
+                id: window.into(),
                 title: title.trim_start_matches("EVE - ").to_string(),
             });
         }
@@ -192,6 +196,7 @@ impl X11Manager {
         height: u32,
     ) -> Result<()> {
         for window in windows {
+            let window_id = Self::x11_id(window.id)?;
             // Move and resize window
             let values = ConfigureWindowAux::new()
                 .x(x)
@@ -199,7 +204,7 @@ impl X11Manager {
                 .width(width)
                 .height(height);
 
-            self.conn.configure_window(window.id, &values)?;
+            self.conn.configure_window(window_id, &values)?;
         }
 
         self.conn.flush()?;
@@ -283,8 +288,8 @@ impl WindowManager for X11Manager {
         self.get_eve_windows()
     }
 
-    fn activate_window(&self, window_id: u32) -> Result<()> {
-        self.activate_window(window_id)
+    fn activate_window(&self, window_id: WindowId) -> Result<()> {
+        self.activate_window(Self::x11_id(window_id)?)
     }
 
     fn stack_windows(&self, windows: &[EveWindow], config: &Config) -> Result<()> {
@@ -296,15 +301,15 @@ impl WindowManager for X11Manager {
         self.stack_windows_internal(windows, x, y, width, height)
     }
 
-    fn get_active_window(&self) -> Result<u32> {
-        self.get_active_window()
+    fn get_active_window(&self) -> Result<WindowId> {
+        self.get_active_window().map(Into::into)
     }
 
-    fn minimize_window(&self, window_id: u32) -> Result<()> {
-        self.minimize_window(window_id)
+    fn minimize_window(&self, window_id: WindowId) -> Result<()> {
+        self.minimize_window(Self::x11_id(window_id)?)
     }
 
-    fn restore_window(&self, window_id: u32) -> Result<()> {
-        self.restore_window(window_id)
+    fn restore_window(&self, window_id: WindowId) -> Result<()> {
+        self.restore_window(Self::x11_id(window_id)?)
     }
 }

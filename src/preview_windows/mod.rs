@@ -3,7 +3,7 @@ use crate::cycle_state::CycleState;
 use crate::preview_common::{
     preview_should_hide, snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
 };
-use crate::window_manager::WindowManager;
+use crate::window_manager::{WindowId, WindowManager};
 use crate::windows_manager::{hwnd_to_id, id_to_hwnd};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -167,7 +167,7 @@ use crate::preview_positions::PreviewPositions;
 /// State for a single preview window. The pointer is stored in the
 /// window's GWLP_USERDATA so the wnd_proc can recover it.
 struct PreviewWindowState {
-    source_id: u32,
+    source_id: WindowId,
     character_name: String,
     thumbnail: Hthumbnail,
     wm: Arc<dyn WindowManager>,
@@ -184,7 +184,7 @@ struct PreviewWindowState {
 /// One owned preview window. Drop unregisters the DWM thumbnail.
 struct OwnedPreview {
     hwnd: HWND,
-    source_id: u32,
+    source_id: WindowId,
     /// Mirror of `PreviewWindowState.is_active` kept here so reconcile
     /// can detect changes without dereferencing the GWLP_USERDATA pointer
     /// on every tick.
@@ -232,7 +232,7 @@ struct PreviewManager {
     list: Option<OwnedListWindow>,
     /// Most recent foreground EVE window id. Used by the list window's
     /// paint callback to decide which row to highlight.
-    active_id: u32,
+    active_id: WindowId,
     /// Names rendered in the list window on the previous reconcile, in
     /// order. Used to detect changes (add/remove/reorder) so we only
     /// invalidate when something actually shifted — calling
@@ -607,7 +607,7 @@ impl PreviewManager {
     /// focuses a non-EVE app, then presses F11, the cycle would step
     /// from wherever we last cycled to (say A) instead of from B,
     /// looking like "cycle skipped a client."
-    fn update_active(&mut self, active_id: u32) {
+    fn update_active(&mut self, active_id: WindowId) {
         self.state.lock().unwrap().sync_with_active(active_id);
 
         for preview in self.previews.values_mut() {

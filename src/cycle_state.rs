@@ -1,4 +1,4 @@
-use crate::window_manager::{EveWindow, WindowManager};
+use crate::window_manager::{EveWindow, WindowId, WindowManager};
 use anyhow::Result;
 use std::time::{Duration, Instant};
 
@@ -247,7 +247,7 @@ impl CycleState {
             .is_some_and(|t| t.elapsed() < ACTIVATION_GRACE)
     }
 
-    pub fn sync_with_active(&mut self, active_window: u32) {
+    pub fn sync_with_active(&mut self, active_window: WindowId) {
         // Within the grace window after our own activation, the compositor's
         // reported active window may still be the *previous* one — its focus
         // commit is asynchronous. Trust `current_index` rather than rewinding
@@ -347,7 +347,7 @@ impl CycleState {
 mod tests {
     use super::*;
 
-    fn create_test_window(id: u32, title: &str) -> EveWindow {
+    fn create_test_window(id: WindowId, title: &str) -> EveWindow {
         EveWindow {
             id,
             title: title.to_string(),
@@ -505,7 +505,7 @@ mod tests {
 
     // Mock WindowManager for testing switch_to
     struct MockWindowManager {
-        activated_windows: std::sync::Mutex<Vec<u32>>,
+        activated_windows: std::sync::Mutex<Vec<WindowId>>,
     }
 
     impl MockWindowManager {
@@ -515,7 +515,7 @@ mod tests {
             }
         }
 
-        fn get_activated(&self) -> Vec<u32> {
+        fn get_activated(&self) -> Vec<WindowId> {
             self.activated_windows.lock().unwrap().clone()
         }
     }
@@ -525,7 +525,7 @@ mod tests {
             Ok(vec![])
         }
 
-        fn activate_window(&self, window_id: u32) -> anyhow::Result<()> {
+        fn activate_window(&self, window_id: WindowId) -> anyhow::Result<()> {
             self.activated_windows.lock().unwrap().push(window_id);
             Ok(())
         }
@@ -538,15 +538,15 @@ mod tests {
             Ok(())
         }
 
-        fn get_active_window(&self) -> anyhow::Result<u32> {
+        fn get_active_window(&self) -> anyhow::Result<WindowId> {
             Ok(0)
         }
 
-        fn minimize_window(&self, _window_id: u32) -> anyhow::Result<()> {
+        fn minimize_window(&self, _window_id: WindowId) -> anyhow::Result<()> {
             Ok(())
         }
 
-        fn restore_window(&self, _window_id: u32) -> anyhow::Result<()> {
+        fn restore_window(&self, _window_id: WindowId) -> anyhow::Result<()> {
             Ok(())
         }
     }

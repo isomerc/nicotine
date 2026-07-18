@@ -1,9 +1,15 @@
 use crate::config::Config;
 use anyhow::Result;
 
+/// Cross-platform window identifier. X11 IDs are 32-bit, but Hyprland
+/// reports pointer-sized hexadecimal addresses and Win64 HWND values are
+/// pointer-sized as well. Keep the shared representation wide enough to
+/// preserve those native values without truncation.
+pub type WindowId = u64;
+
 #[derive(Debug, Clone)]
 pub struct EveWindow {
-    pub id: u32,
+    pub id: WindowId,
     pub title: String,
 }
 
@@ -13,19 +19,19 @@ pub trait WindowManager: Send + Sync {
     fn get_eve_windows(&self) -> Result<Vec<EveWindow>>;
 
     /// Activate/focus a specific window by ID
-    fn activate_window(&self, window_id: u32) -> Result<()>;
+    fn activate_window(&self, window_id: WindowId) -> Result<()>;
 
     /// Stack all EVE windows at the same position (centered)
     fn stack_windows(&self, windows: &[EveWindow], config: &Config) -> Result<()>;
 
     /// Get the currently active window ID
-    fn get_active_window(&self) -> Result<u32>;
+    fn get_active_window(&self) -> Result<WindowId>;
 
     /// Minimize a window
-    fn minimize_window(&self, window_id: u32) -> Result<()>;
+    fn minimize_window(&self, window_id: WindowId) -> Result<()>;
 
     /// Restore a minimized window
-    fn restore_window(&self, window_id: u32) -> Result<()>;
+    fn restore_window(&self, window_id: WindowId) -> Result<()>;
 }
 
 #[cfg(unix)]
