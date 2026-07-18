@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::eve_match::pid_is_eve_client;
-use crate::window_manager::{EveWindow, WindowManager};
+use crate::window_manager::{EveWindow, WindowId, WindowManager};
 use crate::windows_helpers::should_attach_thread_input;
 use anyhow::{Context, Result};
 use std::ffi::c_void;
@@ -22,11 +22,11 @@ impl WindowsManager {
     }
 }
 
-pub(crate) fn hwnd_to_id(hwnd: HWND) -> u32 {
-    hwnd.0 as usize as u32
+pub(crate) fn hwnd_to_id(hwnd: HWND) -> WindowId {
+    hwnd.0 as usize as WindowId
 }
 
-pub(crate) fn id_to_hwnd(id: u32) -> HWND {
+pub(crate) fn id_to_hwnd(id: WindowId) -> HWND {
     HWND(id as usize as *mut c_void)
 }
 
@@ -174,7 +174,7 @@ impl WindowManager for WindowsManager {
         Ok(windows)
     }
 
-    fn activate_window(&self, window_id: u32) -> Result<()> {
+    fn activate_window(&self, window_id: WindowId) -> Result<()> {
         force_activate(id_to_hwnd(window_id));
         Ok(())
     }
@@ -202,12 +202,12 @@ impl WindowManager for WindowsManager {
         Ok(())
     }
 
-    fn get_active_window(&self) -> Result<u32> {
+    fn get_active_window(&self) -> Result<WindowId> {
         let hwnd = unsafe { GetForegroundWindow() };
         Ok(hwnd_to_id(hwnd))
     }
 
-    fn minimize_window(&self, window_id: u32) -> Result<()> {
+    fn minimize_window(&self, window_id: WindowId) -> Result<()> {
         let hwnd = id_to_hwnd(window_id);
         unsafe {
             // SC_MINIMIZE via WM_SYSCOMMAND is friendlier to applications
@@ -224,7 +224,7 @@ impl WindowManager for WindowsManager {
         Ok(())
     }
 
-    fn restore_window(&self, window_id: u32) -> Result<()> {
+    fn restore_window(&self, window_id: WindowId) -> Result<()> {
         let hwnd = id_to_hwnd(window_id);
         unsafe {
             SendMessageW(

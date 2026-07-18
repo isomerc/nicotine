@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::pointer_nudge::{schedule_nudge, PointerNudger};
-use crate::window_manager::{EveWindow, WindowManager};
+use crate::window_manager::{EveWindow, WindowId, WindowManager};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::process::Command;
@@ -11,6 +11,10 @@ use x11rb::protocol::xproto::{
     CLIENT_MESSAGE_EVENT,
 };
 use x11rb::rust_connection::RustConnection;
+
+fn x11_id(window_id: WindowId) -> Result<u32> {
+    u32::try_from(window_id).context("Window ID exceeds the X11 32-bit range")
+}
 
 // ============================================================================
 // Shared XWayland / EWMH helpers (KWin + GNOME)
@@ -252,7 +256,8 @@ impl WindowManager for KWinManager {
             if pid == 0 || !crate::eve_match::pid_is_eve_client(pid) {
                 continue;
             }
-            // Parse hex window ID (e.g., "0x06e00008") to u32.
+            // Parse the X11 window ID (e.g., "0x06e00008") and widen it for
+            // the shared cross-platform representation.
             let id = if let Some(hex) = id_str.strip_prefix("0x") {
                 u32::from_str_radix(hex, 16).unwrap_or(0)
             } else {
@@ -262,7 +267,7 @@ impl WindowManager for KWinManager {
                 continue;
             }
             eve_windows.push(EveWindow {
-                id,
+                id: id.into(),
                 title: title.trim_start_matches("EVE - ").to_string(),
             });
         }
@@ -270,7 +275,7 @@ impl WindowManager for KWinManager {
         Ok(eve_windows)
     }
 
-    fn activate_window(&self, window_id: u32) -> Result<()> {
+    fn activate_window(&self, window_id: WindowId) -> Result<()> {
         // Shared XWayland/EWMH activation. `wmctrl -i -a` silently no-ops
         // under KDE Wayland for XWayland clients, so we send the
         // `_NET_ACTIVE_WINDOW` ClientMessage ourselves (with the
@@ -279,7 +284,7 @@ impl WindowManager for KWinManager {
             &self.conn,
             self.screen_num,
             self.net_active_window_atom,
-            window_id,
+            x11_id(window_id)?,
         )?;
         // Pointer-focus nudge: KWin won't re-target clicks to the newly
         // raised client until the pointer moves. See `pointer_nudge`.
@@ -294,8 +299,8 @@ impl WindowManager for KWinManager {
         let height = config.display_height - config.panel_height;
 
         for window in windows {
-            // Convert u32 to hex format for wmctrl
-            let hex_id = format!("0x{:08x}", window.id);
+            let window_id = x11_id(window.id)?;
+            let hex_id = format!("0x{:08x}", window_id);
 
             // Move and resize window using wmctrl
             Command::new("wmctrl")
@@ -310,13 +315,13 @@ impl WindowManager for KWinManager {
         Ok(())
     }
 
-    fn get_active_window(&self) -> Result<u32> {
+    fn get_active_window(&self) -> Result<WindowId> {
         // Read _NET_ACTIVE_WINDOW directly via x11rb under XWayland —
         // matches what X11Manager does and avoids an `xdotool` runtime dep.
-        ewmh_active_window(&self.conn, self.screen_num, self.net_active_window_atom)
+        ewmh_active_window(&self.conn, self.screen_num, self.net_active_window_atom).map(Into::into)
     }
 
-    fn minimize_window(&self, window_id: u32) -> Result<()> {
+    fn minimize_window(&self, window_id: WindowId) -> Result<()> {
         // Iconify on our own X connection (see `ewmh_iconify`) so it's
         // ordered after the activation of the newly-focused client, instead
         // of racing it via a separate `xdotool` connection.
@@ -324,12 +329,12 @@ impl WindowManager for KWinManager {
             &self.conn,
             self.screen_num,
             self.wm_change_state_atom,
-            window_id,
+            x11_id(window_id)?,
         )
     }
 
-    fn restore_window(&self, window_id: u32) -> Result<()> {
-        let hex_id = format!("0x{:08x}", window_id);
+    fn restore_window(&self, window_id: WindowId) -> Result<()> {
+        let hex_id = format!("0x{:08x}", x11_id(window_id)?);
         // wmctrl -i -a activates and restores from minimized state
         Command::new("wmctrl")
             .args(["-i", "-a", &hex_id])
@@ -414,8 +419,8 @@ impl SwayManager {
             .map(|s| s.to_string())
     }
 
-    fn get_window_id(window: &Value) -> Option<u32> {
-        window.get("id").and_then(|i| i.as_u64()).map(|i| i as u32)
+    fn get_window_id(window: &Value) -> Option<WindowId> {
+        window.get("id").and_then(|i| i.as_u64())
     }
 
     /// Sway's IPC tree exposes the X11/XWayland or native pid on each
@@ -458,7 +463,7 @@ impl WindowManager for SwayManager {
         Ok(eve_windows)
     }
 
-    fn activate_window(&self, window_id: u32) -> Result<()> {
+    fn activate_window(&self, window_id: WindowId) -> Result<()> {
         let output = Command::new("swaymsg")
             .arg(format!("[con_id={}] focus", window_id))
             .output()
@@ -501,7 +506,7 @@ impl WindowManager for SwayManager {
         Ok(())
     }
 
-    fn get_active_window(&self) -> Result<u32> {
+    fn get_active_window(&self) -> Result<WindowId> {
         let windows = self.get_all_windows()?;
 
         for window in windows {
@@ -517,7 +522,7 @@ impl WindowManager for SwayManager {
         anyhow::bail!("No active window found")
     }
 
-    fn minimize_window(&self, window_id: u32) -> Result<()> {
+    fn minimize_window(&self, window_id: WindowId) -> Result<()> {
         Command::new("swaymsg")
             .arg(format!("[con_id={}] move scratchpad", window_id))
             .output()
@@ -525,7 +530,7 @@ impl WindowManager for SwayManager {
         Ok(())
     }
 
-    fn restore_window(&self, window_id: u32) -> Result<()> {
+    fn restore_window(&self, window_id: WindowId) -> Result<()> {
         // Show from scratchpad restores it
         Command::new("swaymsg")
             .arg(format!("[con_id={}] scratchpad show", window_id))
@@ -538,6 +543,11 @@ impl WindowManager for SwayManager {
 // ============================================================================
 // Hyprland Backend (via hyprctl)
 // ============================================================================
+
+fn parse_hyprland_address(address: &str) -> Option<WindowId> {
+    let hex = address.strip_prefix("0x")?;
+    u64::from_str_radix(hex, 16).ok().filter(|id| *id != 0)
+}
 
 pub struct HyprlandManager;
 
@@ -592,26 +602,22 @@ impl WindowManager for HyprlandManager {
             if pid == 0 || !crate::eve_match::pid_is_eve_client(pid) {
                 continue;
             }
-            if let Some(address) = window.get("address").and_then(|a| a.as_str()) {
-                // Hyprland addresses are hex; lossy-narrow to u32 for
-                // the cross-platform EveWindow.id we use elsewhere.
-                let id = if let Some(hex) = address.strip_prefix("0x") {
-                    u32::from_str_radix(hex, 16).unwrap_or(0)
-                } else {
-                    0
-                };
-                eve_windows.push(EveWindow {
-                    id,
-                    title: title.trim_start_matches("EVE - ").to_string(),
-                });
-            }
+            let Some(address) = window.get("address").and_then(|a| a.as_str()) else {
+                continue;
+            };
+            let Some(id) = parse_hyprland_address(address) else {
+                continue;
+            };
+            eve_windows.push(EveWindow {
+                id,
+                title: title.trim_start_matches("EVE - ").to_string(),
+            });
         }
 
         Ok(eve_windows)
     }
 
-    fn activate_window(&self, window_id: u32) -> Result<()> {
-        // Convert u32 back to hex address
+    fn activate_window(&self, window_id: WindowId) -> Result<()> {
         let address = format!("0x{:x}", window_id);
 
         let output = Command::new("hyprctl")
@@ -665,7 +671,7 @@ impl WindowManager for HyprlandManager {
         Ok(())
     }
 
-    fn get_active_window(&self) -> Result<u32> {
+    fn get_active_window(&self) -> Result<WindowId> {
         let output = Command::new("hyprctl")
             .arg("activewindow")
             .arg("-j")
@@ -675,19 +681,14 @@ impl WindowManager for HyprlandManager {
         let window: Value =
             serde_json::from_slice(&output.stdout).context("Failed to parse hyprctl output")?;
 
-        if let Some(address) = window.get("address").and_then(|a| a.as_str()) {
-            let id = if let Some(hex) = address.strip_prefix("0x") {
-                u32::from_str_radix(hex, 16).unwrap_or(0)
-            } else {
-                0
-            };
-            return Ok(id);
-        }
-
-        anyhow::bail!("Failed to get active window ID")
+        window
+            .get("address")
+            .and_then(|a| a.as_str())
+            .and_then(parse_hyprland_address)
+            .ok_or_else(|| anyhow::anyhow!("Failed to get active window ID"))
     }
 
-    fn minimize_window(&self, window_id: u32) -> Result<()> {
+    fn minimize_window(&self, window_id: WindowId) -> Result<()> {
         let address = format!("0x{:x}", window_id);
         Command::new("hyprctl")
             .args([
@@ -700,7 +701,7 @@ impl WindowManager for HyprlandManager {
         Ok(())
     }
 
-    fn restore_window(&self, window_id: u32) -> Result<()> {
+    fn restore_window(&self, window_id: WindowId) -> Result<()> {
         let address = format!("0x{:x}", window_id);
         // Move back to current workspace
         Command::new("hyprctl")
@@ -876,19 +877,19 @@ impl WindowManager for GnomeManager {
                 continue;
             }
             eve_windows.push(EveWindow {
-                id,
+                id: id.into(),
                 title: title.trim_start_matches("EVE - ").to_string(),
             });
         }
         Ok(eve_windows)
     }
 
-    fn activate_window(&self, window_id: u32) -> Result<()> {
+    fn activate_window(&self, window_id: WindowId) -> Result<()> {
         ewmh_activate(
             &self.conn,
             self.screen_num,
             self.net_active_window_atom,
-            window_id,
+            x11_id(window_id)?,
         )?;
         // Pointer-focus nudge — Mutter, like KWin, only re-targets clicks
         // on pointer motion. See `pointer_nudge`.
@@ -909,23 +910,43 @@ impl WindowManager for GnomeManager {
         Ok(())
     }
 
-    fn get_active_window(&self) -> Result<u32> {
-        ewmh_active_window(&self.conn, self.screen_num, self.net_active_window_atom)
+    fn get_active_window(&self) -> Result<WindowId> {
+        ewmh_active_window(&self.conn, self.screen_num, self.net_active_window_atom).map(Into::into)
     }
 
-    fn minimize_window(&self, window_id: u32) -> Result<()> {
+    fn minimize_window(&self, window_id: WindowId) -> Result<()> {
         // ICCCM iconify (WM_CHANGE_STATE → IconicState). Mutter honors it for
         // XWayland windows. Shared with the KWin backend — see `ewmh_iconify`.
         ewmh_iconify(
             &self.conn,
             self.screen_num,
             self.wm_change_state_atom,
-            window_id,
+            x11_id(window_id)?,
         )
     }
 
-    fn restore_window(&self, window_id: u32) -> Result<()> {
+    fn restore_window(&self, window_id: WindowId) -> Result<()> {
         // Activating an iconified window both un-minimizes and focuses it.
         self.activate_window(window_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_hyprland_address;
+
+    #[test]
+    fn hyprland_address_preserves_pointer_sized_value() {
+        let id = parse_hyprland_address("0x56257ff1ebe0").expect("valid Hyprland address");
+        assert_eq!(id, 0x56257ff1ebe0);
+        assert!(id > u32::MAX.into());
+        assert_eq!(format!("0x{id:x}"), "0x56257ff1ebe0");
+    }
+
+    #[test]
+    fn hyprland_address_rejects_invalid_or_zero_values() {
+        assert_eq!(parse_hyprland_address("56257ff1ebe0"), None);
+        assert_eq!(parse_hyprland_address("0xnot-hex"), None);
+        assert_eq!(parse_hyprland_address("0x0"), None);
     }
 }
