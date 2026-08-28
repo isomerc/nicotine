@@ -95,6 +95,8 @@ pub struct Config {
     pub mouse_device_path: Option<String>,
     #[serde(default = "default_minimize_inactive")]
     pub minimize_inactive: bool,
+    #[serde(default = "default_keyboard_device_name")]
+    pub keyboard_device_name: Option<String>,
     #[serde(default = "default_keyboard_device_path")]
     pub keyboard_device_path: Option<String>,
     #[serde(default = "default_modifier_key")]
@@ -243,6 +245,10 @@ fn default_minimize_inactive() -> bool {
     false
 }
 
+fn default_keyboard_device_name() -> Option<String> {
+    None
+}
+
 fn default_keyboard_device_path() -> Option<String> {
     None
 }
@@ -381,6 +387,7 @@ impl Config {
             mouse_device_name: default_mouse_device_name(),
             mouse_device_path: default_mouse_device_path(),
             minimize_inactive: default_minimize_inactive(),
+            keyboard_device_name: default_keyboard_device_name(),
             keyboard_device_path: default_keyboard_device_path(),
             modifier_key: default_modifier_key(),
             preview_width: default_preview_width(),
@@ -467,6 +474,7 @@ mod tests {
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
+            keyboard_device_name: None,
             keyboard_device_path: None,
             modifier_key: None,
             preview_width: 320,
@@ -506,6 +514,7 @@ mod tests {
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
+            keyboard_device_name: None,
             keyboard_device_path: None,
             modifier_key: None,
             preview_width: 320,
@@ -544,6 +553,7 @@ mod tests {
             mouse_device_name: None,
             mouse_device_path: None,
             minimize_inactive: false,
+            keyboard_device_name: None,
             keyboard_device_path: None,
             modifier_key: None,
             preview_width: 320,
