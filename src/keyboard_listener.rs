@@ -1,19 +1,17 @@
 //! evdev keyboard cycle + per-character hotkey listener with **live**
-//! binding reload. See the matching commentary on `mouse_listener` —
-//! same shape, same hot-reload contract, plus the character_hotkeys
-//! dispatch path that was missing from Linux entirely until now.
+//! binding reload and **multi-device** listening. See the matching
+//! commentary on `mouse_listener` — same shape, same hot-reload
+//! contract, plus the character_hotkeys dispatch path.
 
 use crate::config::{CharacterHotkey, Config, LiveSettings};
 use crate::cycle_state::CycleState;
+use crate::evdev_util::{EventDeviceHelper, InputDeviceType};
 use crate::window_manager::WindowManager;
 use anyhow::Result;
-use evdev::{Device, InputEventKind, Key};
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use evdev::InputEventKind;
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, BorrowedFd};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct KeyboardConfig {
@@ -21,6 +19,7 @@ pub struct KeyboardConfig {
     pub forward_key: u16,
     pub backward_key: u16,
     pub modifier_key: Option<u16>,
+    pub keyboard_device_name: Option<String>,
     pub keyboard_device_path: Option<String>,
     pub minimize_inactive: bool,
     pub character_hotkeys: HashMap<String, CharacterHotkey>,
@@ -35,6 +34,7 @@ impl KeyboardConfig {
             forward_key: c.forward_key,
             backward_key: c.backward_key,
             modifier_key: c.modifier_key,
+            keyboard_device_name: c.keyboard_device_name.clone(),
             keyboard_device_path: c.keyboard_device_path.clone(),
             minimize_inactive: c.minimize_inactive,
             character_hotkeys: c.character_hotkeys.clone(),
@@ -52,7 +52,9 @@ impl KeyboardConfig {
     }
 }
 
-const POLL_TIMEOUT_MS: u16 = 200;
+/// How often autodetect mode re-reads `/dev/input` for keyboards that
+/// appeared after the last scan.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct KeyboardListener;
 
@@ -72,12 +74,15 @@ impl KeyboardListener {
         state: Arc<Mutex<CycleState>>,
         live: Arc<Mutex<LiveSettings>>,
     ) {
-        let mut device: Option<Device> = None;
-        let mut current_dev_path: Option<String> = None;
-        // Modifier-down state. Reset on (re)connect because the kernel
-        // doesn't replay release events for keys held during a device
-        // disappearance.
+        let mut keyboards = EventDeviceHelper::new(InputDeviceType::Keyboard);
+        let mut last_rescan: Option<Instant> = None;
+
+        // Modifier-down state, shared across every device so Shift on
+        // one node + a key on another still combines. Reset on
+        // (re)connect because the kernel doesn't replay release events
+        // for keys held during a device disappearance.
         let mut pressed_modifiers: HashSet<u16> = HashSet::new();
+        let mut pressed_keys: HashMap<u16, i32> = HashMap::new();
         let mut announced_listening = false;
         let mut announced_idle = false;
 
@@ -97,44 +102,73 @@ impl KeyboardListener {
                     announced_idle = true;
                     announced_listening = false;
                 }
-                device = None;
-                current_dev_path = None;
+
+                keyboards.reset();
+                last_rescan = None;
                 pressed_modifiers.clear();
+                pressed_keys.clear();
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
             }
 
-            if device.is_none() || current_dev_path != snap.keyboard_device_path {
-                // Drop the old device first — see the matching note in
-                // mouse_listener: a `device = match { Err => continue }`
-                // doesn't assign on the Err path, which would otherwise
-                // leave us using the stale device after a failed
-                // device-path change.
-                device = None;
-                current_dev_path = snap.keyboard_device_path.clone();
+            keyboards.check_update_pinned_device(
+                snap.keyboard_device_name.as_deref(),
+                snap.keyboard_device_path.as_deref(),
+            );
+
+            // Rebuild the device list on (a) startup / empty list (every
+            // keyboard died) or (b) a config-driven change to the pinned
+            // path. Otherwise, keep the live list — it shrinks via the
+            // poll-error / read-error paths below and grows via the
+            // periodic rescan.
+            if keyboards.needs_scan()
+                || last_rescan.is_none_or(|t| t.elapsed() >= RESCAN_INTERVAL)
+            {
+                last_rescan = Some(Instant::now());
                 pressed_modifiers.clear();
-                match Self::find_keyboard_device(snap.keyboard_device_path.as_deref()) {
-                    Ok(d) => {
-                        announced_idle = false;
-                        announced_listening = false;
-                        device = Some(d);
+                match keyboards.scan_devices() {
+                    Ok(res) => {
+                        if res.removed_devices {
+                            announced_idle = false;
+                            announced_listening = false;
+                        }
+
+                        if !res.new_devices.is_empty() {
+                            announced_idle = false;
+                            announced_listening = false;
+
+                            for result in &res.new_devices {
+                                println!(
+                                    "Listening on keyboard device: {} ({})",
+                                    result.name,
+                                    result.path.display()
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Keyboard device not available ({}); retrying in 2s. \
-                             Check permissions on /dev/input/event* and whether \
-                             your user is in the `input` group.",
-                            e
-                        );
+                        eprintln!("Keyboard device scan failed ({}); retrying in 2s.", e);
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     }
+                }
+
+                if keyboards.num_devices() == 0 {
+                    eprintln!(
+                        "No keyboard devices found; retrying in 2s. \
+                        Check permissions on /dev/input/event* and whether your \
+                        user is in the `input` group."
+                    );
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
                 }
             }
 
             if !announced_listening {
                 println!(
-                    "Listening for keyboard keys: forward={} backward={} (+{} character hotkey(s))",
+                    "Listening on {} keyboard device(s) for keys: forward={} backward={} \
+                     (+{} character hotkey(s))",
+                    keyboards.num_devices(),
                     snap.forward_key,
                     snap.backward_key,
                     snap.character_hotkeys.len()
@@ -157,51 +191,19 @@ impl KeyboardListener {
             // "stuck" in the pressed set.
             pressed_modifiers.retain(|c| modifier_codes.contains(c));
 
-            // See mouse_listener::run_listener for why we go through
-            // BorrowedFd::borrow_raw: evdev::Device is AsRawFd but not
-            // AsFd, and the immutable borrow has to release before we
-            // mutably borrow for fetch_events.
-            let raw_fd = device.as_ref().expect("device set above").as_raw_fd();
-            let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
-            let mut pollfds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-            let n = match poll(&mut pollfds, PollTimeout::from(POLL_TIMEOUT_MS)) {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("Keyboard poll failed ({}); reconnecting.", e);
-                    device = None;
-                    continue;
-                }
-            };
-            if n == 0 {
-                continue;
-            }
-            let revents = pollfds[0].revents().unwrap_or_else(PollFlags::empty);
-            if !revents.contains(PollFlags::POLLIN) {
-                eprintln!("Keyboard device hung up; reconnecting.");
-                device = None;
-                continue;
-            }
-            // Detach events from the device borrow — see the same
-            // collect() note in mouse_listener.
-            let events_result = device
-                .as_mut()
-                .unwrap()
-                .fetch_events()
-                .map(|it| it.collect::<Vec<_>>());
-            let events = match events_result {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("Keyboard device read failed ({}); reconnecting.", e);
-                    device = None;
-                    continue;
-                }
-            };
-            for event in events {
+            // Always clear the pressed keys
+            pressed_keys.clear();
+
+            // Poll every device and collect all events to collect any possible modifiers
+            // and all key presses across all keyboards. Then iterate a second time
+            // over all pressed keys so that modifiers from any keyboard can affect
+            // keys from any other keyboard
+            let num_devices_dropped = keyboards.poll_devices(|event| {
                 let InputEventKind::Key(key) = event.kind() else {
-                    continue;
+                    return;
                 };
                 let code = key.code();
-
+                
                 // Track press/release of modifier-eligible keys.
                 if modifier_codes.contains(&code) {
                     if event.value() != 0 {
@@ -213,9 +215,13 @@ impl KeyboardListener {
 
                 // Only act on press / repeat.
                 if event.value() == 0 {
-                    continue;
+                    return;
                 }
 
+                pressed_keys.insert(code, event.value());
+            });
+
+            for (&code, &event_value) in &pressed_keys {
                 // Preview-visibility toggle. Independent of cycling enable,
                 // and acts only on the initial press (value == 1) so a held
                 // key doesn't strobe show/hide on key-repeat. Consume the
@@ -226,7 +232,7 @@ impl KeyboardListener {
                     code,
                     &pressed_modifiers,
                 ) {
-                    if event.value() == 1 {
+                    if event_value == 1 {
                         let mut live = live.lock().unwrap();
                         live.show_previews = !live.show_previews;
                         println!(
@@ -277,61 +283,11 @@ impl KeyboardListener {
                     }
                 }
             }
-        }
-    }
 
-    fn find_keyboard_device(configured_path: Option<&str>) -> Result<Device> {
-        if let Some(path_str) = configured_path {
-            let path = Path::new(path_str);
-            match Device::open(path) {
-                Ok(device) => {
-                    println!(
-                        "Using configured keyboard device {} ({})",
-                        device.name().unwrap_or("Unknown"),
-                        path.display()
-                    );
-                    return Ok(device);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to open configured keyboard device '{}': {}",
-                        path_str, e
-                    );
-                    eprintln!("Falling back to automatic device detection...");
-                }
+            if num_devices_dropped > 0 {
+                announced_listening = false;
             }
         }
-
-        let devices_path = Path::new("/dev/input");
-        let mut event_paths: Vec<_> = std::fs::read_dir(devices_path)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|s| s.starts_with("event"))
-            })
-            .collect();
-        event_paths.sort();
-
-        for path in event_paths {
-            if let Ok(device) = Device::open(&path) {
-                if device.supported_keys().is_some_and(|keys| {
-                    keys.contains(Key::KEY_TAB)
-                        || keys.contains(Key::KEY_LEFTSHIFT)
-                        || keys.contains(Key::KEY_Z)
-                }) {
-                    println!(
-                        "Found keyboard device: {} ({})",
-                        device.name().unwrap_or("Unknown"),
-                        path.display()
-                    );
-                    return Ok(device);
-                }
-            }
-        }
-
-        anyhow::bail!("No keyboard device found in /dev/input")
     }
 
     fn cycle_forward(
@@ -562,6 +518,7 @@ mod tests {
             forward_key: 15,
             backward_key: 15,
             modifier_key: None,
+            keyboard_device_name: None,
             keyboard_device_path: None,
             minimize_inactive: false,
             character_hotkeys: HashMap::new(),
